@@ -19,9 +19,6 @@
 //! ```text
 //! (:UpdateFailure {key: plugin, name, version, error, ms, seen, failed_under})-[:ON]->(:Machine)
 //!     a version that could not start; retired when the failure is over
-//! (:UpdateChoice {key: plugin, version, choice*: keep | use | merge})-[:ON]->(:Machine)
-//!     the user's answer for a changed plugin's release (`choice` keeps its history); retired once
-//!     the release is installed or reset
 //! stream `updates`    every outcome {plugin, version, ms, outcome, detail}; the status shows the newest
 //! ```
 //!
@@ -66,8 +63,6 @@ const RECENT: usize = 20;
 const SAVED: &str = "updater.json";
 /// The graph's label of a version that could not start.
 const FAILURE: &str = "UpdateFailure";
-/// The graph's label of the user's answer for a changed plugin's release.
-const CHOICE: &str = "UpdateChoice";
 /// The stream of update outcomes, and how long it is kept.
 const UPDATES: &str = "updates";
 const UPDATES_DAYS: u32 = 365;
@@ -102,12 +97,6 @@ impl Config {
 /// The versions that could not start, as the graph keeps them (`UpdateFailure`).
 #[derive(Debug, Default, Clone)]
 struct Saved {
-    /// Plugin -> the release the user chose to stay off ("Keep mine", or a merge that clashed).
-    kept: BTreeMap<String, String>,
-    /// Plugin -> the version the user chose to use (or merge), until it is applied.
-    approved: BTreeMap<String, String>,
-    /// Plugin -> the version the user chose to use with their changes merged in, not dropped.
-    merged: BTreeMap<String, String>,
     /// Plugin -> the version that could not start (not tried again under the same frame).
     failed: BTreeMap<String, Failed>,
     /// Plugin -> the frame version that refused its failed version: another frame tries it again.
@@ -117,12 +106,6 @@ struct Saved {
 /// The state file of earlier versions (only what is moved into the graph).
 #[derive(Debug, Default, Deserialize)]
 struct OldSaved {
-    #[serde(default)]
-    kept: BTreeMap<String, String>,
-    #[serde(default)]
-    approved: BTreeMap<String, String>,
-    #[serde(default)]
-    merged: BTreeMap<String, String>,
     #[serde(default)]
     failed: BTreeMap<String, Failed>,
     #[serde(default)]
@@ -213,11 +196,6 @@ impl Updater {
         if let Ok(bytes) = std::fs::read(&path) {
             match serde_json::from_slice::<OldSaved>(&bytes) {
                 Ok(old) => {
-                    let mut choices = Saved { kept: old.kept.clone(), approved: old.approved.clone(), merged: old.merged.clone(), ..Saved::default() };
-                    let plugins: BTreeSet<String> = old.kept.keys().chain(old.approved.keys()).cloned().collect();
-                    for plugin in &plugins {
-                        self.put_choice(&mut choices, plugin);
-                    }
                     for (plugin, failed) in &old.failed {
                         self.put_failure(failed, old.failed_under.get(plugin).map(String::as_str).unwrap_or_default());
                     }
@@ -262,30 +240,6 @@ impl Updater {
             }
             Err(error) => tracing::warn!(error = %error.message, "the failed updates were not read from the graph"),
         }
-        // `choice` is temporal: named in the statement (a whole node leaves temporal values out).
-        let cypher = format!("MATCH (c:{CHOICE}) WHERE c.ended_ms IS NULL RETURN c.key, c.version, c.choice");
-        let query = json!({ "cypher": cypher, "limit": 5000 });
-        match self.graph.ask::<cc_protocol::contracts::memory::GraphQueryResult>(cc_protocol::contracts::memory::methods::GRAPH_QUERY, query).await {
-            Ok(result) => self.with_saved(|saved| {
-                for row in result.rows {
-                    let cell = |i: usize| row.get(i).and_then(Value::as_str).unwrap_or_default().to_owned();
-                    let (plugin, version) = (cell(0), cell(1));
-                    if plugin.is_empty() || version.is_empty() || saved.kept.contains_key(&plugin) || saved.approved.contains_key(&plugin) {
-                        continue;
-                    }
-                    match cell(2).as_str() {
-                        "keep" => drop(saved.kept.insert(plugin, version)),
-                        "use" => drop(saved.approved.insert(plugin, version)),
-                        "merge" => {
-                            saved.approved.insert(plugin.clone(), version.clone());
-                            saved.merged.insert(plugin, version);
-                        }
-                        _ => {}
-                    }
-                }
-            }),
-            Err(error) => tracing::warn!(error = %error.message, "the update choices were not read from the graph"),
-        }
         match self.graph.newest(UPDATES, RECENT as u64).await {
             Ok(entries) => self.with_status(|status| {
                 let known: BTreeSet<(String, String, u64)> = status.recent.iter().map(|a| (a.plugin.clone(), a.version.clone(), a.ms)).collect();
@@ -313,30 +267,6 @@ impl Updater {
             ("failed_under", json!(failed_under)),
         ]);
         self.graph.put(vec![graph::node(FAILURE, &failed.plugin, props)], vec![graph::edge((FAILURE, &failed.plugin), "ON", graph::machine())]);
-    }
-
-    /// Write the user's answer for `plugin` as `saved` holds it now (none: retired).
-    fn put_choice(&self, saved: &mut Saved, plugin: &str) {
-        let choice = match (saved.approved.get(plugin), saved.kept.get(plugin)) {
-            (Some(version), _) => Some((version.clone(), if saved.merged.get(plugin) == Some(version) { "merge" } else { "use" })),
-            (None, Some(version)) => Some((version.clone(), "keep")),
-            (None, None) => None,
-        };
-        match choice {
-            Some((version, choice)) => {
-                let mut node = graph::node(CHOICE, plugin, graph::props([("version", json!(version))]));
-                node.temporal.insert("choice".into(), json!(choice));
-                self.graph.put(vec![node], vec![graph::edge((CHOICE, plugin), "ON", graph::machine())]);
-            }
-            None => self.graph.retire(vec![graph::at(CHOICE, plugin)], "done"),
-        }
-    }
-
-    /// Change the user's answers for `plugin` and write them.
-    fn with_choice(&self, plugin: &str, change: impl FnOnce(&mut Saved)) {
-        let mut saved = self.saved.lock().unwrap_or_else(|p| p.into_inner());
-        change(&mut saved);
-        self.put_choice(&mut saved, plugin);
     }
 
     /// The failures of `plugins` are over: dropped from memory, retired in the graph.
@@ -650,11 +580,6 @@ impl Updater {
                 continue;
             }
             let failed = self.failures_over(std::slice::from_ref(&id), "reset");
-            self.with_choice(&id, |saved| {
-                saved.kept.remove(&id);
-                saved.approved.remove(&id);
-                saved.merged.remove(&id);
-            });
             self.with_status(|status| status.failed = failed);
             if item.action == reset_actions::INSTALL {
                 packages.push((item, package));
@@ -717,17 +642,9 @@ impl Updater {
         }
         match params.choice.as_str() {
             choices::KEEP => {
-                self.with_choice(&params.plugin, |saved| drop(saved.kept.insert(params.plugin.clone(), params.version.clone())));
                 self.record(&params.plugin, &params.version, "kept", "Your version stays; the next release asks again.");
             }
-            choices::USE => self.with_choice(&params.plugin, |saved| {
-                saved.approved.insert(params.plugin.clone(), params.version.clone());
-                saved.merged.remove(&params.plugin);
-            }),
-            choices::MERGE => self.with_choice(&params.plugin, |saved| {
-                saved.approved.insert(params.plugin.clone(), params.version.clone());
-                saved.merged.insert(params.plugin.clone(), params.version.clone());
-            }),
+            choices::USE | choices::MERGE => {}
             other => return Err(RpcError::invalid_params(format!("choice `{other}`: give `{}`, `{}` or `{}`", choices::USE, choices::KEEP, choices::MERGE))),
         }
         self.with_status(|status| status.pending.retain(|pending| pending.plugin != params.plugin));
@@ -954,34 +871,17 @@ impl Updater {
             let all = self.failures_over(&stale, "over");
             self.with_status(|status| status.failed = all);
         }
-        let saved = self.saved.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        let (mut auto, mut pending) = (Vec::new(), Vec::new());
+        // Every plugin runs the latest release: whatever differs from it installs, every check (a
+        // failure is tried again at the next one). The user's data changes are merged in.
+        let mut auto = Vec::new();
         for (item, package) in items {
             let Some(package) = package else { continue };
-            // Updates only go forward: a version newer than the release (a local build) stays; a reset
-            // is what puts the release back.
-            if item.action != reset_actions::INSTALL || is_own_build(&item.installed) || release::is_newer(&item.installed, &item.release) {
+            if item.action != reset_actions::INSTALL {
                 continue;
             }
-            if saved.kept.get(&item.plugin) == Some(&item.release) || saved.failed.get(&item.plugin).is_some_and(|failed| failed.version == item.release) {
-                continue;
-            }
-            let approved = saved.approved.get(&item.plugin) == Some(&item.release);
-            if !item.files.is_empty() && !approved {
-                pending.push(Pending {
-                    plugin: item.plugin.clone(),
-                    name: item.name.clone(),
-                    version: item.release.clone(),
-                    from: item.from.clone(),
-                    installed: item.installed.clone(),
-                    files: item.files.clone(),
-                });
-                continue;
-            }
-            let merge = saved.merged.get(&item.plugin) == Some(&item.release);
-            auto.push(Planned { id: item.plugin, name: item.name, version: item.release, package, drop_changes: approved && !merge });
+            auto.push(Planned { id: item.plugin, name: item.name, version: item.release, package, drop_changes: false });
         }
-        (auto, pending)
+        (auto, Vec::new())
     }
 
     /// Get the package, put its data in, install: every planned plugin.
@@ -1015,15 +915,14 @@ impl Updater {
                 self.step(&[&id], "installing", None, format!("Installing {id} {version}"));
                 self.merge_data(ctx, &id, &version, &package, &work).await
             };
+            // Changes that do not merge give way to the release's data: the plugin updates all the same.
+            let data = match data {
+                Err(_) if !plan.drop_changes => self.reset_data(ctx, &id, &version, &package, &work).await,
+                other => other,
+            };
             match data {
                 Ok(()) => set.push((plan, package)),
                 Err(error) => {
-                    // A clash asks no more for this version; the user sees why.
-                    self.with_choice(&id, |saved| {
-                        saved.approved.remove(&id);
-                        saved.merged.remove(&id);
-                        saved.kept.insert(id.clone(), version.clone());
-                    });
                     self.record(&id, &version, "failed", error);
                 }
             }
@@ -1038,10 +937,6 @@ impl Updater {
 
     fn installed(&self, plan: &Planned) {
         let failed = self.failures_over(std::slice::from_ref(&plan.id), "installed");
-        self.with_choice(&plan.id, |saved| {
-            saved.approved.remove(&plan.id);
-            saved.merged.remove(&plan.id);
-        });
         self.record(&plan.id, &plan.version, "installed", "");
         self.with_status(|status| status.failed = failed);
     }
@@ -1058,7 +953,6 @@ impl Updater {
         let failed = Failed { plugin: plan.id.clone(), name: plan.name.clone(), version: plan.version.clone(), error: error.clone(), ms: now_ms(), seen: false };
         let frame = self.running_frame();
         self.put_failure(&failed, &frame);
-        self.with_choice(&plan.id, |saved| drop(saved.approved.remove(&plan.id)));
         let all = self.with_saved(|saved| {
             saved.failed.insert(plan.id.clone(), failed);
             saved.failed_under.insert(plan.id.clone(), frame);
@@ -1200,11 +1094,6 @@ fn same_version(a: &str, b: &str) -> bool {
     }
 }
 
-/// A build of the user's own (`cortex-pack build --install`): `0.1.0+dev.20261027.004548`.
-fn is_own_build(version: &str) -> bool {
-    version.split('+').nth(1).is_some_and(|tag| tag.starts_with("dev."))
-}
-
 /// The frame's answer when a frame update is staged: it keeps the packages for the restart.
 const RESTART_PENDING: &str = "restart_pending";
 
@@ -1216,9 +1105,26 @@ enum Placed {
 }
 
 async fn install_many(ctx: &Ctx, packages: Vec<&Path>) -> Result<Placed, String> {
+    // A package of exactly the version that runs already is done (a batch that failed partway, or
+    // the frame installing it at start): installing it again would be refused as in use.
+    let running: BTreeMap<String, String> = call::<PluginListResult>(ctx, frame_methods::PLUGINS_LIST, json!({}))
+        .await
+        .map(|list| list.units.into_iter().map(|unit| (unit.id, unit.version)).collect())
+        .unwrap_or_default();
+    let mut rest = Vec::new();
+    for package in packages {
+        let manifest = fetch::manifest(package).await.unwrap_or(Value::Null);
+        let (id, version) = (manifest["plugin"]["id"].as_str().unwrap_or(""), manifest["plugin"]["version"].as_str().unwrap_or(""));
+        if id.is_empty() || running.get(id).is_none_or(|running| running != version) {
+            rest.push(package);
+        }
+    }
+    if rest.is_empty() {
+        return Ok(Placed::Now);
+    }
     let params = InstallManyParams {
         id: format!("update-{}", uuid::Uuid::new_v4().simple()),
-        paths: packages.iter().map(|path| path.to_string_lossy().into_owned()).collect(),
+        paths: rest.iter().map(|path| path.to_string_lossy().into_owned()).collect(),
     };
     match call::<InstallManyResult>(ctx, frame_methods::PLUGINS_INSTALL_MANY, json!(params)).await {
         Ok(result) if result.ok => Ok(Placed::Now),
