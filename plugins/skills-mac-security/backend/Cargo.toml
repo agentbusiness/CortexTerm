@@ -1,0 +1,18 @@
+[package]
+name = "cc-skills-mac-security"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+description = "CortexTerm skills@1 plugin: Mac security skills for the model."
+
+# Own workspace: every plugin directory builds independently.
+[workspace]
+
+[[bin]]
+name = "cc-skills-mac-security"
+path = "src/main.rs"
+
+[dependencies]
+cc-lang-kit = { path = "../../../lang-kit" }

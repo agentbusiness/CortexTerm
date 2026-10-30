@@ -1,0 +1,10 @@
+{
+  "about": "Files the big macOS and supply-chain campaigns of 2025 and 2026 leave behind. `home` paths are under the home folder, `system` paths are absolute, `repo` paths are inside each known repository, `package` names are files at the top of a package in a repository's node_modules. Any hit is reported as high.",
+  "campaigns": [
+    { "name": "AMOS (Atomic Stealer)", "home": [".helper", ".agent"], "system": ["/Library/LaunchDaemons/com.finder.helper.plist"] },
+    { "name": "Nx s1ngularity", "system": ["/tmp/inventory.txt", "/tmp/inventory.txt.bak"] },
+    { "name": "Shai-Hulud", "home": [".dev-env", ".truffler-cache"], "repo": [".github/workflows/discussion.yaml", ".github/workflows/shai-hulud-workflow.yml", "setup_bun.js", "bun_environment.js", "truffleSecrets.json", "actionsSecrets.json"], "package": ["setup_bun.js", "bun_environment.js", "truffleSecrets.json", "actionsSecrets.json"] },
+    { "name": "Banshee", "home": ["password-entered"] },
+    { "name": "InvisibleFerret", "home": [".pyp", ".n2", ".npl"] }
+  ]
+}

@@ -1,0 +1,54 @@
+[package]
+name = "cc-terminal"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+description = "CortexTerm terminal@1 plugin: PTY terminals running the user's login shell, with output events and VT-parsed screen snapshots."
+
+# Own workspace: every plugin directory builds independently.
+[workspace]
+
+[lib]
+name = "cc_terminal"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cc-terminal"
+path = "src/main.rs"
+
+# The PTY daemon that owns the shells (shipped beside cc-terminal; see src/daemon.rs).
+[[bin]]
+name = "cortexd"
+path = "src/cortexd.rs"
+
+[dependencies]
+cc-protocol = { path = "../../../protocol", features = ["terminal", "memory", "service"] }
+# The write sandbox both apps share (identical in CortexCode and CortexTerm).
+tokio-util = "0.7"
+cc-sandbox-kit = { path = "../../../sandbox-kit" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
+portable-pty = "0.9"
+vt100 = "0.16"
+base64 = "0.22"
+libc = "0.2"
+uuid = { version = "1.23", features = ["v4"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Only to import, once, the Runs an earlier version kept in runs.db and runs/<id>.zst (src/migrate.rs).
+rusqlite = { version = "0.40", features = ["bundled"] }
+zstd = "0.13"
+glob = "0.3"
+regex = "1"
+# The paste guard's lookups (the script a `curl | sh` would run, OSV for packages).
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
+[dev-dependencies]
+tempfile = "3.27"
+tokio = { version = "1.53", features = ["process", "net"] }

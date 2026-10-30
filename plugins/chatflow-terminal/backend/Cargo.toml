@@ -1,0 +1,29 @@
+[package]
+name = "cc-chatflow-terminal"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+description = "CortexTerm chatflow@1 plugin (chatflow-terminal): questions, commands, explanations and fixes over the user's shell."
+
+# Own workspace: every plugin directory builds independently.
+[workspace]
+
+[[bin]]
+name = "cc-chatflow-terminal"
+path = "src/main.rs"
+
+[dependencies]
+cc-protocol = { path = "../../../protocol", features = ["chatflow", "mesh", "model", "terminal", "system", "service", "skills"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+uuid = { version = "1.23", features = ["v4"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+debug = false
+lto = "thin"

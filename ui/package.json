@@ -1,0 +1,48 @@
+{
+  "name": "cortexterm-ui",
+  "private": true,
+  "version": "0.1.11",
+  "description": "CortexTerm window shell: the Electron shell the frame starts, the UI SDK and the build of every UI package",
+  "type": "module",
+  "main": "shell/main.js",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc -b",
+    "postinstall": "install-electron && node scripts/brand-electron.mjs",
+    "brand:electron": "node scripts/brand-electron.mjs"
+  },
+  "dependencies": {
+    "ws": "8.22.0"
+  },
+  "devDependencies": {
+    "@codemirror/commands": "6.11.1",
+    "@codemirror/language": "6.13.1",
+    "@codemirror/language-data": "6.5.2",
+    "@codemirror/merge": "6.12.3",
+    "@codemirror/search": "6.7.2",
+    "@codemirror/state": "6.7.6",
+    "@codemirror/view": "6.43.15",
+    "@electron/fuses": "2.1.3",
+    "@fontsource-variable/archivo": "5.3.0",
+    "@fontsource-variable/source-serif-4": "5.3.1",
+    "@lezer/highlight": "1.2.5",
+    "@types/node": "22.20.5",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@types/ws": "8.18.2",
+    "@vitejs/plugin-react": "6.1.2",
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/addon-webgl": "0.19.0",
+    "@xterm/xterm": "6.0.0",
+    "electron": "44.9.3",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1",
+    "typescript": "6.0.3",
+    "vite": "8.3.5"
+  },
+  "workspaces": [
+    "sdk"
+  ]
+}

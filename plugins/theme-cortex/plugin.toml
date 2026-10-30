@@ -1,0 +1,24 @@
+# CortexTerm plugin manifest (plugin.toml, schema ccplugin/1). One folder is one plugin: its backend,
+# UI packages, shell modules, verification and README together, separable into its own repository
+# (only cc-protocol and @cortex/sdk come from outside). `cortex-pack` builds the folder and packs it
+# into a portable .ccplugin; the frame runs it only as an installed package.
+# Paths are relative to this folder.
+
+[plugin]
+id = "theme-cortex"
+name = "Cortex theme"
+version = "0.1.8"
+description = "CortexTerm's design language: tokens for both grounds, the bundled faces, base and component styles, and the derived CodeMirror and xterm themes."
+license = "UNLICENSED"
+platforms = ["macos", "linux"]
+
+# UI packages: one npm workspace rooted at ui/ (own package-lock.json); each package builds
+# <dir>/dist with manifest.json {id, version, slot, entry, css}, which the frame serves.
+[ui]
+dir = "ui"
+build = ["npm", "run", "build"]
+
+[[ui.package]]
+dir = "ui/theme"
+id = "theme-cortex.theme"
+slot = "theme@1"

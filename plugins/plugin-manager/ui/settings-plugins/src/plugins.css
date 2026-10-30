@@ -1,0 +1,38 @@
+/* settings.plugins@1 — one table: a plugin per line (name, version, switch); an opened plugin's
+   parts (version, service, UI packages, app-shell modules) indented under it, their facts stacked,
+   the actions wrapping, and a swap's timings on a full-width row of their own. */
+#cc .cx-plugins{width:100%;table-layout:fixed;}
+#cc .cx-plugins td{font-size:13.5px;vertical-align:top;overflow-wrap:anywhere;}
+#cc .cx-plugins .cx-col-name{width:40%;}
+#cc .cx-plugins .cx-col-facts{width:34%;}
+#cc .cx-plugins tr.cx-unit td{padding-top:8px;padding-bottom:8px;vertical-align:middle;}
+#cc .cx-plugins tr.cx-unit td:last-child{text-align:right;}
+#cc .cx-plugins tr.cx-open td{border-bottom:0;}
+#cc .cx-plugin-name{all:unset;cursor:pointer;color:var(--ink);}
+#cc .cx-plugin-name:hover,#cc .cx-plugin-name[aria-expanded="true"]{color:var(--rubric);}
+#cc .cx-plugin-name:focus-visible{outline:1px solid var(--rubric);outline-offset:2px;}
+#cc .cx-plugins .sw:disabled{cursor:default;border-color:var(--rule);}
+#cc .cx-plugins .cx-official{margin-right:12px;vertical-align:middle;}
+#cc .cx-plugins .cx-col-acts{width:26%;}
+#cc .cx-plugins tr.cx-part td{border-bottom:0;padding-top:2px;padding-bottom:6px;}
+#cc .cx-plugins tr.cx-part td:first-child{padding-left:20px;}
+#cc .cx-plugins .cx-part-kind{display:inline-block;min-width:64px;color:var(--faint,inherit);opacity:.7;font-size:11px;letter-spacing:.08em;text-transform:uppercase;}
+#cc .cx-plugins .cx-on{color:var(--counter);}
+#cc .cx-plugins .cx-off{color:var(--rubric);}
+#cc .cx-plugins .cx-sub{display:block;margin:4px 0 0;padding:0;line-height:1.4;}
+#cc .cx-plugin-acts{display:flex;flex-wrap:wrap;gap:4px;justify-content:flex-end;}
+#cc .cx-plugins tr.cx-has-swap td{border-bottom:0;}
+#cc .cx-plugins tr.cx-swap-row td{padding-top:0;}
+#cc .cx-swap{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;}
+#cc .cx-steps{display:flex;flex-wrap:wrap;gap:4px 12px;min-width:0;}
+#cc .cx-settings-lead{margin:0 0 8px;}
+/* Reset all plugins: one line and its button above the table; the sheet lists one plugin per row. */
+#cc .cx-reset-all{display:flex;flex-wrap:wrap;align-items:center;gap:6px 16px;margin:0 0 14px;padding:10px 0;border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);}
+#cc .cx-reset-status{flex:1;min-width:240px;display:flex;flex-direction:column;gap:2px;}
+#cc .cx-reset-status .t{color:var(--ink);line-height:1.4;}
+#cc .cx-reset-status .cx-settings-line{margin:0;}
+#cc .cx-reset-all[data-reset-state="differs"] .cx-reset-status .t{color:var(--rubric);}
+#cc .cx-reset-list{list-style:none;margin:8px 0 0;padding:0;max-height:40vh;overflow:auto;}
+#cc .cx-reset-list li{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 12px;padding:5px 0;border-bottom:1px solid var(--rule);}
+#cc .cx-reset-list li .t{flex:1;min-width:140px;}
+#cc .cx-reset-list li .ap{text-align:right;}

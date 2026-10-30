@@ -1,0 +1,20 @@
+# CortexTerm plugin manifest (plugin.toml, schema ccplugin/1).
+
+[plugin]
+id = "chatflow-terminal"
+name = "Terminal flow"
+version = "0.1.11"
+description = "The terminal chat flow: plain-language questions about the shell and the machine, one proposed command checked by the risk engine, explanations of commands, lines and processes, and fixes for failed Runs."
+license = "UNLICENSED"
+platforms = ["macos", "linux"]
+
+[backend]
+category = "chatflow-terminal"
+contract = "chatflow@1"
+dir = "backend"
+build = ["cargo", "build", "--release"]
+exec = "backend/target/release/cc-chatflow-terminal"
+
+# The prompts are live data: edited in place in the live folder while the app runs.
+[data]
+dirs = ["data"]

@@ -1,0 +1,29 @@
+# CortexTerm plugin manifest (plugin.toml, schema ccplugin/1). One folder is one plugin: its backend,
+# data, verification and README together, separable into its own repository (only cc-protocol and
+# cc-lang-kit come from outside). `cortex-pack` builds the folder and packs it into a portable
+# .ccplugin; the frame runs it only as an installed package.
+# Paths are relative to this folder.
+
+[plugin]
+id = "skills-mac-security"
+name = "Mac security"
+version = "0.1.2"
+description = "Security know-how for the model: check the Mac on request, look up a CVE, explain a finding, and calm, ordered steps after a suspected hack."
+license = "UNLICENSED"
+platforms = ["macos"]
+
+# The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace).
+# One skills plugin per body of know-how: the `skills` family, category `skills-<id>`, contract
+# `skills@1`. `data/` (the skills, the `macsec` script and the security notes) is the plugin's
+# data (`[data]`).
+[backend]
+category = "skills-mac-security"
+contract = "skills@1"
+dir = "backend"
+build = ["cargo", "build", "--release"]
+exec = "backend/target/release/cc-skills-mac-security"
+
+# The plugin's data: packed at the same path; the app reads it live in the live folder
+# (<home>/live/plugins/skills-mac-security/data), where the model runs data/scripts/macsec.
+[data]
+dirs = ["data"]

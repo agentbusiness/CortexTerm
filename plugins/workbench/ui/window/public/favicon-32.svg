@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" shape-rendering="crispEdges">
+  <title>CortexTerm favicon, 32 px cut</title>
+  <rect width="32" height="32" fill="#14171A"/>
+  <path d="M7 8 12 16 7 24" fill="none" stroke="#E9EBEC" stroke-width="2" stroke-linecap="square" shape-rendering="geometricPrecision"/>
+  <rect x="15" y="22" width="11" height="2" fill="#E9EBEC"/>
+  <rect x="22" y="17" width="4" height="4" fill="#E2603F"/>
+</svg>

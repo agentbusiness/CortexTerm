@@ -1,0 +1,14 @@
+/* pane.terminal@1 — xterm on the ground, inset from the pane's hairlines. */
+#cc .cx-terminal{flex:1;min-height:0;display:flex;flex-direction:column;}
+#cc .cx-terminal>.bar{padding-left:16px;}
+#cc .cx-xterm{flex:1;min-height:0;padding:8px 8px 8px 16px;background:var(--ground);}
+#cc .cx-xterm .xterm{height:100%;}
+#cc .cx-xterm .xterm-viewport{background:var(--ground) !important;}
+#cc .cx-terminal-error{display:flex;align-items:center;gap:8px;padding:0 16px;}
+#cc .cx-terminal-ended{padding:0 16px 8px 16px;}
+/* The link confirm: the theme's modal card, narrow; the address breaks anywhere. */
+#cc .cx-terminal-link{width:min(440px,100%);}
+#cc .cx-terminal-link-title{margin:0 0 8px;font-size:17px;font-weight:600;color:var(--ink);}
+#cc .cx-terminal-link-body{margin:0;font-size:14px;line-height:1.45;color:var(--ink-2);}
+#cc .cx-terminal-link-url{margin:8px 0 0;font-family:var(--font-mono);font-size:13px;color:var(--ink);overflow-wrap:anywhere;}
+#cc .cx-terminal-link-actions{justify-content:flex-end;margin-top:16px;}

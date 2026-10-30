@@ -1,0 +1,10 @@
+# The configuration of a released frame (`<home>/frame/<version>/cortex.toml`, from
+# scripts/release-frame.sh), read by the frame beside it. As scripts/app/cortex.toml, without the
+# app's packages: a released frame's plugins come by updates (`plugins/updater`), never from the
+# frame folder. The schema is documented in cortex.toml.
+
+[frame]
+home = "~/.cortexterm"
+port = 0
+ui = true
+ui_dir = "ui"

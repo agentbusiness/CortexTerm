@@ -1,0 +1,46 @@
+# CortexTerm plugin manifest (plugin.toml, schema ccplugin/1). One folder is one plugin: its backend
+# and UI package together, separable into its own repository (only cc-protocol and @cortex/sdk come
+# from outside). `cortex-pack` builds the folder and packs it into a portable .ccplugin; the frame
+# runs it only as an installed package. Paths are relative to this folder.
+
+[plugin]
+id = "mesh"
+name = "Mesh"
+version = "0.1.17"
+description = "This person's CortexTerm instances linked together: pairing with a short code, a signed membership, encrypted connections over the local network or a relay, capability cards, and borrowing a member's model or hands through the frame's own contracts."
+license = "UNLICENSED"
+platforms = ["macos", "linux"]
+
+# The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace).
+[backend]
+category = "mesh"
+contract = "mesh@1"
+dir = "backend"
+build = ["cargo", "build", "--release"]
+exec = "backend/target/release/cc-mesh"
+swap = "blue_green"
+provides = [
+  "mesh.status", "mesh.pair.start", "mesh.pair.join", "mesh.pair.cancel", "mesh.members", "mesh.revoke",
+  "mesh.leave", "mesh.name", "mesh.card", "mesh.peers", "mesh.call", "mesh.place", "mesh.place.end",
+  "mesh.capacity", "mesh.projects", "mesh.link", "mesh.claim", "mesh.release", "mesh.model.yield",
+]
+subscribes = ["model.", "plugin.state", "plugin.swapped", "session.changed", "project.", "memory.knowledge.changed"]
+publishes = ["mesh.changed"]
+uses = ["frame.machine", "frame.plugins.list", "frame.project.list", "frame.session.list", "memory.knowledge.list", "memory.graph.machine", "memory.graph.put", "memory.graph.retire", "memory.graph.query", "memory.stream.append", "memory.stream.read", "memory.stream.topics", "memory.settings.get", "memory.settings.set", "model.info", "model.slots", "model.metrics", "model.yield", "agents.scheduler", "container.list"]
+
+# Defaults for the frame config's [plugin.config] table (the frame config's values win).
+[backend.config]
+# Relay servers members use to reach each other when no direct connection can be made across
+# networks (empty: n0's public relays). A company with its own iroh relay lists its URL here.
+relays = []
+
+# UI packages: one npm workspace rooted at ui/ (own package-lock.json); each package builds
+# <dir>/dist with manifest.json {id, version, slot, entry, css}, which the frame serves.
+[ui]
+dir = "ui"
+build = ["npm", "run", "build"]
+
+[[ui.package]]
+dir = "ui/settings-mesh"
+id = "mesh.settings"
+slot = "settings.mesh@1"

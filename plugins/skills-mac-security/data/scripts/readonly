@@ -1,0 +1,3 @@
+# The scripts the model may run on its own, one line each: the script's name, then the subcommands
+# that only read.
+macsec check cve areas help

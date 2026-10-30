@@ -1,0 +1,122 @@
+/* workbench.sidebar@1 — the list column, in the design's `.lst` and `.nav` grammar. */
+#cc .cx-sidebar{flex:1;min-height:0;display:flex;flex-direction:column;}
+#cc .cx-sidebar>.bar{padding:8px 16px 8px 0;gap:8px;justify-content:flex-start;box-sizing:border-box;min-height:0px;}
+#cc .cx-sidebar .cx-action{flex:0 0 auto;}
+#cc .cx-sidebar>.inline-error{margin:8px 16px 0 0;}
+#cc .cx-sidebar-scroll{flex:1;min-height:0;overflow:auto;padding:0 0 24px;}
+#cc .cx-pad{padding:16px 16px 0 0;}
+#cc .cx-flush{padding:0;}
+
+/* A project is a heading row: its name set like the index's names (its folder in the tooltip). */
+#cc .cx-proj{border-bottom:1px solid var(--rule);padding:0 0 2px;}
+#cc .cx-proj-h{display:flex;align-items:center;gap:8px;padding:8px 16px 2px 0;min-width:0;}
+/* Conversations at work in the project: a count in a rubric box. */
+#cc .cx-run-badge{
+  display:inline-flex;align-items:center;justify-content:center;min-width:16px;height:16px;padding:0 4px;box-sizing:border-box;
+  border:1px solid var(--rubric);color:var(--rubric);font-family:var(--font-apparatus);font-size:9.5px;font-weight:700;line-height:1;
+}
+#cc .cx-proj-h .grow{flex:1;}
+#cc .cx-proj-toggle{
+  display:inline-flex;align-items:center;gap:8px;border:0;background:transparent;padding:0;cursor:pointer;
+  min-width:0;color:var(--ink-2);
+}
+#cc .cx-proj-toggle:hover{color:var(--ink);}
+#cc .cx-proj-open{min-width:0;}
+#cc .cx-proj-open[aria-pressed="true"] .cx-proj-name{color:var(--rubric);}
+#cc .cx-caret{width:8px;height:8px;flex:0 0 auto;color:var(--ink-3);}
+#cc .cx-proj-name{
+  font-family:var(--font-apparatus);font-size:10.5px;font-weight:600;letter-spacing:.15em;text-transform:uppercase;
+  color:inherit;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+#cc .cx-proj.on .cx-proj-name{color:var(--ink);}
+#cc .cx-proj.on .cx-caret{color:var(--rubric);}
+/* Another computer's project: its name in the counter blue, selected or not. */
+#cc .cx-proj.cx-proj-remote .cx-proj-name,#cc .cx-proj.cx-proj-remote .cx-proj-open[aria-pressed="true"] .cx-proj-name{color:var(--counter);}
+#cc .cx-proj-away{opacity:.5;}
+#cc .cx-proj-away .cx-proj-toggle{cursor:default;}
+/* Under the name: the computer (another one's) and the project's description, one line. */
+#cc .cx-proj-about{
+  margin:0;padding:0 16px 4px 16px;font-size:12px;line-height:1.35;color:var(--ink-3);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+#cc .cx-proj-host{font-family:var(--font-apparatus);font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--counter);}
+#cc .cx-strip-remote .cx-strip-code{color:var(--counter);}
+
+#cc .cx-sessions,#cc .cx-agents{margin:0;}
+#cc .cx-sessions li:last-child,#cc .cx-agents li:last-child{border-bottom:0;}
+#cc .cx-sidebar .lst button{padding:5px 16px 5px 16px;}
+#cc .cx-sidebar .lst button:disabled{cursor:default;}
+#cc .cx-sidebar .lst button:disabled:hover{background:transparent;}
+#cc .cx-sidebar .lst .t{font-size:14px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+#cc .cx-sidebar .lst .r{margin-top:2px;align-items:center;gap:8px;}
+#cc .cx-sidebar .lst .r .ap{white-space:nowrap;}
+#cc .cx-none button .t{font-style:italic;color:var(--ink-3);font-size:14px;}
+#cc .cx-none button:hover .t{color:var(--ink);}
+
+#cc .cx-sub{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 16px 2px 16px;}
+#cc .cx-task{color:var(--ink-2);}
+/* Agents are orange, so they never read as a remote project (counter blue). */
+#cc .cx-agents .cx-at,#cc .cx-agents .ap.origin{color:var(--rubric-lift);}
+/* An agent whose model runs on another computer: its role in the counter blue of other computers. */
+#cc .cx-agents .ap.cx-away{color:var(--counter);}
+#cc .cx-agents .cx-pip-running,#cc .cx-agents .cx-pip-working,#cc .cx-agents .cx-pip-in_progress,#cc .cx-agents .cx-pip-verifying{background:var(--rubric-lift);}
+
+
+/* A conversation or agent that needs the person (an ask-mode call to allow, a block) is washed in
+   rubric: the one place the list spends its accent besides the selection. */
+#cc .cx-sidebar li.cx-attn>button{background:var(--rubric-wash);}
+/* A notification shown only here (the window was in front, or macOS did not show it) marks its row
+   with a rule and a tag until the session is opened. */
+#cc .cx-sidebar li.cx-notice>button{background:var(--rubric-wash);box-shadow:inset 2px 0 0 var(--rubric);}
+#cc .cx-sidebar .cx-notice-tag{white-space:nowrap;}
+#cc .cx-strip-mark.cx-notice{box-shadow:inset 0 0 0 1px var(--rubric);}
+
+/* the open sidebar's foot: Fold (its caret alone, at the right), which leaves the strip. Level
+   with the composer's buttons: their foot is the conversation's 12px, the box's 1px rule and the
+   tools' 8px above the window's bottom. */
+#cc .cx-sidebar-foot{flex:0 0 auto;display:flex;align-items:center;justify-content:flex-end;padding:8px 16px 21px 0;}
+#cc .cx-sidebar-fold{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0;}
+#cc .cx-sidebar-fold,#cc .cx-sidebar-fold:hover{border-color:transparent;}
+#cc .cx-sidebar-fold svg{width:8px;height:8px;}
+/* folded: a 44px rail — New chat, then per project (a hairline apart) one 32px mark per
+   conversation and agent: a short code with its state as a dot in the corner; Show at the foot,
+   where the open sidebar has Fold */
+#cc .cx-strip{align-items:center;padding:8px 0 0;gap:4px;border-right:0;}
+#cc .cx-strip>.cx-slot{flex:0 0 auto;}
+#cc .cx-strip-scroll{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;scrollbar-width:none;display:flex;flex-direction:column;align-items:center;gap:4px;padding:4px 0 8px;width:100%;}
+#cc .cx-strip-project{display:flex;flex-direction:column;align-items:center;gap:4px;padding:4px 0 0;border-top:1px solid var(--rule);width:100%;}
+#cc .cx-strip-project:empty{display:none;}
+#cc .cx-strip .cx-strip-mark{position:relative;font-size:10px;letter-spacing:.02em;}
+#cc .cx-strip-code{display:inline-flex;align-items:baseline;max-width:30px;overflow:hidden;white-space:nowrap;}
+#cc .cx-strip-at{font-size:9px;color:var(--ink-3);}
+/* the state dot sits in the mark's corner; a mark that needs the person or carries a notification
+   takes the rubric */
+#cc .cx-strip-mark .cx-pip{position:absolute;top:3px;right:3px;}
+#cc .cx-strip-mark.cx-attn .cx-pip,#cc .cx-strip-mark.cx-notice .cx-pip{background:var(--rubric);box-shadow:none;}
+/* A running conversation's mark is outlined, not only dotted: visible from across the room. */
+#cc .cx-strip-mark[data-status="running"],#cc .cx-strip-mark[data-status="working"]{box-shadow:inset 0 0 0 1px var(--rubric);}
+#cc .cx-strip-foot{width:100%;justify-content:center;padding:8px 0 21px;}
+
+/* Delete: a small × at the right end of a conversation row and of a project heading, shown on
+   hover. The row is the conversation's button and the × beside it, so the whole row washes on
+   hover; a list's buttons are full-width rows (the theme's `.lst button`), so the × takes its own
+   small box (a full-width invisible × once covered the row and deleted on a click). */
+#cc .cx-sidebar li.cx-row{display:flex;align-items:center;}
+#cc .cx-sidebar li.cx-row:hover{background:var(--rubric-wash);}
+#cc .cx-sidebar li.cx-row>button:first-child{flex:1;min-width:0;}
+#cc .cx-sidebar li.cx-row>button:first-child:hover{background:transparent;}
+#cc .cx-sidebar button.cx-del{
+  flex:0 0 22px;display:none;align-items:center;justify-content:center;width:22px;height:22px;padding:0;
+  border:0;background:transparent;cursor:pointer;color:var(--ink-3);font-size:15px;line-height:1;
+}
+#cc .cx-sidebar .lst li.cx-row>button.cx-del{margin:0 16px 0 0;}
+#cc .cx-sidebar .lst li.cx-row>button.cx-del:hover{background:transparent;}
+/* Hidden, it takes no room: the row's text runs the full width until the row is hovered or focused. */
+#cc .cx-sidebar li.cx-row:hover>button.cx-del,#cc .cx-sidebar li.cx-row:focus-within>button.cx-del,
+#cc .cx-proj-h:hover>button.cx-del,#cc .cx-proj-h:focus-within>button.cx-del{display:inline-flex;}
+#cc .cx-sidebar button.cx-del:hover{color:var(--rubric);}
+/* The delete confirm: the theme's modal card, narrow; the folder path breaks anywhere. */
+#cc .cx-confirm{width:min(440px,100%);}
+#cc .cx-confirm-title{margin:0 0 8px;font-size:17px;font-weight:600;color:var(--ink);}
+#cc .cx-confirm-body{margin:0;font-size:14px;line-height:1.45;color:var(--ink-2);overflow-wrap:anywhere;}
+#cc .cx-confirm-actions{justify-content:flex-end;margin-top:16px;}

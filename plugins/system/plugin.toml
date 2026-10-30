@@ -1,0 +1,24 @@
+# CortexTerm plugin manifest (plugin.toml, schema ccplugin/1). One folder is one plugin; `cortex-pack`
+# builds it and packs it into a portable .ccplugin. Paths are relative to this folder.
+
+[plugin]
+id = "system"
+name = "System"
+version = "0.1.13"
+description = "The machine itself, read without sudo: CPU, memory, GPU, power, disk, network and thermal samples; processes grouped by app or as a tree, with their ports; signals for your own processes; per-process GPU; watchers that post the obvious (runaway CPU, memory climb, disk full, new open port, new launch item); SSH hosts and keys, read only; scheduled commands and the daily workstation security sweep."
+license = "UNLICENSED"
+platforms = ["macos", "linux"]
+
+# The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace).
+[backend]
+category = "system"
+contract = "system@1"
+dir = "backend"
+build = ["cargo", "build", "--release"]
+exec = "backend/target/release/cc-system"
+
+# The plugin's data: the sweep's own malware rules and the list of known-campaign leftovers
+# (data/security), packed at the same path; the backend reads the live copy
+# (<home>/live/plugins/system/data) when present.
+[data]
+dirs = ["data"]

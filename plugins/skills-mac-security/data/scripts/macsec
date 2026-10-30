@@ -1,0 +1,5 @@
+#!/bin/sh
+# macsec: CortexTerm's Mac security checks. The terminal's assistant answers `macsec check|cve|areas`
+# inside the app (the system plugin); run here, in a shell, it only says where to ask.
+echo "macsec runs inside CortexTerm: ask its assistant (for example \"check my firewall\"), or open Alerts & Security." >&2
+exit 3
