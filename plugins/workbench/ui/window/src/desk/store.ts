@@ -1,13 +1,13 @@
 /**
  * The Desk's state. What a person arranged (Desks, their panes, which are on the Stage) is the
  * durable slot state the frame keeps (`useShared('ct.desks')`), so it is the same after a restart.
- * What the machines report (each shell's state, its last Run, this Mac's alerts) is live and lives
+ * What the machines report (each shell's state, its last Run) is live and lives
  * here; a shell on a joined computer reports through that computer's frame (`runtimeFor(node)`).
  */
 
 import { useSyncExternalStore } from 'react';
-import { runtime, runtimeFor } from '@cortex/sdk';
-import type { Alert, Run, TermState } from './api';
+import { runtimeFor } from '@cortex/sdk';
+import type { Run, TermState } from './api';
 
 export type PaneKind = 'term' | 'editor' | 'run' | 'process' | 'alerts' | 'ssh' | 'schedules';
 
@@ -61,7 +61,6 @@ class LiveStore {
   ended = new Map<string, number | null>();
   /** Panes with a proposed command or an answer the person has not looked at. */
   unseen = new Set<string>();
-  alerts: Alert[] = [];
   private listeners = new Set<() => void>();
   private finished = new Set<(run: Run, node: string | null) => void>();
   private version = 0;
@@ -90,17 +89,6 @@ class LiveStore {
     if (this.started) return;
     this.started = true;
     this.watch(null);
-    const client = runtime().client;
-    client.on('system.alert', (_topic, data) => {
-      const alert = data as Alert;
-      if (!alert?.id) return;
-      this.alerts = [alert, ...this.alerts.filter((other) => other.id !== alert.id)].slice(0, 50);
-      this.changed();
-    });
-    client.call<{ alerts: Alert[] }>('system.alerts', {}).then((list) => {
-      this.alerts = list?.alerts ?? [];
-      this.changed();
-    }).catch(() => undefined);
   }
 
   /** Listen to a computer's shells (null: this one's), once. */

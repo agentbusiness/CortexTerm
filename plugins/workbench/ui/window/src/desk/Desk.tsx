@@ -11,12 +11,12 @@
  * A pane may run on a joined computer (`PaneRec.node`): it renders inside that computer's
  * `ComputerScope`, so its calls go to that frame through `mesh.link`, and the Line, the AI and the
  * side pane follow the focused pane there. The nav lists this Mac first, then joined computers
- * that run CortexTerm, with each shell listed once under its computer.
+ * on the mesh, with each shell listed once under its computer.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Caret, ComputerScope, Divider, ago, errorMessage, runtime, runtimeFor, useEvent, useHost, useRuntime, useShared } from '@cortex/sdk';
+import { Caret, ComputerScope, Divider, ago, errorMessage, runtime, runtimeFor, useHost, useRuntime, useShared } from '@cortex/sdk';
 import './sidebar.css';
 import type { Proc, TermState } from './api';
 import { shortPath } from './api';
@@ -27,14 +27,14 @@ import { AlertsPane, EditorPane, ProcessPane, RunPane } from './Views';
 import { Investigate } from './Investigate';
 import { Traces } from './Traces';
 import { SchedulesPane, SshPane } from './Machines';
+import { Cluster, ComputerPicker, LOCAL_COMPUTER, useClusterLayout, type Computer } from './Cluster';
+import { useMachineAlerts } from './machine-data';
 import { EMPTY_DOC, NEEDS_YOU, STAGE_MAX, live, newId, useLive, type Attention, type DeskDoc, type DeskRec, type PaneRec } from './store';
 import './desk.css';
 
 interface TermInfo { term_id: string; cwd: string; alive: boolean }
 interface Place { path: string; runs: number; last: number; git: boolean }
 interface Peer { member: { node: string; name: string; local?: boolean }; card?: { name: string; software: string } | null; reachable: boolean; path: string }
-/** A joined computer that runs CortexTerm. */
-interface Computer { node: string; name: string; reachable: boolean; path: string }
 type Client = ReturnType<typeof runtime>['client'];
 
 const clientOf = (node?: string | null) => runtimeFor(node).client;
@@ -50,6 +50,7 @@ async function homeProject(client: Client): Promise<{ id: string; root: string }
 }
 
 type SideView = 'machine' | 'alerts' | 'traces' | 'ssh' | 'schedules' | 'log' | 'investigate';
+interface SideDetails { run?: string; pid?: number; trace?: string }
 
 const NAV = { def: 220, min: 160, max: 420, fold: 110 };
 const SIDE = { def: 420, min: 320, max: 760, fold: 220 };
@@ -97,20 +98,19 @@ function useColumns() {
 export function Desk() {
   useLive();
   const host = useHost();
-  const client = runtime().client;
+  const client = clientOf(null);
   const [doc, setDoc] = useShared<DeskDoc>('ct.desks', EMPTY_DOC);
   const [home, setHome] = useState('');
   const [projectId, setProjectId] = useState('');
   const [overlay, setOverlay] = useState<'map' | 'jump' | null>(null);
+  const [clusterOpen, setClusterOpen] = useState(false);
+  const closeCluster = useCallback(() => setClusterOpen(false), []);
   const [places, setPlaces] = useState<Place[]>([]);
   const [problem, setProblem] = useState<string | null>(null);
   const [settings, setSettings] = useShared<string | null>('settings.open', null);
-  const [sideView, setSideView] = useShared<SideView>('ct.side.view', 'machine');
-  const [sideRun, setSideRun] = useShared<string>('ct.side.run', '');
-  /** The process the Investigate tab shows (0: none, and no tab). */
-  const [sidePid, setSidePid] = useShared<number>('ct.side.pid', 0);
-  /** The trace the Traces tab shows ('': the list). */
-  const [sideTrace, setSideTrace] = useShared<string>('ct.side.trace', '');
+  const [requestedSideView, setSideView] = useShared<SideView>('ct.side.view', 'machine');
+  const [sideDetails, setSideDetails] = useShared<Record<string, SideDetails>>('ct.side.details', {});
+  const [sideChoice, setSideChoice] = useState<{ focus: string; node?: string } | null>(null);
   const line = useRef<LineHandle>(null);
   const watched = useRef(new Map<string, string>());
   const helpers = useRef(new Set<string>());
@@ -127,18 +127,20 @@ export function Desk() {
 
   // --- the joined computers ------------------------------------------------------------------
   const [computers, setComputers] = useState<Computer[]>([]);
-  const paneNodes = [...new Set(doc.desks.flatMap((entry) => entry.panes.flatMap((pane) => (pane.node ? [pane.node] : []))))].join(',');
   const readComputers = useCallback(() => {
-    const used = paneNodes.split(',');
-    client.call<{ peers: Peer[] }>('mesh.peers', {}).then((list) => setComputers((list?.peers ?? [])
-      // Another app on this Mac is not another computer; one that is away has no card to say
-      // what it runs, so it stays listed when a shell of this window is there.
-      .filter((peer) => !peer.member.local && (peer.card ? peer.card.software === 'cortexterm' : used.includes(peer.member.node)))
+    client.call<{ peers: Peer[] }>('mesh.peers', {}, { signal: AbortSignal.timeout(8000) }).then((list) => setComputers((list?.peers ?? [])
+      // Keep offline members even without a shell here; an absent card must not hide a machine.
+      // Another app on this Mac is still this computer.
+      .filter((peer) => !peer.member.local)
       .map((peer) => ({ node: peer.member.node, name: peer.card?.name || peer.member.name, reachable: peer.reachable, path: peer.path }))))
       .catch(() => undefined);
-  }, [client, paneNodes]);
-  useEffect(() => { readComputers(); }, [readComputers]);
-  useEvent('mesh.changed', () => readComputers());
+  }, [client]);
+  useEffect(() => {
+    const off = client.on('mesh.changed', () => readComputers());
+    readComputers();
+    const timer = setInterval(readComputers, 10_000);
+    return () => { off(); clearInterval(timer); };
+  }, [readComputers, client]);
   const nameOf = (node?: string) => (node ? computers.find((computer) => computer.node === node)?.name ?? 'another computer' : undefined);
 
   // --- boot: the home place, a Desk, live shells for every terminal pane ------------------------
@@ -253,6 +255,30 @@ export function Desk() {
 
   const focused = desk?.panes.find((pane) => pane.id === desk.focus && desk.stage.includes(pane.id)) ?? desk?.panes.find((pane) => desk.stage.includes(pane.id));
   const focusedTerm = focused?.kind === 'term' ? focused : desk?.panes.find((pane) => pane.kind === 'term' && desk.stage.includes(pane.id));
+
+  // A manual selection lasts until session focus changes. Deriving the target synchronously
+  // prevents a render (and RPC) against the previous computer when switching sessions.
+  const focusKey = JSON.stringify([desk?.id, focused?.id, focused?.node]);
+  const sideNode = sideChoice?.focus === focusKey ? sideChoice.node : focused?.node;
+  useEffect(() => setSideChoice(null), [focusKey]);
+  const selectSideNode = useCallback((node: string) => setSideChoice({ focus: focusKey, node: node || undefined }), [focusKey]);
+  const sideHome = sideNode ? '~' : home;
+  const machineOptions = [LOCAL_COMPUTER, ...computers];
+  if (sideNode && !machineOptions.some((computer) => computer.node === sideNode)) {
+    machineOptions.push({ node: sideNode, name: nameOf(sideNode) ?? 'Offline computer', reachable: false, path: '' });
+  }
+  const selectedComputer = machineOptions.find((computer) => computer.node === (sideNode ?? ''))!;
+  const cluster = useClusterLayout(machineOptions);
+  const { alerts: localAlerts } = useMachineAlerts(null);
+  const sideAlerts = useMachineAlerts(sideNode);
+  const sideAlertCount = sideAlerts.alerts.filter((alert) => !alert.dismissed && alert.severity !== 'info').length;
+  const details = sideDetails[sideNode ?? ''] ?? {};
+  const sideRun = details.run ?? '', sidePid = details.pid ?? 0, sideTrace = details.trace ?? '';
+  const setSideRun = useCallback((run: string) => setSideDetails((current) => ({ ...current, [sideNode ?? '']: { ...current[sideNode ?? ''], run } })), [sideNode, setSideDetails]);
+  const setSidePid = useCallback((pid: number) => setSideDetails((current) => ({ ...current, [sideNode ?? '']: { ...current[sideNode ?? ''], pid } })), [sideNode, setSideDetails]);
+  const setSideTrace = useCallback((trace: string) => setSideDetails((current) => ({ ...current, [sideNode ?? '']: { ...current[sideNode ?? ''], trace } })), [sideNode, setSideDetails]);
+  const sideView = (requestedSideView === 'log' && !sideRun || requestedSideView === 'investigate' && !sidePid) ? 'machine' : requestedSideView;
+
   function focusedCwd() {
     const term = focusedTerm?.termId ? live.states.get(focusedTerm.termId) : undefined;
     return term?.cwd || focusedTerm?.cwd || '';
@@ -330,10 +356,10 @@ export function Desk() {
     return session?.id;
   };
 
-  const onAsk = useCallback(async (text: string, intent: 'ask' | 'explain' | 'fix', runId?: string) => {
+  const onAsk = useCallback(async (text: string, intent: 'ask' | 'explain' | 'fix', runId?: string, target?: { node?: string }) => {
     if (!desk) return;
-    let termPane = focusedTerm;
-    if (!termPane) termPane = await openTerm();
+    let termPane = target ? desk.panes.find((pane) => pane.kind === 'term' && pane.node === target.node) : focusedTerm;
+    if (!termPane) termPane = await openTerm(undefined, 'stage', 'shell', target?.node);
     if (termPane && !desk.stage.includes(termPane.id)) promote(termPane.id);
     // The AI runs on the computer the shell runs on, with that computer's terminal flow.
     const node = termPane?.node;
@@ -361,15 +387,30 @@ export function Desk() {
       return true;
     }
     if (view === 'process') {
+      selectSideNode(focusedTerm?.node ?? '');
       openTool('process');
       return true;
     }
     return false;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [addPane, openTool, home, desk]);
+  }, [addPane, openTool, home, desk, selectSideNode, focusedTerm]);
 
-  /** The computer the side pane shows: the focused pane's. */
-  const sideNode = focused?.node;
+  /** Side-pane actions always target the selected computer, including a manual override. */
+  const onSideAsk = useCallback((text: string, intent: 'ask' | 'explain' | 'fix', runId?: string) => {
+    void onAsk(text, intent, runId, { node: sideNode }).catch((cause) => host.notify(errorMessage(cause)));
+  }, [onAsk, sideNode, host]);
+  const onSideShell = useCallback((command: string) => {
+    void openTerm(undefined, 'stage', command.split(/\s+/)[0] || 'shell', sideNode).then((pane) => {
+      if (pane.termId) setTimeout(() => runIn(pane.termId!, command, sideNode), 700);
+    }).catch((cause) => host.notify(`No shell on ${selectedComputer.name}: ${errorMessage(cause)}`));
+  }, [openTerm, runIn, sideNode, selectedComputer.name, host]);
+  const onSideCommand = useCallback((command: string) => {
+    void (async () => {
+      if (!focusedTerm || focusedTerm.node !== sideNode) await openTerm(undefined, 'stage', 'shell', sideNode);
+      line.current?.set(command);
+      line.current?.focus();
+    })().catch((cause) => host.notify(errorMessage(cause)));
+  }, [focusedTerm, sideNode, openTerm, host]);
 
   const onSignal = useCallback((proc: Proc, signal: string) => {
     clientOf(sideNode).call<{ ok: boolean; detail?: string }>('system.signal', { pid: proc.pid, signal })
@@ -392,15 +433,20 @@ export function Desk() {
   const actions: TermActions = useMemo(() => ({
     runCommand: runIn,
     editCommand: (command) => line.current?.set(command),
-    openRun: (run) => { setSideRun(run.id); setSideView('log'); columns.openSide(); },
+    openRun: (run) => {
+      const node = nodeOfTerm(run.term_id);
+      selectSideNode(node ?? '');
+      setSideDetails((current) => ({ ...current, [node ?? '']: { ...current[node ?? ''], run: run.id } }));
+      setSideView('log'); columns.openSide();
+    },
     fix: (_pane, run) => void onAsk(`\`${run.command}\` failed with exit code ${run.exit_code}. What went wrong and how do I fix it?`, 'fix', run.id),
     explain: (_pane, text) => void onAsk(`Explain: ${text}`, 'explain'),
-  }), [runIn, onAsk, setSideRun, setSideView, columns]);
+  }), [runIn, onAsk, nodeOfTerm, selectSideNode, setSideDetails, setSideView, columns]);
 
   // --- attention -------------------------------------------------------------------------------
   const everyPane = doc.desks.flatMap((entry) => entry.panes.map((pane) => ({ desk: entry, pane, attention: live.attention(pane) })));
   const needsYou = everyPane.filter((entry) => NEEDS_YOU.has(entry.attention));
-  const openAlerts = live.alerts.filter((alert) => !alert.dismissed && alert.severity !== 'info');
+  const openAlerts = localAlerts.filter((alert) => !alert.dismissed && alert.severity !== 'info');
   const back = useRef<{ desk: string; pane: string } | null>(null);
 
   const jumpNext = useCallback(() => {
@@ -421,7 +467,7 @@ export function Desk() {
     }));
   }, [needsYou, desk, setDoc, host]);
 
-  const openAlertsPane = useCallback(() => openTool('alerts', 'alerts'), [openTool]);
+  const openAlertsPane = useCallback(() => { selectSideNode(''); openTool('alerts', 'alerts'); }, [openTool, selectSideNode]);
 
   const newDesk = useCallback(async () => {
     if (!projectId) return;
@@ -444,6 +490,7 @@ export function Desk() {
   // --- keys ------------------------------------------------------------------------------------
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      if (clusterOpen) return;
       const meta = event.metaKey || event.ctrlKey;
       if (event.key === 'Escape' && overlay) { event.preventDefault(); setOverlay(null); return; }
       if (!meta) return;
@@ -466,7 +513,7 @@ export function Desk() {
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
-  }, [desk, overlay, focused, jumpNext, openTerm, closePane, toShelf, promote, newDesk, columns, setSettings]);
+  }, [desk, overlay, clusterOpen, focused, jumpNext, openTerm, closePane, toShelf, promote, newDesk, columns, setSettings]);
 
   const bandTarget = document.getElementById('ct-band');
   if (problem) return <div className="ct-desk"><p className="ct-hint ct-warn ct-boot">{problem}</p></div>;
@@ -475,7 +522,7 @@ export function Desk() {
   const stagePanes = desk.stage.map((id) => desk.panes.find((pane) => pane.id === id)).filter(Boolean) as PaneRec[];
   const fullscreen = focusedTerm?.termId ? live.states.get(focusedTerm.termId)?.alternate_screen : false;
   const sideFrame = (kind: PaneRec['kind'], runId?: string) => ({
-    pane: { id: `side-${kind}`, kind, title: kind, cwd: home, runId },
+    pane: { id: `side-${kind}`, kind, title: kind, cwd: sideHome, runId, ...(sideNode ? { node: sideNode } : {}) },
     focused: false, bare: true, onFocus: () => undefined, onShelf: () => undefined, onClose: () => setSideView('machine'),
   });
 
@@ -513,7 +560,7 @@ export function Desk() {
   return (
     <div className="ct-desk">
       {bandTarget && createPortal(band, bandTarget)}
-      <div ref={columns.work} className="ct-work" style={columns.style}>
+      <div ref={columns.work} className="ct-work" style={columns.style} inert={clusterOpen || undefined}>
         <nav className="ct-nav cx-sidebar" aria-label="Desks and computers" hidden={!columns.navOpen}>
           <div className="bar cx-sidebar-actions">
             <button type="button" className="detent" onClick={() => void newDesk()}>NEW DESK</button>
@@ -601,29 +648,41 @@ export function Desk() {
         <Divider name="ct-side" label="Machine width" onMove={columns.moveSide} onEnd={columns.endSide} onReset={columns.resetSide} className={columns.sideOpen ? '' : 'ct-hidden'} />
         {columns.sideOpen ? (
           <aside className="ct-side" aria-label="Side">
-            <div className="ct-side-tabs" role="tablist">
-              {([['machine', 'MACHINE'], ['alerts', openAlerts.length ? `ALERTS · ${openAlerts.length}` : 'ALERTS'], ['traces', 'TRACES'], ['ssh', 'SSH'], ['schedules', 'SCHEDULES'], ...(sideRun ? [['log', 'LOG']] : []), ...(sidePid ? [['investigate', `PID ${sidePid}`]] : [])] as [SideView, string][]).map(([view, label]) => (
-                <button key={view} type="button" role="tab" aria-selected={sideView === view} className={`ct-side-tab${sideView === view ? ' on' : ''}${view === 'alerts' && openAlerts.length ? ' hot' : ''}`} onClick={() => setSideView(view)}>{label}</button>
-              ))}
+            <div className="ct-side-toolbar">
+              <ComputerPicker computers={machineOptions} node={sideNode ?? ''} colors={cluster.layout.colors}
+                onSelect={selectSideNode} onCluster={() => { setOverlay(null); setClusterOpen(true); }} />
+              <div className="ct-side-tabs" role="tablist" aria-label={`Views for ${selectedComputer.name}`}>
+                {([['machine', 'MACHINE'], ['alerts', sideAlertCount ? `ALERTS · ${sideAlertCount}` : 'ALERTS'], ['traces', 'TRACES'], ['ssh', 'SSH'], ['schedules', 'SCHEDULES'], ...(sideRun ? [['log', 'LOG']] : []), ...(sidePid ? [['investigate', `PID ${sidePid}`]] : [])] as [SideView, string][]).map(([view, label]) => (
+                  <button key={view} id={`ct-side-tab-${view}`} type="button" role="tab" aria-selected={sideView === view} aria-controls="ct-machine-panel"
+                    className={`ct-side-tab${sideView === view ? ' on' : ''}${view === 'alerts' && sideAlertCount ? ' hot' : ''}`} onClick={() => setSideView(view)}>{label}</button>
+                ))}
+              </div>
             </div>
-            {/* Alerts are this Mac's; everything else in the side pane is the focused pane's computer's. */}
-            {sideView === 'alerts' && <AlertsPane {...sideFrame('alerts')} onAsk={onAsk} onRunCommand={(command) => line.current?.set(command)} />}
-            <ComputerScope node={sideNode ?? null}>
-            {sideView === 'machine' && <Sidebar computer={nameOf(sideNode)} onAsk={(text, intent) => void onAsk(text, intent)} onSignal={onSignal} onInvestigate={onInvestigate} />}
-            {sideView === 'traces' && <Traces open={sideTrace} home={home} onOpen={setSideTrace} onAsk={(text, intent, runId) => void onAsk(text, intent, runId)}
-              onOpenRun={(runId) => { setSideRun(runId); setSideView('log'); }} />}
-            {sideView === 'ssh' && <SshPane {...sideFrame('ssh')} onShell={(command) => void onShell(command, 'pane')} onAsk={(text, intent) => void onAsk(text, intent)} />}
-            {sideView === 'schedules' && <SchedulesPane {...sideFrame('schedules')} home={home} />}
-            {sideView === 'investigate' && sidePid > 0 && <Investigate pid={sidePid} home={home} onAsk={(text, intent, runId) => void onAsk(text, intent, runId)} onSignal={onSignal}
-              onShell={(command) => void onShell(command, 'pane')} onInvestigate={onInvestigate} onOpenTrace={onOpenTrace}
-              onOpenFile={(path) => addPane({ id: newId('pane'), kind: 'editor', title: path.split('/').pop() || path, cwd: home, path, ...(sideNode ? { node: sideNode } : {}) })}
-              onOpenRun={(runId) => { setSideRun(runId); setSideView('log'); }}
-              onClose={() => { setSidePid(0); setSideView('machine'); }} />}
-            {sideView === 'log' && sideRun && <RunPane {...sideFrame('run', sideRun)} named home={home} onAsk={onAsk} onRun={(command) => void onShell(command, 'pane')} onClose={() => { setSideRun(''); setSideView('machine'); }} />}
-            </ComputerScope>
+            <div key={`${sideNode ?? 'local'}:${sideView}`} className="ct-side-content" id="ct-machine-panel" role="tabpanel" aria-labelledby={`ct-side-tab-${sideView}`}>
+              {!selectedComputer.reachable ? <div className="ct-machine-offline" role="status">
+                <span className="ct-reading-name">{selectedComputer.name} is offline</span>
+                <p className="ct-hint">These panes belong to this computer. They resume when it reconnects.</p>
+                <button type="button" className="detent" onClick={readComputers}>CHECK CONNECTION</button>
+              </div> : <ComputerScope key={sideNode ?? 'local'} node={sideNode ?? null}>
+                {sideView === 'alerts' && <AlertsPane {...sideFrame('alerts')} onAsk={onSideAsk} onRunCommand={onSideCommand} />}
+                {sideView === 'machine' && <Sidebar computer={nameOf(sideNode)} onAsk={onSideAsk} onSignal={onSignal} onInvestigate={onInvestigate} />}
+                {sideView === 'traces' && <Traces open={sideTrace} home={sideHome} onOpen={setSideTrace} onAsk={onSideAsk}
+                  onOpenRun={(runId) => { setSideRun(runId); setSideView('log'); }} />}
+                {sideView === 'ssh' && <SshPane {...sideFrame('ssh')} onShell={onSideShell} onAsk={onSideAsk} />}
+                {sideView === 'schedules' && <SchedulesPane {...sideFrame('schedules')} home={sideHome} />}
+                {sideView === 'investigate' && sidePid > 0 && <Investigate pid={sidePid} home={sideHome} onAsk={onSideAsk} onSignal={onSignal}
+                  onShell={onSideShell} onInvestigate={onInvestigate} onOpenTrace={onOpenTrace}
+                  onOpenFile={(path) => addPane({ id: newId('pane'), kind: 'editor', title: path.split('/').pop() || path, cwd: sideHome, path, ...(sideNode ? { node: sideNode } : {}) })}
+                  onOpenRun={(runId) => { setSideRun(runId); setSideView('log'); }}
+                  onClose={() => { setSidePid(0); setSideView('machine'); }} />}
+                {sideView === 'log' && sideRun && <RunPane {...sideFrame('run', sideRun)} named home={sideHome} onAsk={onSideAsk} onRun={onSideShell} onClose={() => { setSideRun(''); setSideView('machine'); }} />}
+              </ComputerScope>}
+            </div>
           </aside>
         ) : <div />}
       </div>
+      <Cluster open={clusterOpen} computers={machineOptions} selected={sideNode ?? ''} layout={cluster.layout} order={cluster.order} onLayout={cluster.setLayout}
+        onClose={closeCluster} onSelect={(node) => { selectSideNode(node); setSideView('machine'); columns.openSide(); closeCluster(); }} />
       {settings !== null && <host.Slot name="settings.host@1" className="cx-settings-layer" props={{ onClose: () => setSettings(null) }} />}
       {overlay && (
         <MapView desks={doc.desks} current={desk.id} home={home} jump={overlay === 'jump'} onClose={() => setOverlay(null)}

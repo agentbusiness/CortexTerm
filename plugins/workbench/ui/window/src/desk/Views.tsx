@@ -15,7 +15,8 @@ import { ago, errorMessage, useRuntime } from '@cortex/sdk';
 import type { Alert, CveReport, FileText, Finding, Histogram, Proc, Run, RunOutput, SweepReport } from './api';
 import { quote, seconds, shortPath, size } from './api';
 import { Processes } from './Sidebar';
-import { live, useLive, type PaneRec } from './store';
+import type { PaneRec } from './store';
+import { useMachineAlerts } from './machine-data';
 
 const languageSlot = new Compartment();
 
@@ -343,14 +344,14 @@ function LookupKeys() {
 }
 
 export function AlertsPane({ pane, focused, bare, onFocus, onShelf, onClose, onAsk, onRunCommand }: PaneControls & { pane: PaneRec; onAsk: Ask; onRunCommand: (command: string) => void }) {
-  useLive();
+  const { client, node } = useRuntime();
+  const machineAlerts = useMachineAlerts(node);
   const [report, setReport] = useState<SweepReport | null>(null);
   const [running, setRunning] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const [showIgnored, setShowIgnored] = useState(false);
   const [cveId, setCveId] = useState('');
   const [cve, setCve] = useState<{ loading?: boolean; error?: string; report?: CveReport } | null>(null);
-  const client = useRuntime().client;
   const checkCve = () => {
     const id = cveId.trim().toUpperCase();
     if (!id) return;
@@ -368,12 +369,9 @@ export function AlertsPane({ pane, focused, bare, onFocus, onShelf, onClose, onA
     client.call<SweepReport>('system.finding.ignore', { key: finding.key, ignore: value }).then(setReport).catch((cause) => setProblem(errorMessage(cause)));
   };
   const act = (alert: Alert, action: string) => {
-    void client.call('system.alert.act', { id: alert.id, action }).then(() => {
-      live.alerts = live.alerts.map((entry) => (entry.id === alert.id ? { ...entry, dismissed: true } : entry));
-      live.changed();
-    }).catch(() => undefined);
+    void machineAlerts.act(alert.id, action).catch((cause) => setProblem(errorMessage(cause)));
   };
-  const alerts = live.alerts.filter((alert) => !alert.dismissed).sort(bySeverity);
+  const alerts = machineAlerts.alerts.filter((alert) => !alert.dismissed).sort(bySeverity);
   const findings = (report?.findings ?? []).slice().sort(bySeverity);
   const open = findings.filter((finding) => !finding.ignored);
   const ignored = findings.filter((finding) => finding.ignored);
@@ -382,8 +380,9 @@ export function AlertsPane({ pane, focused, bare, onFocus, onShelf, onClose, onA
     <PaneFrame pane={pane} focused={focused} bare={bare} onFocus={onFocus} onShelf={onShelf} onClose={onClose} title="ALERTS & SECURITY">
       <div className="ct-alerts">
         <section className="ct-asec">
-          <header className="ct-asec-head"><span className="ct-label">ALERTS</span><span className="ct-label ct-faint">{alerts.length ? `${alerts.length} OPEN` : 'ALL QUIET'}</span></header>
-          {alerts.length === 0 && <p className="ct-asec-note">Watching CPU, memory, disk, new open ports and new login items.</p>}
+          <header className="ct-asec-head"><span className="ct-label">ALERTS</span><span className="ct-label ct-faint">{machineAlerts.loading ? 'LOADING…' : machineAlerts.problem ? 'UNAVAILABLE' : alerts.length ? `${alerts.length} OPEN` : 'ALL QUIET'}</span></header>
+          {machineAlerts.problem && <p className="ct-asec-note ct-warn" role="status">{machineAlerts.problem} <button type="button" className="detent sm" onClick={() => void machineAlerts.reload()}>RETRY</button></p>}
+          {!machineAlerts.loading && !machineAlerts.problem && alerts.length === 0 && <p className="ct-asec-note">Watching CPU, memory, disk, new open ports and new login items.</p>}
           {alerts.map((alert) => (
             <article key={alert.id} className={`ct-issue ${alert.severity}`}>
               <div className="ct-issue-meta"><span className="ct-label sev">{alert.kind.toUpperCase()}</span><span className="ct-label ct-faint">{new Date(alert.at).toLocaleTimeString()}</span></div>
