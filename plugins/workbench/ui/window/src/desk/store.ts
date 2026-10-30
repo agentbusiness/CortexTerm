@@ -1,11 +1,12 @@
 /**
  * The Desk's state. What a person arranged (Desks, their panes, which are on the Stage) is the
  * durable slot state the frame keeps (`useShared('ct.desks')`), so it is the same after a restart.
- * What the machine reports (each shell's state, its last Run, alerts) is live and lives here.
+ * What the machines report (each shell's state, its last Run, this Mac's alerts) is live and lives
+ * here; a shell on a joined computer reports through that computer's frame (`runtimeFor(node)`).
  */
 
 import { useSyncExternalStore } from 'react';
-import { runtime } from '@cortex/sdk';
+import { runtime, runtimeFor } from '@cortex/sdk';
 import type { Alert, Run, TermState } from './api';
 
 export type PaneKind = 'term' | 'editor' | 'run' | 'process' | 'alerts' | 'ssh' | 'schedules';
@@ -16,6 +17,8 @@ export interface PaneRec {
   title: string;
   cwd: string;
   termId?: string;
+  /** The joined computer the shell runs on (its mesh node); none: this one. */
+  node?: string;
   path?: string;
   runId?: string;
   /** Helper shells that ran commands while this one was busy: their cards join this stream. */
@@ -26,6 +29,8 @@ export interface DeskRec {
   id: string;
   name: string;
   sessionId?: string;
+  /** The Desk's `terminal` session on each joined computer it asked on (node -> session). */
+  sessions?: Record<string, string>;
   panes: PaneRec[];
   /** Pane ids on the Stage, at most three, left to right. */
   stage: string[];
@@ -58,7 +63,9 @@ class LiveStore {
   unseen = new Set<string>();
   alerts: Alert[] = [];
   private listeners = new Set<() => void>();
+  private finished = new Set<(run: Run, node: string | null) => void>();
   private version = 0;
+  private watching = new Set<string>();
   private started = false;
 
   subscribe = (listener: () => void) => {
@@ -73,10 +80,34 @@ class LiveStore {
     for (const listener of this.listeners) listener();
   }
 
+  /** Called with every Run that ends, on this computer or a watched one. */
+  onFinished(listener: (run: Run, node: string | null) => void) {
+    this.finished.add(listener);
+    return () => { this.finished.delete(listener); };
+  }
+
   start() {
     if (this.started) return;
     this.started = true;
+    this.watch(null);
     const client = runtime().client;
+    client.on('system.alert', (_topic, data) => {
+      const alert = data as Alert;
+      if (!alert?.id) return;
+      this.alerts = [alert, ...this.alerts.filter((other) => other.id !== alert.id)].slice(0, 50);
+      this.changed();
+    });
+    client.call<{ alerts: Alert[] }>('system.alerts', {}).then((list) => {
+      this.alerts = list?.alerts ?? [];
+      this.changed();
+    }).catch(() => undefined);
+  }
+
+  /** Listen to a computer's shells (null: this one's), once. */
+  watch(node: string | null) {
+    if (this.watching.has(node ?? '')) return;
+    this.watching.add(node ?? '');
+    const client = runtimeFor(node).client;
     client.on('terminal.state', (_topic, data) => {
       const state = data as TermState;
       if (!state?.term_id) return;
@@ -88,6 +119,7 @@ class LiveStore {
       if (!run?.term_id) return;
       this.lastRun.set(run.term_id, run);
       this.changed();
+      for (const listener of this.finished) listener(run, node);
     });
     client.on('terminal.run.started', (_topic, data) => {
       const run = data as Run;
@@ -102,22 +134,13 @@ class LiveStore {
       this.ended.set(event.term_id, event.exit_code ?? null);
       this.changed();
     });
-    client.on('system.alert', (_topic, data) => {
-      const alert = data as Alert;
-      if (!alert?.id) return;
-      this.alerts = [alert, ...this.alerts.filter((other) => other.id !== alert.id)].slice(0, 50);
-      this.changed();
-    });
-    client.call<{ alerts: Alert[] }>('system.alerts', {}).then((list) => {
-      this.alerts = list?.alerts ?? [];
-      this.changed();
-    }).catch(() => undefined);
   }
 
   /** The state of a shell, fetched once when nobody has reported it yet. */
-  ensure(termId: string) {
+  ensure(termId: string, node?: string | null) {
+    this.watch(node ?? null);
     if (this.states.has(termId)) return;
-    const client = runtime().client;
+    const client = runtimeFor(node).client;
     client.call<TermState>('terminal.state', { term_id: termId }).then((state) => {
       if (state && !this.states.has(termId)) {
         this.states.set(termId, state);

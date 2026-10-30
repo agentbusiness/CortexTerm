@@ -7,7 +7,7 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ago, errorMessage, runtime } from '@cortex/sdk';
+import { ago, errorMessage, useRuntime } from '@cortex/sdk';
 import type { MonitorReport, OpenFile, Proc, ProcessDetail, ProcSample, Run, RunOutput, TraceInfo } from './api';
 import { quote, seconds, shortPath, size } from './api';
 
@@ -20,7 +20,7 @@ export function Investigate({ pid, home, onAsk, onSignal, onShell, onOpenFile, o
   pid: number; home: string; onAsk: Ask; onSignal: (proc: Proc, signal: string) => void; onShell: (command: string) => void;
   onOpenFile: (path: string) => void; onOpenRun: (runId: string) => void; onInvestigate: (pid: number) => void; onOpenTrace: (id: string) => void; onClose: () => void;
 }) {
-  const client = runtime().client;
+  const client = useRuntime().client;
   const [detail, setDetail] = useState<ProcessDetail | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const [gone, setGone] = useState(false);
@@ -318,7 +318,7 @@ function Timeline({ samples, from, to, runs, pinned, picked, onPin, onPick }: {
 // --- the output at a moment ----------------------------------------------------------------------
 
 function OutputAt({ at, runs, home, onOpenRun, onClear }: { at: number | null; runs: Run[]; home: string; onOpenRun: (runId: string) => void; onClear: () => void }) {
-  const client = runtime().client;
+  const client = useRuntime().client;
   const [outputs, setOutputs] = useState<Record<string, RunOutput>>({});
   const key = runs.map((run) => run.id).join(',');
   useEffect(() => {
@@ -454,7 +454,7 @@ function Files({ files, home, onOpenFile }: { files: OpenFile[]; home: string; o
 function Monitor({ pid, name, report, ended, home, onChanged, onAsk, onOpenFile }: {
   pid: number; name: string; report: MonitorReport | null; ended: boolean; home: string; onChanged: () => void; onAsk: Ask; onOpenFile: (path: string) => void;
 }) {
-  const client = runtime().client;
+  const client = useRuntime().client;
   const [children, setChildren] = useState(true);
   const [problem, setProblem] = useState<string | null>(null);
   const [tab, setTab] = useState<'hosts' | 'folders' | 'log'>('hosts');

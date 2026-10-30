@@ -11,7 +11,7 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
 import '@xterm/xterm/css/xterm.css';
-import { activeTheme, currentGround, runtime, subscribeTheme, useEvent, useJournal, type TermSnapshot } from '@cortex/sdk';
+import { activeTheme, currentGround, useRuntime, subscribeTheme, useEvent, useJournal, type TermSnapshot } from '@cortex/sdk';
 import type { Ask, Assessment, OutputLine, Run, RunOutput, Threat } from './api';
 import { quote, seconds, shortPath } from './api';
 import { live, useLive, type PaneRec } from './store';
@@ -43,10 +43,12 @@ const FETCHED_LINES = 400;
 /** Blocks kept in the stream (older ones stay in the Run ledger). */
 const KEPT_RUNS = 60;
 
-export function TermPane({ pane, focused, sessionId, home, onFocus, actions }: {
+export function TermPane({ pane, focused, sessionId, computer, home, onFocus, actions }: {
   pane: PaneRec;
   focused: boolean;
   sessionId?: string;
+  /** The joined computer the shell runs on, by name (none: this one). */
+  computer?: string;
   home: string;
   slot: number;
   onFocus: () => void;
@@ -57,8 +59,8 @@ export function TermPane({ pane, focused, sessionId, home, onFocus, actions }: {
   useLive();
   const termId = pane.termId ?? '';
   useEffect(() => {
-    if (termId) live.ensure(termId);
-  }, [termId]);
+    if (termId) live.ensure(termId, pane.node);
+  }, [termId, pane.node]);
   const state = live.states.get(termId);
   const [raw, setRaw] = useState(false);
   // A program that needs the keyboard gets the live terminal; it goes back to the stream after.
@@ -69,6 +71,7 @@ export function TermPane({ pane, focused, sessionId, home, onFocus, actions }: {
   return (
     <section className={`ct-pane ct-term${focused ? ' focused' : ''}`} onMouseDown={onFocus} aria-label={`Shell ${pane.title}`}>
       <div className="ct-term-float">
+        {computer && <span className="ct-label ct-blue">{computer.toUpperCase()}</span>}
         <Crumbs cwd={state?.cwd || pane.cwd} home={home} branch={state?.git_branch ?? null} onGo={(path) => actions.runCommand(termId, `cd ${quote(path)}`)} />
         <span className="grow" />
         {state?.running && <span className="ct-label ct-blue">RUNNING</span>}
@@ -106,11 +109,11 @@ interface Step { command: string; output: string; exitCode: number | null; runni
 type Item = { kind: 'run'; at: number; run: Run } | { kind: 'ask'; at: number; exchange: Exchange };
 
 function useRuns(termIds: string[]): Run[] {
+  const client = useRuntime().client;
   const [runs, setRuns] = useState<Run[]>([]);
   const key = termIds.join(',');
   useEffect(() => {
     let stopped = false;
-    const client = runtime().client;
     Promise.all(termIds.map((id) => client.call<{ runs: Run[] }>('terminal.runs', { term_id: id, limit: KEPT_RUNS }).catch(() => ({ runs: [] as Run[] }))))
       .then((lists) => {
         if (stopped) return;
@@ -119,7 +122,7 @@ function useRuns(termIds: string[]): Run[] {
       });
     return () => { stopped = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key]);
+  }, [key, client]);
   const upsert = (run: Run) => {
     if (!run || !termIds.includes(run.term_id)) return;
     setRuns((all) => {
@@ -250,6 +253,7 @@ function Stream({ pane, termId, sessionId, home, actions }: { pane: PaneRec; ter
 }
 
 function RunBlock({ run, pane, home, actions, latest }: { run: Run; pane: PaneRec; home: string; actions: TermActions; latest: boolean }) {
+  const client = useRuntime().client;
   const [output, setOutput] = useState<RunOutput | null>(null);
   // Open by default: a card shows its output; folding one is the person's choice.
   const [open, setOpen] = useState(true);
@@ -262,7 +266,7 @@ function RunBlock({ run, pane, home, actions, latest }: { run: Run; pane: PaneRe
   useEffect(() => {
     if (!open || run.fullscreen) return;
     let stopped = false;
-    const read = () => runtime().client.call<RunOutput>('terminal.run.output', { run_id: run.id, from: -FETCHED_LINES, count: FETCHED_LINES })
+    const read = () => client.call<RunOutput>('terminal.run.output', { run_id: run.id, from: -FETCHED_LINES, count: FETCHED_LINES })
       .then((result) => { if (!stopped) setOutput(result); })
       .catch(() => undefined);
     void read();
@@ -272,7 +276,7 @@ function RunBlock({ run, pane, home, actions, latest }: { run: Run; pane: PaneRe
       stopped = true;
       clearInterval(timer);
     };
-  }, [open, run.id, running, run.fullscreen, run.lines]);
+  }, [open, run.id, running, run.fullscreen, run.lines, client]);
 
   // Progress bars and spinners redraw the same line many times; the card shows each one's latest frame.
   const lines = useMemo(() => collapseProgress(output?.lines ?? []), [output]);
@@ -436,6 +440,7 @@ function TableView({ table }: { table: Table }) {
  * program asks the same thing the terminal plugin fills it in, and this row says so.
  */
 function AskRow({ run }: { run: Run }) {
+  const client = useRuntime().client;
   useLive();
   const state = live.states.get(run.term_id);
   const mine = state?.running?.id === run.id;
@@ -451,7 +456,7 @@ function AskRow({ run }: { run: Run }) {
           <code className="ct-mono ct-asks-prompt dim">{keychain}</code>
           <span className="grow" />
           <button type="button" className="ct-act" title="Remove it from the Keychain"
-            onClick={() => void runtime().client.call('terminal.ask.forget', { key: keychain }).catch(() => undefined)}>forget</button>
+            onClick={() => void client.call('terminal.ask.forget', { key: keychain }).catch(() => undefined)}>forget</button>
         </div>
       </div>
     );
@@ -466,7 +471,7 @@ function AskForm({ termId, ask }: { termId: string; ask: Ask | null }) {
   const [typing, setTyping] = useState(false);
   const [remember, setRemember] = useState(Boolean(ask?.refused));
   const [error, setError] = useState('');
-  const client = runtime().client;
+  const client = useRuntime().client;
   const answer = (value: string) => {
     setError('');
     client.call('terminal.ask.answer', { term_id: termId, text: value, remember: ask?.kind === 'secret' && remember })
@@ -673,11 +678,11 @@ function XTerm({ termId, visible, focused }: { termId: string; visible: boolean;
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const [held, setHeld] = useState<{ text: string; threats: Threat[] } | null>(null);
+  const client = useRuntime().client;
 
   useEffect(() => {
     const element = host.current;
     if (!element) return;
-    const client = runtime().client;
     const term = new Terminal({
       fontFamily: activeTheme()?.fonts.mono ?? 'ui-monospace, Menlo, monospace',
       fontSize: 13,
@@ -768,7 +773,7 @@ function XTerm({ termId, visible, focused }: { termId: string; visible: boolean;
       termRef.current = null;
       fitRef.current = null;
     };
-  }, [termId]);
+  }, [termId, client]);
 
   // Shown: fit to the pane and take the keyboard.
   useEffect(() => {

@@ -7,13 +7,18 @@
  * The layout is the workbench's: the band on top (the Desk adds its items to it), then Desks |
  * Stage | machine, each divider draggable (double-click: default width), each side able to fold
  * and come back from its band toggle. Every pane can go to the Shelf and come back, or close.
+ *
+ * A pane may run on a joined computer (`PaneRec.node`): it renders inside that computer's
+ * `ComputerScope`, so its calls go to that frame through `mesh.link`, and the Line, the AI and the
+ * side pane follow the focused pane there. COMPUTERS in the nav lists the joined computers that run
+ * CortexTerm, with the shells open on each.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Caret, Divider, ago, errorMessage, runtime, useHost, useShared } from '@cortex/sdk';
+import { Caret, ComputerScope, Divider, ago, errorMessage, runtime, runtimeFor, useEvent, useHost, useRuntime, useShared } from '@cortex/sdk';
 import './sidebar.css';
-import type { Proc, Run, TermState } from './api';
+import type { Proc, TermState } from './api';
 import { shortPath } from './api';
 import { Line, type LineHandle } from './Line';
 import { Sidebar, modelLabel, useModel } from './Sidebar';
@@ -27,6 +32,22 @@ import './desk.css';
 
 interface TermInfo { term_id: string; cwd: string; alive: boolean }
 interface Place { path: string; runs: number; last: number; git: boolean }
+interface Peer { member: { node: string; name: string; local?: boolean }; card?: { name: string; software: string } | null; reachable: boolean; path: string }
+/** A joined computer that runs CortexTerm. */
+interface Computer { node: string; name: string; reachable: boolean; path: string }
+type Client = ReturnType<typeof runtime>['client'];
+
+const clientOf = (node?: string | null) => runtimeFor(node).client;
+
+/** The home place's project on a computer's frame: its first project, else one opened at `~`. */
+async function homeProject(client: Client): Promise<{ id: string; root: string }> {
+  const projects = await client.call<{ projects: { id: string; root: string }[] }>('frame.project.list', {});
+  const found = projects?.projects?.[0];
+  if (found) return found;
+  const probe = await client.call<TermInfo>('terminal.open', { cwd: '~', cols: 80, rows: 24 });
+  await client.call('terminal.close', { term_id: probe.term_id }).catch(() => undefined);
+  return client.call<{ id: string; root: string }>('frame.project.open', { root: probe.cwd });
+}
 
 type SideView = 'machine' | 'alerts' | 'traces' | 'ssh' | 'schedules' | 'log' | 'investigate';
 
@@ -104,31 +125,42 @@ export function Desk() {
 
   useEffect(() => live.start(), []);
 
+  // --- the joined computers ------------------------------------------------------------------
+  const [computers, setComputers] = useState<Computer[]>([]);
+  const paneNodes = [...new Set(doc.desks.flatMap((entry) => entry.panes.flatMap((pane) => (pane.node ? [pane.node] : []))))].join(',');
+  const readComputers = useCallback(() => {
+    const used = paneNodes.split(',');
+    client.call<{ peers: Peer[] }>('mesh.peers', {}).then((list) => setComputers((list?.peers ?? [])
+      // Another app on this Mac is not another computer; one that is away has no card to say
+      // what it runs, so it stays listed when a shell of this window is there.
+      .filter((peer) => !peer.member.local && (peer.card ? peer.card.software === 'cortexterm' : used.includes(peer.member.node)))
+      .map((peer) => ({ node: peer.member.node, name: peer.card?.name || peer.member.name, reachable: peer.reachable, path: peer.path }))))
+      .catch(() => undefined);
+  }, [client, paneNodes]);
+  useEffect(() => { readComputers(); }, [readComputers]);
+  useEvent('mesh.changed', () => readComputers());
+  const nameOf = (node?: string) => (node ? computers.find((computer) => computer.node === node)?.name ?? 'another computer' : undefined);
+
   // --- boot: the home place, a Desk, live shells for every terminal pane ------------------------
   useEffect(() => {
     if (booted.current) return;
     booted.current = true;
     void (async () => {
       try {
-        const projects = await client.call<{ projects: { id: string; root: string }[] }>('frame.project.list', {});
-        let project = projects?.projects?.[0];
-        if (!project) {
-          const probe = await client.call<TermInfo>('terminal.open', { cwd: '~', cols: 80, rows: 24 });
-          await client.call('terminal.close', { term_id: probe.term_id }).catch(() => undefined);
-          project = await client.call<{ id: string; root: string }>('frame.project.open', { root: probe.cwd });
-        }
+        const project = await homeProject(client);
         setHome(project.root);
         setProjectId(project.id);
         const alive = new Set(((await client.call<{ terminals: TermInfo[] }>('terminal.list', {}))?.terminals ?? []).filter((term) => term.alive).map((term) => term.term_id));
         const stored = runtime().state.get<DeskDoc>('workbench', 'ct.desks') ?? EMPTY_DOC;
         let desks = stored.desks;
         if (desks.length === 0) desks = [await createDesk(project.id, project.root, 'main')];
-        // Shells the frame no longer has start again in the folder they were last in.
+        // Shells the frame no longer has start again in the folder they were last in. A joined
+        // computer's shell stays as it is: that computer may be away now.
         const restored: DeskRec[] = [];
         for (const entry of desks) {
           const panes: PaneRec[] = [];
           for (const pane of entry.panes.filter((rec) => rec.kind === 'term' || rec.kind === 'editor')) {
-            if (pane.kind === 'term' && (!pane.termId || !alive.has(pane.termId))) {
+            if (pane.kind === 'term' && !pane.node && (!pane.termId || !alive.has(pane.termId))) {
               const info = await client.call<TermInfo>('terminal.open', { cwd: pane.cwd || project.root, cols: 120, rows: 32 }).catch(() => null);
               panes.push(info ? { ...pane, termId: info.term_id, cwd: info.cwd } : pane);
             } else panes.push(pane);
@@ -168,19 +200,28 @@ export function Desk() {
     });
   }, [desk, update]);
 
-  const openTerm = useCallback(async (cwd?: string, where: 'stage' | 'shelf' = 'stage', title = 'shell') => {
-    const base = cwd || focusedCwd() || home;
-    const info = await client.call<TermInfo>('terminal.open', { cwd: base || '~', cols: 120, rows: 32 });
-    const pane: PaneRec = { id: newId('pane'), kind: 'term', title, cwd: info.cwd, termId: info.term_id };
+  /** A new shell, on `node` (none: this computer), in `cwd`, else the focused shell's folder when it is on that computer. */
+  const openTerm = useCallback(async (cwd?: string, where: 'stage' | 'shelf' = 'stage', title = 'shell', node?: string) => {
+    const base = cwd || (focusedTerm?.node === node ? focusedCwd() : '') || (node ? '~' : home);
+    const info = await clientOf(node).call<TermInfo>('terminal.open', { cwd: base || '~', cols: 120, rows: 32 });
+    const pane: PaneRec = { id: newId('pane'), kind: 'term', title, cwd: info.cwd, termId: info.term_id, ...(node ? { node } : {}) };
     addPane(pane, where);
     return pane;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [client, home, addPane, desk]);
+  }, [home, addPane, desk]);
+
+  /** A shell already open on a joined computer, as a pane here (or the pane that shows it already). */
+  const attachTerm = useCallback((node: string, info: TermInfo) => {
+    const shown = desk?.panes.find((pane) => pane.termId === info.term_id);
+    if (shown) promote(shown.id);
+    else addPane({ id: newId('pane'), kind: 'term', title: 'shell', cwd: info.cwd, termId: info.term_id, node });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [desk, addPane]);
 
   const closePane = useCallback((paneId: string) => {
     if (!desk) return;
     const pane = desk.panes.find((entry) => entry.id === paneId);
-    if (pane?.termId) void client.call('terminal.close', { term_id: pane.termId }).catch(() => undefined);
+    if (pane?.termId) void clientOf(pane.node).call('terminal.close', { term_id: pane.termId }).catch(() => undefined);
     update(desk.id, (entry) => {
       const panes = entry.panes.filter((other) => other.id !== paneId);
       let stage = entry.stage.filter((id) => id !== paneId);
@@ -188,7 +229,7 @@ export function Desk() {
       if (stage.length === 0 && next) stage = [next.id];
       return { ...entry, panes, stage, focus: stage.at(-1) };
     });
-  }, [desk, update, client]);
+  }, [desk, update]);
 
   const promote = useCallback((paneId: string) => {
     if (!desk) return;
@@ -225,10 +266,13 @@ export function Desk() {
   });
 
   // --- running and asking --------------------------------------------------------------------
-  const runIn = useCallback((termId: string, command: string) => {
+  /** The computer a shell runs on: its pane's, or its parent pane's for a helper shell. */
+  const nodeOfTerm = useCallback((termId: string) => doc.desks.flatMap((entry) => entry.panes).find((pane) => pane.termId === termId || pane.workers?.includes(termId))?.node, [doc.desks]);
+
+  const runIn = useCallback((termId: string, command: string, node = nodeOfTerm(termId)) => {
     const data = command.includes('\n') ? `\x15\x1b[200~${command}\x1b[201~\r` : `\x15${command}\r`;
-    void client.call('terminal.write', { term_id: termId, data }).catch((cause) => host.notify(`Not sent: ${errorMessage(cause)}`));
-  }, [client, host]);
+    void clientOf(node).call('terminal.write', { term_id: termId, data }).catch((cause) => host.notify(`Not sent: ${errorMessage(cause)}`));
+  }, [host, nodeOfTerm]);
 
   const onShell = useCallback(async (command: string, how: 'here' | 'pane' | 'background' | 'watch') => {
     if (how === 'here' && focusedTerm?.termId && desk) {
@@ -239,26 +283,27 @@ export function Desk() {
         return;
       }
       const parent = focusedTerm;
-      const info = await client.call<TermInfo>('terminal.open', { cwd: focusedCwd() || home, cols: 120, rows: 32 }).catch(() => null);
+      const info = await clientOf(parent.node).call<TermInfo>('terminal.open', { cwd: focusedCwd() || (parent.node ? '~' : home), cols: 120, rows: 32 }).catch(() => null);
       if (!info) return;
       update(desk.id, (entry) => ({ ...entry, panes: entry.panes.map((pane) => (pane.id === parent.id ? { ...pane, workers: [...(pane.workers ?? []).slice(-20), info.term_id] } : pane)) }));
       helpers.current.add(info.term_id);
-      setTimeout(() => runIn(info.term_id, command), 600);
+      setTimeout(() => runIn(info.term_id, command, parent.node), 600);
       return;
     }
-    const pane = await openTerm(undefined, how === 'here' || how === 'pane' ? 'stage' : 'shelf', command.split(/\s+/)[0] || 'shell');
+    // A command typed for the focused shell runs on that shell's computer.
+    const node = focusedTerm?.node;
+    const pane = await openTerm(undefined, how === 'here' || how === 'pane' ? 'stage' : 'shelf', command.split(/\s+/)[0] || 'shell', node);
     if (!pane.termId) return;
     if (how === 'watch') watched.current.set(pane.termId, command);
     // The new shell needs a moment to show its prompt.
-    setTimeout(() => runIn(pane.termId!, command), 700);
+    setTimeout(() => runIn(pane.termId!, command, node), 700);
     if (how === 'background' || how === 'watch') host.notify(how === 'watch' ? `Watching \`${command}\`: you'll be told when it ends.` : `\`${command}\` runs on the Shelf.`);
   }, [focusedTerm, openTerm, runIn, host, desk, client, home, update]);
 
-  useEffect(() => client.on('terminal.run.finished', (_topic, data) => {
-    const run = data as Run;
-    if (run?.term_id && helpers.current.has(run.term_id)) {
+  useEffect(() => live.onFinished((run, node) => {
+    if (helpers.current.has(run.term_id)) {
       helpers.current.delete(run.term_id);
-      setTimeout(() => void client.call('terminal.close', { term_id: run.term_id }).catch(() => undefined), 1000);
+      setTimeout(() => void clientOf(node).call('terminal.close', { term_id: run.term_id }).catch(() => undefined), 1000);
     }
     const command = watched.current.get(run?.term_id);
     if (!command) return;
@@ -268,24 +313,39 @@ export function Desk() {
     void client.call('notify.send', { kind: run.exit_code === 0 ? 'done' : 'failed', title: `${command} ${outcome}`, body: '' }).catch(() => undefined);
   }), [client, host]);
 
+  /** The Desk's `terminal` session on a computer (none: this one), made on first use there. */
+  const sessionOn = async (node: string | undefined): Promise<string | undefined> => {
+    if (!desk) return undefined;
+    if (!node) {
+      if (desk.sessionId || !projectId) return desk.sessionId;
+      const sessionId = await newSession(projectId, desk.name);
+      if (sessionId) update(desk.id, (entry) => ({ ...entry, sessionId }));
+      return sessionId;
+    }
+    if (desk.sessions?.[node]) return desk.sessions[node];
+    const remote = clientOf(node);
+    const project = await homeProject(remote).catch(() => null);
+    const session = project ? await remote.call<{ id: string }>('frame.session.create', { project_id: project.id, title: desk.name, flow: 'terminal' }).catch(() => null) : null;
+    if (session?.id) update(desk.id, (entry) => ({ ...entry, sessions: { ...entry.sessions, [node]: session.id } }));
+    return session?.id;
+  };
+
   const onAsk = useCallback(async (text: string, intent: 'ask' | 'explain' | 'fix', runId?: string) => {
     if (!desk) return;
-    let sessionId = desk.sessionId;
-    if (!sessionId && projectId) {
-      sessionId = await newSession(projectId, desk.name);
-      if (sessionId) update(desk.id, (entry) => ({ ...entry, sessionId }));
-    }
-    if (!sessionId) {
-      host.notify('No conversation for this Desk yet.');
-      return;
-    }
     let termPane = focusedTerm;
     if (!termPane) termPane = await openTerm();
     if (termPane && !desk.stage.includes(termPane.id)) promote(termPane.id);
-    void client.call('chatflow-terminal.turn', { session_id: sessionId, text, intent, term_id: termPane?.termId, run_id: runId })
+    // The AI runs on the computer the shell runs on, with that computer's terminal flow.
+    const node = termPane?.node;
+    const sessionId = await sessionOn(node);
+    if (!sessionId) {
+      host.notify(node ? `No conversation on ${nameOf(node)} yet: is it reachable?` : 'No conversation for this Desk yet.');
+      return;
+    }
+    void clientOf(node).call('chatflow-terminal.turn', { session_id: sessionId, text, intent, term_id: termPane?.termId, run_id: runId })
       .catch((cause) => host.notify(`Not asked: ${errorMessage(cause)}`));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [desk, projectId, focusedTerm, openTerm, promote, client, host, update]);
+  }, [desk, projectId, focusedTerm, openTerm, promote, host, update, computers]);
 
   /** The side pane shows the machine; a tool (alerts, SSH, schedules, a Run's log) opens there in its place. */
   const openTool = useCallback((kind: 'alerts' | 'ssh' | 'schedules' | 'process', _title?: string) => {
@@ -296,7 +356,8 @@ export function Desk() {
   const onNative = useCallback((view: string, target: string | null | undefined) => {
     const cwd = focusedCwd() || home;
     if (view === 'editor' && target) {
-      addPane({ id: newId('pane'), kind: 'editor', title: target.split('/').pop() || target, cwd, path: target });
+      const node = focusedTerm?.node;
+      addPane({ id: newId('pane'), kind: 'editor', title: target.split('/').pop() || target, cwd, path: target, ...(node ? { node } : {}) });
       return true;
     }
     if (view === 'process') {
@@ -307,11 +368,14 @@ export function Desk() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [addPane, openTool, home, desk]);
 
+  /** The computer the side pane shows: the focused pane's. */
+  const sideNode = focused?.node;
+
   const onSignal = useCallback((proc: Proc, signal: string) => {
-    client.call<{ ok: boolean; detail?: string }>('system.signal', { pid: proc.pid, signal })
+    clientOf(sideNode).call<{ ok: boolean; detail?: string }>('system.signal', { pid: proc.pid, signal })
       .then((result) => host.notify(result?.ok ? `${signal} sent to ${proc.name} (${proc.pid})` : `${proc.name}: ${result?.detail ?? 'not sent'}`))
       .catch((cause) => host.notify(`${proc.name}: ${errorMessage(cause)}`));
-  }, [client, host]);
+  }, [host, sideNode]);
 
   const onInvestigate = useCallback((pid: number) => {
     setSidePid(pid);
@@ -370,12 +434,12 @@ export function Desk() {
   const closeDesk = useCallback((deskId: string) => {
     const target = doc.desks.find((entry) => entry.id === deskId);
     if (!target || doc.desks.length < 2) return;
-    for (const pane of target.panes) if (pane.termId) void client.call('terminal.close', { term_id: pane.termId }).catch(() => undefined);
+    for (const pane of target.panes) if (pane.termId) void clientOf(pane.node).call('terminal.close', { term_id: pane.termId }).catch(() => undefined);
     setDoc((current) => {
       const desks = current.desks.filter((entry) => entry.id !== deskId);
       return { desks, current: current.current === deskId ? desks[0]?.id ?? '' : current.current };
     });
-  }, [doc.desks, client, setDoc]);
+  }, [doc.desks, setDoc]);
 
   // --- keys ------------------------------------------------------------------------------------
   useEffect(() => {
@@ -415,11 +479,12 @@ export function Desk() {
     focused: false, bare: true, onFocus: () => undefined, onShelf: () => undefined, onClose: () => setSideView('machine'),
   });
 
-  const renderPane = (pane: PaneRec, slot: number) => {
+  const renderPane = (pane: PaneRec, slot: number) => <ComputerScope node={pane.node ?? null}>{paneView(pane, slot)}</ComputerScope>;
+  const paneView = (pane: PaneRec, slot: number) => {
     const isFocused = pane.id === (focused?.id ?? '');
     const common = { focused: isFocused, onFocus: () => focusPane(pane.id), onShelf: () => toShelf(pane.id), onClose: () => closePane(pane.id) };
     switch (pane.kind) {
-      case 'term': return <TermPane pane={pane} sessionId={desk.sessionId} home={home} slot={slot} actions={actions} {...common} />;
+      case 'term': return <TermPane pane={pane} sessionId={pane.node ? desk.sessions?.[pane.node] : desk.sessionId} computer={nameOf(pane.node)} home={home} slot={slot} actions={actions} {...common} />;
       case 'editor': return <EditorPane pane={pane} home={home} onAsk={onAsk} onRunReal={(command) => void onShell(command, 'pane')} {...common} />;
       case 'run': return <RunPane pane={pane} home={home} onAsk={onAsk} {...common} />;
       case 'process': return <ProcessPane pane={pane} onAsk={onAsk} onSignal={onSignal} onInvestigate={onInvestigate} {...common} />;
@@ -478,7 +543,7 @@ export function Desk() {
                         return (
                           <li key={pane.id} className={['cx-row', selected ? 'sel' : '', NEEDS_YOU.has(attention) ? 'cx-attn' : ''].filter(Boolean).join(' ')}>
                             <button type="button" onClick={() => promote(pane.id)} aria-current={selected ? 'true' : undefined}>
-                              <div className="t">{paneTitle(pane, home)}</div>
+                              <div className="t">{pane.node && <span className="ct-blue">{nameOf(pane.node)} </span>}{paneTitle(pane, home)}</div>
                               <div className="r">
                                 <span className={`cx-pip cx-pip-${status}`} aria-hidden />
                                 <span className={`ap ${tone}`}>{label}</span>
@@ -497,6 +562,16 @@ export function Desk() {
                 </section>
               );
             })}
+            {computers.length > 0 && (
+              <section className="cx-proj">
+                <div className="cx-proj-h"><span className="cx-proj-name ct-faint">COMPUTERS</span></div>
+                {computers.map((computer) => (
+                  <ComputerScope key={computer.node} node={computer.node}>
+                    <ComputerShells computer={computer} home={home} shown={desk.panes} onOpen={(info) => attachTerm(computer.node, info)} onNew={() => void openTerm(undefined, 'stage', 'shell', computer.node).catch((cause) => host.notify(`No shell on ${computer.name}: ${errorMessage(cause)}`))} />
+                  </ComputerScope>
+                ))}
+              </section>
+            )}
             {places.length > 0 && (
               <section className="cx-proj">
                 <div className="cx-proj-h"><span className="cx-proj-name ct-faint">PLACES I KNOW</span></div>
@@ -529,8 +604,10 @@ export function Desk() {
             )}
             {stagePanes.map((pane, index) => <div key={pane.id} className="ct-cell">{renderPane(pane, index)}</div>)}
           </div>
-          <Line ref={line} termId={focusedTerm?.termId} home={home} onShell={(command, how) => void onShell(command, how)} onAsk={(text, intent) => void onAsk(text, intent)} onNative={onNative}
-            disabled={fullscreen ? 'A full-screen program has the keyboard: click into it, or quit it to use the Line.' : null} />
+          <ComputerScope node={focusedTerm?.node ?? null}>
+            <Line ref={line} termId={focusedTerm?.termId} home={home} onShell={(command, how) => void onShell(command, how)} onAsk={(text, intent) => void onAsk(text, intent)} onNative={onNative}
+              disabled={fullscreen ? 'A full-screen program has the keyboard: click into it, or quit it to use the Line.' : null} />
+          </ComputerScope>
         </main>
         <Divider name="ct-side" label="Machine width" onMove={columns.moveSide} onEnd={columns.endSide} onReset={columns.resetSide} className={columns.sideOpen ? '' : 'ct-hidden'} />
         {columns.sideOpen ? (
@@ -540,18 +617,21 @@ export function Desk() {
                 <button key={view} type="button" role="tab" aria-selected={sideView === view} className={`ct-side-tab${sideView === view ? ' on' : ''}${view === 'alerts' && openAlerts.length ? ' hot' : ''}`} onClick={() => setSideView(view)}>{label}</button>
               ))}
             </div>
-            {sideView === 'machine' && <Sidebar onAsk={(text, intent) => void onAsk(text, intent)} onSignal={onSignal} onInvestigate={onInvestigate} />}
+            {/* Alerts are this Mac's; everything else in the side pane is the focused pane's computer's. */}
             {sideView === 'alerts' && <AlertsPane {...sideFrame('alerts')} onAsk={onAsk} onRunCommand={(command) => line.current?.set(command)} />}
+            <ComputerScope node={sideNode ?? null}>
+            {sideView === 'machine' && <Sidebar computer={nameOf(sideNode)} onAsk={(text, intent) => void onAsk(text, intent)} onSignal={onSignal} onInvestigate={onInvestigate} />}
             {sideView === 'traces' && <Traces open={sideTrace} home={home} onOpen={setSideTrace} onAsk={(text, intent, runId) => void onAsk(text, intent, runId)}
               onOpenRun={(runId) => { setSideRun(runId); setSideView('log'); }} />}
             {sideView === 'ssh' && <SshPane {...sideFrame('ssh')} onShell={(command) => void onShell(command, 'pane')} onAsk={(text, intent) => void onAsk(text, intent)} />}
             {sideView === 'schedules' && <SchedulesPane {...sideFrame('schedules')} home={home} />}
             {sideView === 'investigate' && sidePid > 0 && <Investigate pid={sidePid} home={home} onAsk={(text, intent, runId) => void onAsk(text, intent, runId)} onSignal={onSignal}
               onShell={(command) => void onShell(command, 'pane')} onInvestigate={onInvestigate} onOpenTrace={onOpenTrace}
-              onOpenFile={(path) => addPane({ id: newId('pane'), kind: 'editor', title: path.split('/').pop() || path, cwd: home, path })}
+              onOpenFile={(path) => addPane({ id: newId('pane'), kind: 'editor', title: path.split('/').pop() || path, cwd: home, path, ...(sideNode ? { node: sideNode } : {}) })}
               onOpenRun={(runId) => { setSideRun(runId); setSideView('log'); }}
               onClose={() => { setSidePid(0); setSideView('machine'); }} />}
             {sideView === 'log' && sideRun && <RunPane {...sideFrame('run', sideRun)} named home={home} onAsk={onAsk} onRun={(command) => void onShell(command, 'pane')} onClose={() => { setSideRun(''); setSideView('machine'); }} />}
+            </ComputerScope>
           </aside>
         ) : <div />}
       </div>
@@ -590,6 +670,64 @@ function CloseButton({ label, title, body, action, onConfirm }: { label: string;
         document.getElementById('cc') ?? document.body,
       )}
     </>
+  );
+}
+
+/** A joined computer in the nav: its name in blue, the shells open there (`terminal.list` on its
+ * frame) and a new shell there; greyed while it is away. */
+function ComputerShells({ computer, home, shown, onOpen, onNew }: { computer: Computer; home: string; shown: PaneRec[]; onOpen: (info: TermInfo) => void; onNew: () => void }) {
+  useLive();
+  const { client } = useRuntime();
+  const [shells, setShells] = useState<TermInfo[]>([]);
+  useEffect(() => {
+    if (!computer.reachable) return;
+    let stopped = false;
+    const read = () => client.call<{ terminals: TermInfo[] }>('terminal.list', {})
+      .then((list) => {
+        if (stopped) return;
+        const alive = (list?.terminals ?? []).filter((term) => term.alive);
+        for (const term of alive) live.ensure(term.term_id, computer.node);
+        setShells(alive);
+      })
+      .catch(() => undefined);
+    void read();
+    const timer = setInterval(read, 5000);
+    return () => { stopped = true; clearInterval(timer); };
+  }, [client, computer.reachable, computer.node]);
+  return (
+    <div className="ct-computer">
+      <div className="cx-proj-h">
+        <span className={`cx-proj-name ${computer.reachable ? 'ct-blue' : 'ct-faint'}`}>{computer.name}</span>
+        <span className="grow" />
+        <span className="ap faint">{computer.reachable ? (computer.path || 'mesh').toUpperCase() : 'AWAY'}</span>
+      </div>
+      {computer.reachable && (
+        <>
+          <ul className="lst cx-sessions" aria-label={`Shells on ${computer.name}`}>
+            {shells.map((term) => {
+              const pane: PaneRec = { id: term.term_id, kind: 'term', title: 'shell', cwd: term.cwd, termId: term.term_id, node: computer.node };
+              const attention = live.attention(pane);
+              const [status, label, tone] = ROW_STATE[attention];
+              const here = shown.some((entry) => entry.termId === term.term_id);
+              return (
+                <li key={term.term_id} className={['cx-row', here ? 'sel' : '', NEEDS_YOU.has(attention) ? 'cx-attn' : ''].filter(Boolean).join(' ')}>
+                  <button type="button" onClick={() => onOpen(term)} title={here ? 'Show it' : 'Open it here'}>
+                    <div className="t ct-mono ct-place-t">{shortPath(live.states.get(term.term_id)?.cwd || term.cwd, home)}</div>
+                    <div className="r">
+                      <span className={`cx-pip cx-pip-${status}`} aria-hidden />
+                      <span className={`ap ${tone}`}>{live.states.get(term.term_id)?.running ? `${label} · ${live.states.get(term.term_id)!.running!.command.split(/\s+/)[0]!.toUpperCase()}` : label}</span>
+                      <span className="grow" />
+                      <span className="ap faint">{paneWhen(pane)}</span>
+                    </div>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+          <button type="button" className="detent sm ct-computer-new" onClick={onNew}>NEW SHELL THERE</button>
+        </>
+      )}
+    </div>
   );
 }
 

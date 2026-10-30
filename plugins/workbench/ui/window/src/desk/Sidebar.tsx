@@ -4,7 +4,7 @@
  */
 
 import { useEffect, useMemo, useState } from 'react';
-import { errorMessage, runtime, useEvent } from '@cortex/sdk';
+import { errorMessage, useRuntime, useEvent } from '@cortex/sdk';
 import type { Metrics, ModelInfo, Proc, ProcessGroup } from './api';
 import { GB, rate, size } from './api';
 
@@ -60,31 +60,38 @@ function TempChart({ history }: { history: Metrics[] }) {
   );
 }
 
-/** Samples kept across mounts, so switching the side pane away and back keeps the curves. */
-let kept: Metrics[] = [];
+/** Samples kept across mounts, per computer, so switching the side pane away and back keeps the curves. */
+const kept = new Map<string, Metrics[]>();
 
 export function useMetrics() {
-  const [metrics, setMetrics] = useState<Metrics | null>(kept[kept.length - 1] ?? null);
-  const [history, setHistory] = useState<Metrics[]>(kept);
+  const { client, node } = useRuntime();
+  const key = node ?? '';
+  const [metrics, setMetrics] = useState<Metrics | null>(null);
+  const [history, setHistory] = useState<Metrics[]>([]);
   useEffect(() => {
-    runtime().client.call<Metrics>('system.metrics', {}).then((sample) => sample && setMetrics(sample)).catch(() => undefined);
-  }, []);
+    const samples = kept.get(key) ?? [];
+    setHistory(samples);
+    setMetrics(samples[samples.length - 1] ?? null);
+    client.call<Metrics>('system.metrics', {}).then((sample) => sample && setMetrics(sample)).catch(() => undefined);
+  }, [client, key]);
   useEvent('system.sample', (_topic, data) => {
     const sample = data as Metrics;
     if (!sample?.at) return;
     setMetrics(sample);
-    kept = [...kept.slice(-(HISTORY - 1)), sample];
-    setHistory(kept);
+    const samples = [...(kept.get(key) ?? []).slice(-(HISTORY - 1)), sample];
+    kept.set(key, samples);
+    setHistory(samples);
   });
   return { metrics, history };
 }
 
 export function useModel() {
+  const client = useRuntime().client;
   const [info, setInfo] = useState<ModelInfo | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   useEffect(() => {
     let stopped = false;
-    const read = () => runtime().client.call<ModelInfo>('model.info', {}, { signal: AbortSignal.timeout(4000) })
+    const read = () => client.call<ModelInfo>('model.info', {}, { signal: AbortSignal.timeout(4000) })
       .then((value) => { if (!stopped) { setInfo(value); setProblem(null); } })
       .catch((cause) => { if (!stopped) setProblem(errorMessage(cause)); });
     void read();
@@ -93,7 +100,7 @@ export function useModel() {
       stopped = true;
       clearInterval(timer);
     };
-  }, []);
+  }, [client]);
   return { info, problem };
 }
 
@@ -107,12 +114,13 @@ export function modelLabel(info: ModelInfo | null, problem: string | null): stri
   return `${tag} · ${name} · ${where}`;
 }
 
-export function Sidebar({ onAsk, onSignal, onInvestigate }: { onAsk: (text: string, intent: 'ask' | 'explain') => void; onSignal: (proc: Proc, signal: string) => void; onInvestigate: (pid: number) => void }) {
+/** `computer`: the joined computer the focused shell runs on, named in blue (none: this Mac). */
+export function Sidebar({ computer, onAsk, onSignal, onInvestigate }: { computer?: string; onAsk: (text: string, intent: 'ask' | 'explain') => void; onSignal: (proc: Proc, signal: string) => void; onInvestigate: (pid: number) => void }) {
   const { metrics, history } = useMetrics();
   return (
-    <div className="ct-machine" aria-label="This machine">
+    <div className="ct-machine" aria-label={computer ?? 'This machine'}>
       <div className="ct-side-head">
-        <span className="ct-label ct-faint">THIS MAC</span>
+        {computer ? <span className="ct-label ct-blue">{computer.toUpperCase()}</span> : <span className="ct-label ct-faint">THIS MAC</span>}
         <span className="grow" />
         <span className="ct-label ct-blue">{metrics ? `${(metrics.machine || '').replace('Apple ', '').toUpperCase()} · ${Math.round(metrics.memory_total / GB)} GB · ${(metrics.thermal || 'nominal').toUpperCase()}` : '…'}</span>
       </div>
@@ -164,6 +172,7 @@ function Tile({ label, value, values, max, note }: { label: string; value: strin
 const QUESTION = /\?$|^(who|what|why|which|how|is|are|does|can)\b/i;
 
 export function Processes({ onAsk, onSignal, onInvestigate, wide }: { onAsk: (text: string, intent: 'ask' | 'explain') => void; onSignal: (proc: Proc, signal: string) => void; onInvestigate: (pid: number) => void; wide?: boolean }) {
+  const client = useRuntime().client;
   const [group, setGroup] = useState<'flat' | 'app' | 'tree'>(wide ? 'app' : 'flat');
   const [sort, setSort] = useState<'cpu' | 'memory' | 'gpu'>('memory');
   const [filter, setFilter] = useState('');
@@ -174,7 +183,7 @@ export function Processes({ onAsk, onSignal, onInvestigate, wide }: { onAsk: (te
 
   useEffect(() => {
     let stopped = false;
-    const read = () => runtime().client.call<{ groups: ProcessGroup[] }>('system.processes', { group, sort, filter: asking ? '' : filter, limit: wide ? 200 : 40 })
+    const read = () => client.call<{ groups: ProcessGroup[] }>('system.processes', { group, sort, filter: asking ? '' : filter, limit: wide ? 200 : 40 })
       .then((list) => { if (!stopped) { setGroups(list?.groups ?? []); setProblem(null); } })
       .catch((cause) => { if (!stopped) setProblem(errorMessage(cause)); });
     void read();
@@ -183,7 +192,7 @@ export function Processes({ onAsk, onSignal, onInvestigate, wide }: { onAsk: (te
       stopped = true;
       clearInterval(timer);
     };
-  }, [group, sort, filter, asking, wide]);
+  }, [group, sort, filter, asking, wide, client]);
 
   const rows = useMemo(() => {
     if (group !== 'app') return (groups[0]?.processes ?? []).map((proc) => ({ proc, depth: 0 }));
