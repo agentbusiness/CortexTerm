@@ -4,7 +4,7 @@
  */
 
 import { useEffect, useMemo, useState } from 'react';
-import { errorMessage, useRuntime, useEvent } from '@cortex/sdk';
+import { errorMessage, useRuntime } from '@cortex/sdk';
 import type { Metrics, ModelInfo, Proc, ProcessGroup } from './api';
 import { GB, rate, size } from './api';
 
@@ -63,26 +63,38 @@ function TempChart({ history }: { history: Metrics[] }) {
 /** Samples kept across mounts, per computer, so switching the side pane away and back keeps the curves. */
 const kept = new Map<string, Metrics[]>();
 
-export function useMetrics() {
+export function useMetrics(enabled = true) {
   const { client, node } = useRuntime();
   const key = node ?? '';
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [history, setHistory] = useState<Metrics[]>([]);
+  const [problem, setProblem] = useState<string | null>(null);
   useEffect(() => {
+    let stopped = false;
     const samples = kept.get(key) ?? [];
     setHistory(samples);
     setMetrics(samples[samples.length - 1] ?? null);
-    client.call<Metrics>('system.metrics', {}).then((sample) => sample && setMetrics(sample)).catch(() => undefined);
-  }, [client, key]);
-  useEvent('system.sample', (_topic, data) => {
-    const sample = data as Metrics;
-    if (!sample?.at) return;
-    setMetrics(sample);
-    const samples = [...(kept.get(key) ?? []).slice(-(HISTORY - 1)), sample];
-    kept.set(key, samples);
-    setHistory(samples);
-  });
-  return { metrics, history };
+    setProblem(null);
+    if (!enabled) return;
+    const accept = (sample: Metrics) => {
+      if (stopped || !sample?.at) return;
+      const previous = kept.get(key) ?? [];
+      if ((previous.at(-1)?.at ?? 0) > sample.at) return;
+      const next = previous.at(-1)?.at === sample.at ? previous : [...previous.slice(-(HISTORY - 1)), sample];
+      kept.set(key, next);
+      setMetrics(sample);
+      setHistory(next);
+      setProblem(null);
+    };
+    const read = () => client.call<Metrics>('system.metrics', {}, { signal: AbortSignal.timeout(8000) })
+      .then(accept).catch((cause) => { if (!stopped) setProblem(errorMessage(cause)); });
+    const off = client.on('system.sample', (_topic, data) => accept(data as Metrics));
+    void read();
+    // Refresh after a missed event or reconnect as well as receiving the live stream.
+    const timer = setInterval(() => void read(), 10_000);
+    return () => { stopped = true; off(); clearInterval(timer); };
+  }, [client, key, enabled]);
+  return { metrics, history, problem };
 }
 
 export function useModel() {
@@ -116,7 +128,7 @@ export function modelLabel(info: ModelInfo | null, problem: string | null): stri
 
 /** `computer`: the joined computer the focused shell runs on, named in blue (none: this Mac). */
 export function Sidebar({ computer, onAsk, onSignal, onInvestigate }: { computer?: string; onAsk: (text: string, intent: 'ask' | 'explain') => void; onSignal: (proc: Proc, signal: string) => void; onInvestigate: (pid: number) => void }) {
-  const { metrics, history } = useMetrics();
+  const { metrics, history, problem } = useMetrics();
   return (
     <div className="ct-machine" aria-label={computer ?? 'This machine'}>
       <div className="ct-side-head">
@@ -124,6 +136,16 @@ export function Sidebar({ computer, onAsk, onSignal, onInvestigate }: { computer
         <span className="grow" />
         <span className="ct-label ct-blue">{metrics ? `${(metrics.machine || '').replace('Apple ', '').toUpperCase()} · ${Math.round(metrics.memory_total / GB)} GB · ${(metrics.thermal || 'nominal').toUpperCase()}` : '…'}</span>
       </div>
+      {problem && <p className="ct-hint ct-warn" role="status">Metrics unavailable: {problem}. Reconnecting…</p>}
+      <MachineReadings metrics={metrics} history={history} />
+      <Processes onAsk={onAsk} onSignal={onSignal} onInvestigate={onInvestigate} />
+    </div>
+  );
+}
+
+/** The same measurements in the machine pane and in every cluster card. */
+export function MachineReadings({ metrics, history }: { metrics: Metrics | null; history: Metrics[] }) {
+  return <>
       <div className="ct-tiles three">
         <Tile label="CPU" value={metrics ? `${Math.round(metrics.cpu)}%` : '–'} values={history.map((m) => m.cpu)} max={100}
           note={metrics && metrics.p_cores ? `P ${metrics.p_cores} · E ${metrics.e_cores} · load ${metrics.load[0].toFixed(1)}` : metrics ? `load ${metrics.load[0].toFixed(1)}` : ''} />
@@ -154,9 +176,7 @@ export function Sidebar({ computer, onAsk, onSignal, onInvestigate }: { computer
           </> : ''}</div>
         </div>
       </div>
-      <Processes onAsk={onAsk} onSignal={onSignal} onInvestigate={onInvestigate} />
-    </div>
-  );
+  </>;
 }
 
 function Tile({ label, value, values, max, note }: { label: string; value: string; values: number[]; max?: number; note?: string }) {
