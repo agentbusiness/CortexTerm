@@ -71,7 +71,18 @@ pub fn spawn_power(power: Arc<Mutex<Power>>) {
             }
         });
     }
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::thread::Builder::new().name("linux-sensors".into()).spawn(move || {
+            let mut sensors = crate::linux::Sensors::new();
+            loop {
+                let sample = sensors.sample();
+                if let Ok(mut current) = power.lock() { *current = sample; }
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
+    }
+    #[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
     {
         let _ = power;
     }
@@ -178,6 +189,8 @@ pub struct Sampler {
     last_ports: Option<Instant>,
     last_slow: Option<Instant>,
     battery: Option<Battery>,
+    #[cfg(target_os = "linux")]
+    disk_previous: Option<(u64, u64)>,
     /// The previous scan's GPU time per pid (ns), to turn into a share of the interval.
     gpu_prev: Option<(Instant, HashMap<u32, u64>)>,
     pub ports: Vec<Port>,
@@ -204,6 +217,8 @@ impl Sampler {
             last_ports: None,
             last_slow: None,
             battery: None,
+            #[cfg(target_os = "linux")]
+            disk_previous: None,
             gpu_prev: None,
             ports: Vec::new(),
             snapshot: Snapshot::default(),
@@ -238,10 +253,23 @@ impl Sampler {
             cores.rotate_left(e);
         }
         let root = self.disks.list().iter().find(|d| d.mount_point() == std::path::Path::new("/")).or_else(|| self.disks.list().first());
-        let (disk_total, disk_free) = root.map(|d| (d.total_space(), d.available_space())).unwrap_or_default();
+        let capacity = root.map(|d| (d.total_space(), d.available_space()));
+        #[cfg(target_os = "linux")]
+        let capacity = crate::linux::root_capacity().or(capacity);
+        let (disk_total, disk_free) = capacity.unwrap_or_default();
         // Volumes on one physical disk report that disk's traffic: take the busiest, not the sum.
+        #[cfg(not(target_os = "linux"))]
         let disk_read = self.disks.list().iter().map(|d| d.usage().read_bytes).max().unwrap_or(0);
+        #[cfg(not(target_os = "linux"))]
         let disk_write = self.disks.list().iter().map(|d| d.usage().written_bytes).max().unwrap_or(0);
+        #[cfg(target_os = "linux")]
+        let (disk_read, disk_write) = match crate::linux::disk_bytes() {
+            Some(current) => {
+                let previous = self.disk_previous.replace(current).unwrap_or(current);
+                (current.0.saturating_sub(previous.0), current.1.saturating_sub(previous.1))
+            }
+            None => { self.disk_previous = None; (0, 0) }
+        };
         let (mut rx, mut tx) = (0u64, 0u64);
         for (name, data) in self.nets.list() {
             if !name.starts_with("lo") {

@@ -1,0 +1,46 @@
+/* The machine pane's existing type, rules and theme colours; all selectors belong to this plugin. */
+.ct-side-files{display:flex;flex:1;min-height:0;min-width:0;}
+.fb-files{display:flex;flex:1;flex-direction:column;gap:12px;min-height:0;min-width:0;color:var(--ink);font:13px/1.5 "Source Serif 4",Georgia,serif;}
+.fb-files button{cursor:pointer;}
+.fb-files button:disabled{cursor:default;opacity:.45;}
+.fb-files button:focus-visible,.fb-files input:focus-visible{outline:1px solid var(--counter);outline-offset:3px;}
+.fb-path{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px;min-width:0;padding-bottom:8px;border-bottom:1px solid var(--rule-2);font:12px/1.6 var(--font-mono);overflow-wrap:anywhere;}
+.fb-path button{background:transparent;border:0;padding:0;color:var(--ink-2);font:inherit;text-align:left;overflow-wrap:anywhere;}
+.fb-path button:hover,.fb-path button[aria-current]{color:var(--ink);}
+.fb-crumb{display:inline-flex;align-items:baseline;gap:4px;min-width:0;color:var(--ink-3);}
+.fb-toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:8px;}
+.fb-grow{flex:1;min-width:0;}
+.fb-text-control{background:transparent;border:0;padding:0;color:var(--ink-2);font:600 9.5px/16px Archivo,sans-serif;letter-spacing:.17em;text-transform:uppercase;}
+.fb-text-control:hover{color:var(--ink);}
+.fb-hidden{display:flex;align-items:center;gap:7px;color:var(--ink-2);font:600 9.5px/16px Archivo,sans-serif;letter-spacing:.12em;cursor:pointer;}
+.fb-hidden input{width:12px;height:12px;margin:0;accent-color:var(--rubric);}
+.fb-list{flex:1;min-height:0;overflow:auto;scrollbar-color:var(--rule-2) var(--ground);scrollbar-width:thin;}
+.fb-list ul{list-style:none;padding:0;margin:0;}
+.fb-columns,.fb-row{display:grid;grid-template-columns:minmax(0,1fr) 58px 64px;gap:10px;align-items:center;}
+.fb-columns{padding:0 6px 6px;border-bottom:1px solid var(--rule-2);color:var(--ink-3);font:600 9px/16px Archivo,sans-serif;letter-spacing:.12em;}
+.fb-columns span:not(:first-child){text-align:right;}
+.fb-row{width:100%;padding:8px 6px;background:transparent;border:0;border-bottom:1px solid var(--rule);text-align:left;color:var(--ink);font:12px/1.5 var(--font-mono);}
+.fb-row:hover{background:var(--rubric-wash);}
+.fb-row.fb-selected{background:var(--rubric-wash);box-shadow:inset 0 0 0 1px var(--rubric-deep);}
+.fb-row:disabled{opacity:1;color:var(--ink-3);}
+.fb-row:disabled:hover{background:transparent;}
+.fb-name{display:flex;align-items:center;gap:7px;min-width:0;}
+.fb-name>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.fb-icon{flex:0 0 15px;width:15px;height:15px;color:var(--ink-3);}
+.fb-icon-folder{color:var(--counter);}
+.fb-parent{display:flex;font-family:"Source Serif 4",Georgia,serif;color:var(--ink-2);}
+.fb-size,.fb-date{text-align:right;white-space:nowrap;color:var(--ink-3);font:10px/1.5 var(--font-mono);font-variant-numeric:tabular-nums;}
+.fb-message{margin:0;padding:10px 0;color:var(--ink-2);overflow-wrap:anywhere;}
+.fb-message p{margin:0 0 8px;}
+.fb-message .fb-text-control+.fb-text-control{margin-left:12px;}
+.fb-error,.fb-error .fb-message{color:var(--rubric-lift);}
+.fb-count{display:flex;align-items:baseline;gap:8px;min-width:0;margin:0;padding-top:8px;border-top:1px solid var(--rule);color:var(--ink-3);font:600 9px/16px Archivo,sans-serif;letter-spacing:.12em;}
+.fb-count>span:last-child{max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.fb-transfer{padding-top:10px;border-top:1px solid var(--rule-2);}
+.fb-transfer-head{display:flex;align-items:baseline;gap:8px;font:600 9.5px/16px Archivo,sans-serif;letter-spacing:.14em;}
+.fb-transfer-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:6px 0;font:12px/1.5 var(--font-mono);}
+.fb-transfer-detail{margin:6px 0;color:var(--ink-3);font:10px/1.5 var(--font-mono);font-variant-numeric:tabular-nums;}
+.fb-transfer progress{display:block;width:100%;height:3px;border:0;border-radius:0;background:var(--rule);accent-color:var(--counter);}
+.fb-transfer progress::-webkit-progress-bar{background:var(--rule);}
+.fb-transfer progress::-webkit-progress-value{background:var(--counter);}
+.fb-transfer progress::-moz-progress-bar{background:var(--counter);}

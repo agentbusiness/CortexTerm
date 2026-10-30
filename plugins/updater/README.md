@@ -53,3 +53,9 @@ check_every_s = 3600
 |---|---|
 | `backend/` | Cargo workspace, binary `cc-updater` |
 | `ui/band` | the band line and the popup (`workbench.band@1`) |
+
+## Runner behavior (0.1.15)
+
+Frame 0.1.12's `--runner` profile keeps the updater enabled and supplies `auto_restart=true`. The background loop checks every five seconds for a staged core update and waits for update operations, AI runs, terminal command jobs, due schedules and active system/terminal calls before requesting a restart. PTY shells stay in `cortexd`. Desktop launches retain their explicit restart behavior.
+
+A development runner receives `development=true` and the frame's initial build marker. The updater watches the checkout's successful core-build marker instead of installing official releases over local plugins; a changed core restarts onto the checkout's own binary. See [the runner documentation](../../RUNNER.md).

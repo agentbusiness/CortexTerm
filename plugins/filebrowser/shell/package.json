@@ -1,0 +1,9 @@
+{
+  "name": "@cortexterm/filebrowser-shell",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "main": "index.js",
+  "cortex": { "id": "filebrowser.shell-module", "shellModule": { "entry": "index.js" } }
+}

@@ -63,51 +63,19 @@ pub fn scan() -> Vec<Port> {
     finish(ports)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 pub fn scan() -> Vec<Port> {
-    use std::collections::HashMap;
-    // inode -> (address, port) of listening sockets (state 0A).
-    let mut listening: HashMap<u64, (String, u16)> = HashMap::new();
-    for (file, v6) in [("/proc/net/tcp", false), ("/proc/net/tcp6", true)] {
-        let text = std::fs::read_to_string(file).unwrap_or_default();
-        for line in text.lines().skip(1) {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() < 10 || fields[3] != "0A" {
-                continue;
-            }
-            let Some((addr, port)) = fields[1].split_once(':') else { continue };
-            let Ok(port) = u16::from_str_radix(port, 16) else { continue };
-            let address = if v6 {
-                // Four 32-bit words, each in host byte order.
-                let mut bytes = [0u8; 16];
-                for (i, chunk) in bytes.chunks_mut(4).enumerate() {
-                    let word = addr.get(i * 8..i * 8 + 8).and_then(|w| u32::from_str_radix(w, 16).ok()).unwrap_or(0);
-                    chunk.copy_from_slice(&word.to_ne_bytes());
-                }
-                std::net::Ipv6Addr::from(bytes).to_string()
-            } else {
-                u32::from_str_radix(addr, 16).map(|raw| std::net::Ipv4Addr::from(u32::from_be(raw)).to_string()).unwrap_or_default()
-            };
-            if let Ok(inode) = fields[9].parse() {
-                listening.insert(inode, (address, port));
-            }
-        }
-    }
+    let mut owners = crate::linux::socket_owners();
     let mut ports = Vec::new();
-    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else { continue };
-        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else { continue };
-        let process = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default().trim().to_owned();
-        for fd in fds.flatten() {
-            let Ok(target) = std::fs::read_link(fd.path()) else { continue };
-            let target = target.to_string_lossy();
-            let Some(inode) = target.strip_prefix("socket:[").and_then(|s| s.strip_suffix(']')).and_then(|s| s.parse::<u64>().ok()) else {
-                continue;
-            };
-            if let Some((address, port)) = listening.get(&inode) {
-                ports.push(Port { port: *port, address: address.clone(), pid, process: process.clone(), public: false });
-            }
+    for socket in crate::linux::sockets().unwrap_or_default().into_values().filter(|s| s.proto == "tcp" && s.state == "LISTEN") {
+        // Keep a visible listener even when procfs permissions hide its owner's descriptors.
+        let processes = owners.remove(&socket.inode).unwrap_or_else(|| vec![(0, "owner unavailable".into())]);
+        for (pid, process) in processes {
+            ports.push(Port { port: socket.local.port(), address: socket.local.ip().to_string(), pid, process, public: false });
         }
     }
     finish(ports)
 }
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn scan() -> Vec<Port> { Vec::new() }

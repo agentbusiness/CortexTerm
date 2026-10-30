@@ -4,9 +4,9 @@
 // later runs start the installed app at once, without looking at the catalog: the app updates its
 // frame and plugins itself, so a newer app release is only for machines that have none. The app runs
 // on its own: closing the terminal does not quit it (its start output goes to ~/.cortexterm/logs/start.log).
-// Arguments go to the app (`--headless`, `--safe`). `npx cortexterm runner` keeps it running without a
-// window at every login (a LaunchAgent), for a Mac nobody sits at; `runner join <invitation>` joins
-// that Mac to the network, `runner off` stops it.
+// Arguments go to the app (`--headless`, `--safe`). `npx cortexterm runner` keeps it running without
+// a local chat model: launchd on macOS, systemd on Linux (boot and SSH logout). `runner join <invitation>`
+// joins the mesh, `runner off` stops it. Development uses the same installer via ./cortexterm runner.
 
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -14,14 +14,14 @@ import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, readFile
 import http from 'node:http';
 import https from 'node:https';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { pipeline } from 'node:stream/promises';
-import { fileURLToPath } from 'node:url';
 
 const REPO = process.env.CORTEXTERM_REPO || 'agentbusiness/CortexTerm';
 // CORTEXTERM_CATALOG: another catalog (a mirror, or a release under test).
 const CATALOG_URL = process.env.CORTEXTERM_CATALOG || `https://github.com/${REPO}/releases/download/catalog/catalog.json`;
-const HOME = process.env.CORTEX_HOME || join(homedir(), '.cortexterm');
+const HOME = resolve(process.env.CORTEX_HOME || join(homedir(), '.cortexterm'));
+const DEV_ROOT = process.env.CORTEXTERM_DEV_ROOT ? resolve(process.env.CORTEXTERM_DEV_ROOT) : null;
 const APPS = join(HOME, 'app');
 const READY = '.ready';
 const START_LOG = join(HOME, 'logs', 'start.log');
@@ -178,39 +178,131 @@ async function ensureApp() {
   return chosen;
 }
 
-// --- the runner: CortexTerm with no window, kept running on a Mac nobody sits at -------------------
+/** Old installed launch frames cannot parse --runner, even when a newer frame is staged.
+ * Refresh the bootstrap app in that case before installing a persistent service. */
+async function runnerApp() {
+  let chosen = await ensureApp();
+  if (!chosen) return null;
+  let app = executable(join(APPS, chosen));
+  if ((await serviceCommand(app, ['--help'], true)).stdout.includes('--runner')) return app;
+  say('the installed app predates the runner profile; downloading the current app');
+  const listed = await catalog();
+  const asset = listed.app?.files?.[platform()]?.archive;
+  if (!asset) throw new Error('the release catalog has no runner-capable app for this machine yet');
+  await install(listed.app, asset);
+  chosen = listed.app.version;
+  app = executable(join(APPS, chosen));
+  if (!(await serviceCommand(app, ['--help'], true)).stdout.includes('--runner')) {
+    throw new Error('the released app does not support --runner yet; it needs frame 0.1.12 or later');
+  }
+  return app;
+}
 
+// The service starts the installed frame directly, independently of npx's temporary cache.
 const LABEL = 'com.cortexterm.runner';
 const AGENT = join(homedir(), 'Library', 'LaunchAgents', `${LABEL}.plist`);
-const RUNNER = join(HOME, 'runner', 'cortexterm.mjs');
+const SERVICE = 'cortexterm-runner.service';
+const SYSTEM_SERVICE = process.platform === 'linux' && process.getuid() === 0;
+const UNIT_DIR = SYSTEM_SERVICE ? '/etc/systemd/system' : join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'systemd', 'user');
+const UNIT = join(UNIT_DIR, SERVICE);
+const xml = (value) => String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-const xml = (text) => String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+function serviceEnv() {
+  const env = { CORTEX_HOME: HOME, HOME: homedir(), PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin' };
+  if (DEV_ROOT) { env.CORTEXTERM_DEV_ROOT = DEV_ROOT; env.CORTEX_NO_HANDOVER = '1'; }
+  if (process.env.SHELL) env.SHELL = process.env.SHELL;
+  // Preserve explicit release mirrors for offline/private installations.
+  for (const key of ['CORTEXTERM_REPO', 'CORTEXTERM_CATALOG', 'CORTEX_LOG']) {
+    if (process.env[key]) env[key] = process.env[key];
+  }
+  return env;
+}
 
-/** A LaunchAgent that starts this launcher (a copy kept in the home: npx's own is temporary) in
- * the foreground with `--headless` at every login, and again when the app ends with an error. */
-function agentPlist() {
-  const env = process.env.CORTEX_HOME ? `<key>EnvironmentVariables</key><dict><key>CORTEX_HOME</key><string>${xml(HOME)}</string></dict>` : '';
+function agentPlist(app) {
+  const env = Object.entries(serviceEnv()).map(([key, value]) => `<key>${xml(key)}</key><string>${xml(value)}</string>`).join('');
   const log = xml(join(HOME, 'logs', 'runner.log'));
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>${LABEL}</string>
-<key>ProgramArguments</key><array><string>${xml(process.execPath)}</string><string>${xml(RUNNER)}</string><string>--headless</string><string>--foreground</string></array>
+<key>ProgramArguments</key><array><string>${xml(app)}</string><string>--runner</string></array>
 <key>RunAtLoad</key><true/>
-<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+<key>KeepAlive</key><true/>
+<key>ThrottleInterval</key><integer>5</integer>
+<key>AbandonProcessGroup</key><true/>
 <key>StandardOutPath</key><string>${log}</string>
 <key>StandardErrorPath</key><string>${log}</string>
-${env}
+<key>EnvironmentVariables</key><dict>${env}</dict>
 </dict></plist>
 `;
 }
 
-function launchctl(args) {
+// systemd interprets percent specifiers and, in ExecStart, dollar expansion even inside quotes.
+function unitQuote(value, command = false) {
+  const text = String(value);
+  if (/[\0\r\n]/.test(text)) throw new Error('service paths and environment values cannot contain line breaks or NUL');
+  return '"' + text.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%').replace(/\$/g, command ? '$$$$' : '$$') + '"';
+}
+
+function serviceUnit(app) {
+  const env = Object.entries(serviceEnv()).map(([key, value]) => `Environment=${unitQuote(`${key}=${value}`)}`).join('\n');
+  return `[Unit]
+Description=CortexTerm model-free runner
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=${unitQuote(app, true)} --runner
+${env}
+Restart=always
+RestartSec=5
+# The frame shuts down its plugins; cortexd and its shells deliberately survive a service restart.
+KillMode=process
+TimeoutStopSec=90
+UMask=0077
+
+[Install]
+WantedBy=${SYSTEM_SERVICE ? 'multi-user.target' : 'default.target'}
+`;
+}
+
+function serviceCommand(command, args, capture = false) {
   return new Promise((resolve) => {
-    const child = spawn('/bin/launchctl', args, { stdio: 'ignore' });
-    child.on('error', () => resolve(false));
-    child.on('exit', (code) => resolve(code === 0));
+    let stdout = '';
+    let stderr = '';
+    const env = { ...process.env };
+    if (process.platform === 'linux' && process.getuid() !== 0 && command === 'systemctl') {
+      env.XDG_RUNTIME_DIR ||= `/run/user/${process.getuid()}`;
+      env.DBUS_SESSION_BUS_ADDRESS ||= `unix:path=${env.XDG_RUNTIME_DIR}/bus`;
+    }
+    const child = spawn(command, args, { env, stdio: ['ignore', capture ? 'pipe' : 'ignore', 'pipe'] });
+    child.stdout?.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', (error) => resolve({ ok: false, stdout, stderr: error.message }));
+    child.on('exit', (code) => resolve({ ok: code === 0, stdout: stdout.trim(), stderr: stderr.trim() }));
   });
+}
+
+const systemctl = (args, capture = false) => serviceCommand('systemctl', [...(SYSTEM_SERVICE ? [] : ['--user']), '--no-ask-password', ...args], capture);
+
+async function requireService(result, action) {
+  const outcome = await result;
+  if (!outcome.ok) throw new Error(`${action}: ${outcome.stderr || 'service manager unavailable'}`);
+  return outcome;
+}
+
+async function waitForRunner() {
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    try {
+      const info = JSON.parse(readFileSync(join(HOME, 'run', 'frame.json'), 'utf8'));
+      const response = await fetch(`http://127.0.0.1:${info.port}/health`, { signal: AbortSignal.timeout(Math.max(1, Math.min(1000, deadline - Date.now()))) });
+      const health = await response.json();
+      if (health.ok && health.runner && health.pid === info.pid) return info.pid;
+    } catch { /* The installed frame may still be starting. */ }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(500, Math.max(0, deadline - Date.now()))));
+  }
+  throw new Error(`the runner did not become ready in 60 seconds; inspect ${join(HOME, 'logs', 'runner.log')} or journalctl ${SYSTEM_SERVICE ? '' : '--user '} -u ${SERVICE}`);
 }
 
 /** The frame's API token: in the Keychain on macOS, in `run/frame.json` elsewhere. */
@@ -247,46 +339,101 @@ async function runner(args) {
   const [what, ...rest] = args;
   if (what === 'join') {
     const code = rest.join(' ').trim();
-    if (!code) {
-      say('npx cortexterm runner join <invitation>: the invitation from Settings > Mesh on a computer of your network');
-      return 1;
-    }
+    if (!code) throw new Error('runner join <invitation>: use the invitation from Settings > Mesh on another computer');
     const member = await frameCall('mesh.pair.join', { code });
     say(`joined the network as ${member.name}`);
     return 0;
   }
-  if (process.platform !== 'darwin') {
-    say('the runner is for Macs for now; elsewhere start CortexTerm with `npx cortexterm --headless`');
-    return 1;
-  }
-  const domain = `gui/${process.getuid()}`;
+  if (!['darwin', 'linux'].includes(process.platform)) throw new Error('the runner supports macOS and Linux');
   if (what === 'off') {
-    await launchctl(['bootout', `${domain}/${LABEL}`]);
-    rmSync(AGENT, { force: true });
-    say('the runner is off: CortexTerm no longer starts at login, and the runner\'s CortexTerm has stopped');
+    if (process.platform === 'darwin') {
+      const job = `gui/${process.getuid()}/${LABEL}`;
+      if ((await serviceCommand('/bin/launchctl', ['print', job])).ok) {
+        await requireService(serviceCommand('/bin/launchctl', ['bootout', job]), 'cannot stop the runner');
+      }
+      rmSync(AGENT, { force: true });
+    } else {
+      const installed = existsSync(UNIT);
+      const active = await systemctl(['is-active', '--quiet', SERVICE]);
+      if (installed || active.ok) {
+        await requireService(systemctl(['stop', SERVICE]), 'cannot stop the runner');
+        if (installed) await requireService(systemctl(['disable', SERVICE]), 'cannot disable the runner');
+        rmSync(UNIT, { force: true });
+        await requireService(systemctl(['daemon-reload']), 'cannot reload services');
+      }
+    }
+    say('the runner is off; existing terminal shells are preserved');
     return 0;
   }
-  if (what) {
-    say(`unknown runner command \`${what}\` (runner, runner join <invitation>, runner off)`);
-    return 1;
+  if (what) throw new Error(`unknown runner command ${what}; use runner, runner join <invitation>, or runner off`);
+  if (running()) {
+    // Do not take over a desktop or another checkout sharing this home.
+    throw new Error('CortexTerm already runs for this home; stop it before installing the runner');
   }
-  if (!(await ensureApp())) return 1;
-  mkdirSync(join(HOME, 'runner'), { recursive: true });
-  mkdirSync(join(HOME, 'logs'), { recursive: true });
-  mkdirSync(join(homedir(), 'Library', 'LaunchAgents'), { recursive: true });
-  writeFileSync(RUNNER, readFileSync(fileURLToPath(import.meta.url)));
-  writeFileSync(AGENT, agentPlist());
-  await launchctl(['bootout', `${domain}/${LABEL}`]);
-  if (!(await launchctl(['bootstrap', domain, AGENT]))) {
-    say(`cannot start the runner (launchctl bootstrap ${domain} ${AGENT} failed)`);
-    return 1;
+  let app;
+  if (DEV_ROOT) {
+    if (!existsSync(join(DEV_ROOT, 'cortexterm'))) throw new Error(`no development launcher in ${DEV_ROOT}`);
+    await run(join(DEV_ROOT, 'cortexterm'), ['--build-only']);
+    app = process.platform === 'darwin'
+      ? join(DEV_ROOT, 'build', 'CortexTerm.app', 'Contents', 'MacOS', 'CortexTerm')
+      : join(DEV_ROOT, 'build', 'cortexterm', 'CortexTerm');
+  } else {
+    app = await runnerApp();
+    if (!app) return 1;
   }
-  const pid = running();
-  say(pid
-    ? `CortexTerm is already running here (pid ${pid}); the runner keeps it running without a window from the next login`
-    : 'the runner is on: CortexTerm runs here without a window, now and at every login');
-  say('to join your network: npx cortexterm runner join <invitation>');
+  if (process.platform === 'linux' && !SYSTEM_SERVICE) {
+    // Linger keeps the user manager alive after SSH logout and starts it at boot.
+    const linger = await serviceCommand('loginctl', ['show-user', String(process.getuid()), '--property=Linger', '--value'], true);
+    if (linger.stdout !== 'yes') {
+      await requireService(serviceCommand('loginctl', ['--no-ask-password', 'enable-linger', String(process.getuid())]),
+        `cannot keep the runner alive after logout; an administrator must run loginctl enable-linger ${process.getuid()}`);
+    }
+  }
+  mkdirSync(join(HOME, 'logs'), { recursive: true, mode: 0o700 });
+  if (process.platform === 'darwin') {
+    mkdirSync(dirname(AGENT), { recursive: true });
+    writeFileSync(AGENT, agentPlist(app));
+    const domain = `gui/${process.getuid()}`;
+    await serviceCommand('/bin/launchctl', ['bootout', `${domain}/${LABEL}`]);
+    await requireService(serviceCommand('/bin/launchctl', ['bootstrap', domain, AGENT]), 'cannot start the runner');
+  } else {
+    mkdirSync(UNIT_DIR, { recursive: true });
+    writeFileSync(UNIT, serviceUnit(app));
+    await requireService(systemctl(['daemon-reload']), 'cannot load the runner service');
+    await requireService(systemctl(['enable', SERVICE]), 'cannot enable the runner');
+    await requireService(systemctl(['restart', SERVICE]), 'cannot start the runner');
+  }
+  const pid = await waitForRunner();
+  say(`the ${DEV_ROOT ? 'development ' : ''}runner is on (pid ${pid}): no local model, background updates, automatic restarts`);
+  say(process.platform === 'darwin' ? 'starts at login; you can close this terminal' : 'starts at boot and stays running after SSH logout');
   return 0;
+}
+
+async function foreground(args) {
+  const appArgs = args.filter((arg) => arg !== '--foreground');
+  let command;
+  if (DEV_ROOT) {
+    command = join(DEV_ROOT, 'cortexterm');
+  } else {
+    const chosen = await ensureApp();
+    if (!chosen) return 1;
+    command = executable(join(APPS, chosen));
+  }
+  return await new Promise((resolve) => {
+    const child = spawn(command, appArgs, { stdio: 'inherit' });
+    const forward = (signal) => { if (child.exitCode === null) child.kill(signal); };
+    const term = () => forward('SIGTERM');
+    const interrupt = () => forward('SIGINT');
+    process.on('SIGTERM', term);
+    process.on('SIGINT', interrupt);
+    const done = (code) => {
+      process.off('SIGTERM', term);
+      process.off('SIGINT', interrupt);
+      resolve(code);
+    };
+    child.once('error', (error) => { say(`cannot start CortexTerm: ${error.message}`); done(1); });
+    child.once('exit', (code) => done(code ?? 1));
+  });
 }
 
 async function main() {
@@ -294,7 +441,7 @@ async function main() {
   if (args.includes('--help') || args.includes('-h')) {
     process.stdout.write([
       'npx cortexterm [--headless] [--safe]   start CortexTerm; the first run downloads it into ~/.cortexterm/app',
-      'npx cortexterm runner                  keep CortexTerm running here without a window, at every login (macOS)',
+      'npx cortexterm runner                  model-free background service (macOS login / Linux boot)',
       'npx cortexterm runner join <invitation>  join this computer to your network (the invitation from Settings > Mesh)',
       'npx cortexterm runner off              stop the runner',
       '',
@@ -302,6 +449,7 @@ async function main() {
     return 0;
   }
   if (args[0] === 'runner') return runner(args.slice(1));
+  if (args.includes('--foreground')) return foreground(args);
   const pid = running();
   if (pid) {
     say(`CortexTerm is already running (pid ${pid})`);
@@ -309,17 +457,6 @@ async function main() {
   }
   const chosen = await ensureApp();
   if (!chosen) return 1;
-  // The runner's LaunchAgent: the app in the foreground, so launchd sees it end.
-  if (args.includes('--foreground')) {
-    const child = spawn(executable(join(APPS, chosen)), args.filter((arg) => arg !== '--foreground'), { stdio: 'inherit' });
-    return await new Promise((resolve) => {
-      child.on('error', (error) => {
-        say(`cannot start CortexTerm: ${error.message}`);
-        resolve(1);
-      });
-      child.on('exit', (code) => resolve(code ?? 1));
-    });
-  }
   // Its own session, detached from this terminal: closing the terminal does not quit it.
   mkdirSync(join(HOME, 'logs'), { recursive: true });
   const log = openSync(START_LOG, 'a');

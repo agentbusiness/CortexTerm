@@ -20,7 +20,18 @@ while [ -L "$self" ]; do
   esac
 done
 cd "$(dirname "$self")" || exit 1
-app=build/CortexTerm.app/Contents/MacOS/CortexTerm
+export CORTEXTERM_DEV_ROOT="$PWD"
+if [ "${1:-}" = runner ]; then
+  shift
+  exec node npm/cortexterm/bin/cortexterm.mjs runner "$@"
+fi
+build_only=0
+[ "${1:-}" != --build-only ] || build_only=1
+case "$(uname -s)" in
+  Darwin) app=build/CortexTerm.app/Contents/MacOS/CortexTerm ;;
+  Linux) app=build/cortexterm/CortexTerm ;;
+  *) echo "CortexTerm development supports macOS and Linux" >&2; exit 1 ;;
+esac
 if [ -x "$app" ]; then
   # A build a previous start left running is stopped (with the cargo and npm under it): this one
   # starts from the current source.
@@ -32,11 +43,15 @@ if [ -x "$app" ]; then
   if [ -n "$previous" ] && ps -p "$previous" -o command= 2>/dev/null | grep -q 'build-app.sh'; then
     stop_tree "$previous"
   fi
+  if [ "$build_only" = 1 ]; then
+    exec scripts/build-app.sh build --live 3>&2
+  fi
   # Its progress lines reach this terminal on fd 3; the rest goes to the log.
   nohup scripts/build-app.sh build --live 3>&2 >build/build.log 2>&1 </dev/null &
   echo $! > build/.build.pid
 else
   scripts/build-app.sh build || exit 1
+  [ "$build_only" = 0 ] || exit 0
 fi
 # The development start runs this build, never a frame an update staged in ~/.cortexterm/frame.
 export CORTEX_NO_HANDOVER=1

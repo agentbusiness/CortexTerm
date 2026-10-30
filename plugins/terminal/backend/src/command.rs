@@ -63,7 +63,7 @@ fn now_ms() -> u64 {
 }
 
 fn shell() -> PathBuf {
-    std::env::var("SHELL").ok().filter(|s| s.starts_with('/') && Path::new(s).is_file()).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/bin/zsh"))
+    PathBuf::from(crate::login_shell())
 }
 
 impl Commands {

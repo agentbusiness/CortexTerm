@@ -13,15 +13,17 @@ running the command again while it runs only says so.
 
 Arguments go to the app: `npx cortexterm --headless`, `npx cortexterm --safe`.
 
-## A Mac nobody sits at: the runner
+## Background runner (macOS and Linux)
 
 ```sh
 npx cortexterm runner
 npx cortexterm runner join <invitation>
 ```
 
-`runner` keeps CortexTerm running on this Mac without a window, now and at every login (a LaunchAgent,
-`~/Library/LaunchAgents/com.cortexterm.runner.plist`; its output goes to `~/.cortexterm/logs/runner.log`).
-`runner join` joins it to your network with an invitation made in Settings > Mesh on another computer.
-The other computers then list it under COMPUTERS and open shells on it. `npx cortexterm runner off`
-stops it. On Linux, start it with `npx cortexterm --headless` for now.
+The runner keeps terminal execution, metrics, monitoring, memory, mesh and updates running in the background. It never downloads or loads a local chat model; AI uses an available model in the mesh. Shell commands execute on this machine and work without AI.
+
+On macOS it installs a LaunchAgent that starts at login. On Linux it installs a systemd service and enables user linger so it starts at boot and survives SSH logout (the installer explains when an administrator must enable linger). The service starts the installed frame directly, independently of npx's cache. Updates requiring a core restart are applied automatically after active work settles. Existing PTY shells survive restarts.
+
+`npx cortexterm runner off` stops the service. macOS output is in `~/.cortexterm/logs/runner.log`; Linux uses `journalctl --user -u cortexterm-runner.service` (without `--user` for a root-installed service). On non-systemd Linux, use `npx cortexterm --runner --foreground` under your supervisor.
+
+Development uses `./cortexterm runner` from the checkout; `./cortexterm --build-only` refreshes the build and the runner automatically restarts when the core changed. Development stays on local builds. Full details: [runner documentation](https://github.com/agentbusiness/CortexTerm/blob/main/RUNNER.md).

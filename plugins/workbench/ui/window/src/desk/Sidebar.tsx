@@ -126,13 +126,12 @@ export function modelLabel(info: ModelInfo | null, problem: string | null): stri
   return `${tag} · ${name} · ${where}`;
 }
 
-/** `computer`: the joined computer the focused shell runs on, named in blue (none: this Mac). */
+/** The picker names the computer; this header only shows its hardware and thermal status. */
 export function Sidebar({ computer, onAsk, onSignal, onInvestigate }: { computer?: string; onAsk: (text: string, intent: 'ask' | 'explain') => void; onSignal: (proc: Proc, signal: string) => void; onInvestigate: (pid: number) => void }) {
   const { metrics, history, problem } = useMetrics();
   return (
     <div className="ct-machine" aria-label={computer ?? 'This machine'}>
       <div className="ct-side-head">
-        {computer ? <span className="ct-label ct-blue">{computer.toUpperCase()}</span> : <span className="ct-label ct-faint">THIS MAC</span>}
         <span className="grow" />
         <span className="ct-label ct-blue">{metrics ? `${(metrics.machine || '').replace('Apple ', '').toUpperCase()} · ${Math.round(metrics.memory_total / GB)} GB · ${(metrics.thermal || 'nominal').toUpperCase()}` : '…'}</span>
       </div>
@@ -150,13 +149,12 @@ export function MachineReadings({ metrics, history }: { metrics: Metrics | null;
         <Tile label="CPU" value={metrics ? `${Math.round(metrics.cpu)}%` : '–'} values={history.map((m) => m.cpu)} max={100}
           note={metrics && metrics.p_cores ? `P ${metrics.p_cores} · E ${metrics.e_cores} · load ${metrics.load[0].toFixed(1)}` : metrics ? `load ${metrics.load[0].toFixed(1)}` : ''} />
         <div className="ct-tile">
-          <div className="ct-tile-head"><span className="ct-faint">MEM</span><span className="grow" /><span>{metrics ? `${(metrics.memory_used / GB).toFixed(1)}/${Math.round(metrics.memory_total / GB)} GB` : '–'}</span></div>
+          <div className="ct-tile-head" title={metrics ? `Memory pressure: ${metrics.pressure}` : undefined}><span className={metrics && metrics.pressure !== 'normal' ? 'ct-warn' : 'ct-faint'}>MEM</span><span className="grow" /><span>{metrics ? `${(metrics.memory_used / GB).toFixed(1)}/${Math.round(metrics.memory_total / GB)} GB` : '–'}</span></div>
           <MemChart history={history} total={metrics?.memory_total ?? 0} />
           <div className="ct-tile-note ct-memkey">{metrics ? <>
-            <span className="app">apps {size(metrics.memory_used - metrics.memory_compressed)}</span>
-            <span className="comp">compressed {size(metrics.memory_compressed)}</span>
-            {metrics.swap_used > 0 && <span className="swap">swap {size(metrics.swap_used)}</span>}
-            <span className={metrics.pressure === 'normal' ? 'ct-faint' : 'ct-warn'}>{metrics.pressure}</span>
+            <span className="app" title={`Apps: ${size(metrics.memory_used - metrics.memory_compressed)}`}>a:{((metrics.memory_used - metrics.memory_compressed) / GB).toFixed(1)}</span>
+            <span className="comp" title={`Compressed: ${size(metrics.memory_compressed)}`}>c:{(metrics.memory_compressed / GB).toFixed(1)}</span>
+            {metrics.swap_used > 0 && <span className="swap" title={`Swap: ${size(metrics.swap_used)}`}>s:{(metrics.swap_used / GB).toFixed(1)}</span>}
           </> : ''}</div>
         </div>
         <Tile label="GPU" value={metrics?.gpu != null ? `${Math.round(metrics.gpu)}%` : '–'} values={history.map((m) => m.gpu ?? 0)} max={100}
@@ -170,9 +168,9 @@ export function MachineReadings({ metrics, history }: { metrics: Metrics | null;
           <div className="ct-tile-head"><span className="ct-faint">TEMP</span><span className="grow" /><span className={(metrics?.cpu_temp ?? 0) >= 90 ? 'ct-warn' : ''}>{metrics?.cpu_temp != null ? `${Math.round(metrics.cpu_temp)}°C` : '–'}</span></div>
           <TempChart history={history} />
           <div className="ct-tile-note ct-memkey">{metrics ? <>
-            {metrics.cpu_temp != null && <span className="app">cpu {Math.round(metrics.cpu_temp)}°</span>}
-            {metrics.gpu_temp != null && <span className="comp">gpu {Math.round(metrics.gpu_temp)}°</span>}
-            <span className="swap">{metrics.fan_rpm ? `fan ${metrics.fan_rpm} rpm` : 'no fan'}</span>
+            {metrics.cpu_temp != null && <span className="app" title="CPU">c:{Math.round(metrics.cpu_temp)}°</span>}
+            {metrics.gpu_temp != null && <span className="comp" title="GPU">g:{Math.round(metrics.gpu_temp)}°</span>}
+            <span className="swap" title="Fan">f:{metrics.fan_rpm ? `${metrics.fan_rpm} rpm` : '–'}</span>
           </> : ''}</div>
         </div>
       </div>

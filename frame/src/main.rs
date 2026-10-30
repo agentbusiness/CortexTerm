@@ -54,6 +54,9 @@ struct Cli {
     /// Do not start the Electron shell.
     #[arg(long)]
     headless: bool,
+    /// Model-free background runner: no window, unattended updates and core restarts.
+    #[arg(long)]
+    runner: bool,
     /// CortexTerm home (overrides CORTEX_HOME and the config's `[frame] home`).
     #[arg(long)]
     home: Option<PathBuf>,
@@ -141,7 +144,7 @@ fn raise_fd_limit() {
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
             return;
         }
-        let per_process: libc::rlim_t = 10_240; // OPEN_MAX on macOS: the most setrlimit accepts
+        let per_process: libc::rlim_t = if cfg!(target_os = "macos") { 10_240 } else { 65_536 };
         let wanted = limit.rlim_max.min(per_process);
         if wanted > limit.rlim_cur {
             limit.rlim_cur = wanted;
@@ -172,7 +175,17 @@ async fn run(cli: Cli, config: Config, home: Home) -> ExitCode {
     }
 }
 
-async fn serve(cli: Cli, config: Config, home: Home) -> Result<(), String> {
+async fn serve(cli: Cli, mut config: Config, home: Home) -> Result<(), String> {
+    if cli.runner {
+        // Runtime policy only: never change the desktop's saved plugin preferences.
+        let updater = config.overrides.entry("updater".into()).or_default();
+        updater.config = config::merge_config(&updater.config, &serde_json::json!({
+            "enabled": true,
+            "auto_restart": true,
+            "development": std::env::var("CORTEX_NO_HANDOVER").is_ok_and(|value| value == "1"),
+            "development_build": std::env::var_os("CORTEXTERM_DEV_ROOT").and_then(|root| std::fs::read_to_string(std::path::PathBuf::from(root).join("build/.runner-restart")).ok()),
+        }));
+    }
     let machine = tokio::task::spawn_blocking(machine::measure).await.map_err(|e| e.to_string())?;
     // Only one CortexTerm runs: the home lock kept a second frame out; what a frame that died
     // without its shutdown left running (its plugins, the shell) is stopped before this one starts.
@@ -203,12 +216,12 @@ async fn serve(cli: Cli, config: Config, home: Home) -> Result<(), String> {
         .map_err(|e| format!("cannot bind 127.0.0.1:{}: {e}", config.port))?;
     let port = tcp.local_addr().map_err(|e| e.to_string())?.port();
 
-    let want_ui = config.ui && !cli.headless;
+    let want_ui = config.ui && !cli.headless && !cli.runner;
     let live = config.live.clone().unwrap_or_else(|| home.live());
     if cli.safe {
         tracing::warn!("safe mode: plugins read their packaged data only");
     }
-    let frame = Frame::new(FrameParts { config, home: home.clone(), token: token.clone(), socket: socket.clone(), headless: cli.headless, machine, journal, state, memory, units, live, safe: cli.safe });
+    let frame = Frame::new(FrameParts { config, home: home.clone(), token: token.clone(), socket: socket.clone(), headless: cli.headless || cli.runner, runner: cli.runner, machine, journal, state, memory, units, live, safe: cli.safe });
     frame.port.store(port, Ordering::SeqCst);
     // The machine does not idle-sleep while the frame runs (window open or not); shutdown releases it.
     if let Err(error) = frame.power.hold(power::FRAME_HOLDER, power::FRAME_REASON, power::FRAME_PEER) {

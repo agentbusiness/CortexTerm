@@ -93,6 +93,8 @@ interface Exchange {
   question: string;
   intent: string;
   answer: string;
+  reasoning: string;
+  reasoningActive: boolean;
   streaming: boolean;
   /** What the turn is doing until the answer's text streams (`reading the skills`, `waiting for a free model`). */
   phase?: string;
@@ -146,7 +148,7 @@ function useExchanges(sessionId: string | undefined, termId: string): { exchange
       const runId = String(data.run_id ?? '');
       if (entry.kind === 'user_message') {
         if (data.term_id !== termId) continue;
-        const exchange: Exchange = { runId, at: entry.ts_ms, question: String(data.text ?? ''), intent: String(data.intent ?? 'ask'), answer: '', streaming: false, steps: [] };
+        const exchange: Exchange = { runId, at: entry.ts_ms, question: String(data.text ?? ''), intent: String(data.intent ?? 'ask'), answer: '', reasoning: '', reasoningActive: false, streaming: false, steps: [] };
         byRun.set(runId, exchange);
         order.push(exchange);
         continue;
@@ -155,6 +157,8 @@ function useExchanges(sessionId: string | undefined, termId: string): { exchange
       if (!exchange) continue;
       if (entry.kind === 'assistant_message') {
         exchange.answer = String(data.text ?? '');
+        exchange.reasoning = String(data.reasoning ?? '');
+        exchange.reasoningActive = Boolean(data.reasoning_active);
         exchange.streaming = Boolean(data.streaming);
         exchange.phase = typeof data.phase === 'string' ? data.phase : undefined;
       } else if (entry.kind === 'command_step') {
@@ -555,12 +559,13 @@ function AskBlock({ exchange, pane, termId, actions, fromHistory }: { exchange: 
         <button type="button" className="ct-block-toggle" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
         <span className="ct-ask-q" data-intent={exchange.intent}>{exchange.intent !== 'ask' && <span className="ct-ask-label">{exchange.intent === 'fix' ? 'FIX' : 'EXPLAIN'}</span>}{exchange.question}</span>
         </button>
-        {thinking && <span className="ct-act static">{exchange.phase ? `${exchange.phase}…` : exchange.steps.length ? 'reading the output…' : 'reading the shell…'}</span>}
+        {thinking && !exchange.reasoningActive && <span className="ct-act static">{exchange.phase ? `${exchange.phase}…` : exchange.steps.length ? 'reading the output…' : 'reading the shell…'}</span>}
         {checking && <span className="ct-act static">checking…</span>}
       </header>
       {open && (
         <div className="ct-ask-body">
           {exchange.steps.map((step, index) => <CheckStep key={index} step={step} />)}
+          {exchange.reasoning.trim() && <ThinkingLine text={exchange.reasoning} active={exchange.reasoningActive && exchange.streaming && exchange.state === 'running'} />}
           {prose && <p className="ct-reading"><Prose text={prose} />{exchange.streaming ? ' ▍' : ''}</p>}
           {exchange.error && <p className="ct-reading ct-warn">{exchange.error}</p>}
           {exchange.command && !exchange.streaming && (
@@ -578,6 +583,26 @@ function AskBlock({ exchange, pane, termId, actions, fromHistory }: { exchange: 
         </div>
       )}
     </article>
+  );
+}
+
+/** A single live line gives way to the answer; the complete thinking stays keyboard-accessible. */
+function ThinkingLine({ text, active }: { text: string; active: boolean }) {
+  const [expanded, setExpanded] = useState(false);
+  const body = useRef<HTMLPreElement>(null);
+  const preview = text.trim().replace(/\s+/g, ' ').slice(-180);
+  useEffect(() => {
+    if (active && expanded && body.current) body.current.scrollTop = body.current.scrollHeight;
+  }, [text, active, expanded]);
+  return (
+    <details className={`ct-thinking${active ? ' active' : ''}`} onToggle={(event) => setExpanded(event.currentTarget.open)}>
+      <summary>
+        <svg className="ct-thinking-caret" width="8" height="8" viewBox="0 0 8 8" fill="none" aria-hidden="true"><path d="m2.5 1.5 2.5 2.5-2.5 2.5" stroke="currentColor" strokeWidth="1" /></svg>
+        <span className="ct-thinking-label">{active ? 'thinking' : 'thoughts'}</span>
+        <span className="ct-thinking-preview" aria-hidden="true"><span>{preview}</span></span>
+      </summary>
+      <pre ref={body} className="ct-thinking-text" tabIndex={0} aria-label="Model thinking">{text.trim()}</pre>
+    </details>
   );
 }
 

@@ -80,6 +80,16 @@ pub fn pressure() -> String {
     {
         // Linux PSI: `some avg10=..` / `full avg10=..`.
         let text = std::fs::read_to_string("/proc/pressure/memory").unwrap_or_default();
+        if text.is_empty() {
+            let info = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+            let field = |name: &str| info.lines().find_map(|line| line.strip_prefix(name)?.split_whitespace().next()?.parse::<f64>().ok());
+            return match field("MemAvailable:").zip(field("MemTotal:")).filter(|(_, total)| *total > 0.0) {
+                Some((available, total)) if available / total < 0.05 => "critical",
+                Some((available, total)) if available / total < 0.10 => "warn",
+                Some(_) => "normal",
+                None => "",
+            }.to_owned();
+        }
         let avg10 = |prefix: &str| {
             text.lines()
                 .find(|line| line.starts_with(prefix))
@@ -120,10 +130,10 @@ pub fn compressed_memory() -> u64 {
             stats.compressor_page_count as u64 * page
         }
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        0
-    }
+    #[cfg(target_os = "linux")]
+    { crate::linux::compressed_memory() }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    { 0 }
 }
 
 /// nominal | fair | serious | critical ("" when unknown).
@@ -528,12 +538,33 @@ pub fn threads(pid: u32) -> Vec<cc_protocol::contracts::system::ThreadSample> {
             })
             .unwrap_or_default()
     };
+    #[cfg(target_os = "linux")]
+    {
+        type ThreadTimes = HashMap<(u32, u64), (std::time::Instant, u64)>;
+        static PREVIOUS: std::sync::OnceLock<std::sync::Mutex<ThreadTimes>> = std::sync::OnceLock::new();
+        let now = std::time::Instant::now();
+        let mut previous = PREVIOUS.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
+        previous.retain(|_, (at, _)| now.duration_since(*at) < Duration::from_secs(300));
+        for thread in &mut list {
+            let used = thread.user_ms.saturating_add(thread.system_ms);
+            if let Some((at, before)) = previous.insert((pid, thread.id), (now, used)) {
+                let elapsed_ms = now.duration_since(at).as_secs_f64() * 1000.0;
+                if elapsed_ms > 0.0 { thread.cpu = (used.saturating_sub(before) as f64 / elapsed_ms * 100.0).clamp(0.0, 100.0) as f32; }
+            }
+        }
+    }
     list.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal).then((b.user_ms + b.system_ms).cmp(&(a.user_ms + a.system_ms))));
     list
 }
 
 /// Open files, sockets and pipes of the given pids, from `lsof -F` (numeric hosts and ports).
 /// Keyed by pid; a pid that could not be read is missing.
+#[cfg(target_os = "linux")]
+pub fn open_files(pids: &[u32]) -> HashMap<u32, Vec<cc_protocol::contracts::system::OpenFile>> {
+    crate::linux::open_files(pids)
+}
+
+#[cfg(not(target_os = "linux"))]
 pub fn open_files(pids: &[u32]) -> HashMap<u32, Vec<cc_protocol::contracts::system::OpenFile>> {
     use cc_protocol::contracts::system::OpenFile;
     let mut out: HashMap<u32, Vec<OpenFile>> = HashMap::new();

@@ -14,7 +14,7 @@
  * on the mesh, with each shell listed once under its computer.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
 import { Caret, ComputerScope, Divider, ago, errorMessage, runtime, runtimeFor, useHost, useRuntime, useShared } from '@cortex/sdk';
 import './sidebar.css';
@@ -33,7 +33,6 @@ import { EMPTY_DOC, NEEDS_YOU, STAGE_MAX, live, newId, useLive, type Attention, 
 import './desk.css';
 
 interface TermInfo { term_id: string; cwd: string; alive: boolean }
-interface Place { path: string; runs: number; last: number; git: boolean }
 interface Peer { member: { node: string; name: string; local?: boolean }; card?: { name: string; software: string } | null; reachable: boolean; path: string }
 type Client = ReturnType<typeof runtime>['client'];
 
@@ -49,7 +48,7 @@ async function homeProject(client: Client): Promise<{ id: string; root: string }
   return client.call<{ id: string; root: string }>('frame.project.open', { root: probe.cwd });
 }
 
-type SideView = 'machine' | 'alerts' | 'traces' | 'ssh' | 'schedules' | 'log' | 'investigate';
+type SideView = 'machine' | 'alerts' | 'traces' | 'ssh' | 'schedules' | 'files' | 'log' | 'investigate';
 interface SideDetails { run?: string; pid?: number; trace?: string }
 
 const NAV = { def: 220, min: 160, max: 420, fold: 110 };
@@ -98,6 +97,7 @@ function useColumns() {
 export function Desk() {
   useLive();
   const host = useHost();
+  const filesAvailable = useSyncExternalStore(host.subscribeUiPlugins, () => host.uiPlugins().some((plugin) => plugin.slot === 'machine.files@1'));
   const client = clientOf(null);
   const [doc, setDoc] = useShared<DeskDoc>('ct.desks', EMPTY_DOC);
   const [home, setHome] = useState('');
@@ -105,7 +105,6 @@ export function Desk() {
   const [overlay, setOverlay] = useState<'map' | 'jump' | null>(null);
   const [clusterOpen, setClusterOpen] = useState(false);
   const closeCluster = useCallback(() => setClusterOpen(false), []);
-  const [places, setPlaces] = useState<Place[]>([]);
   const [problem, setProblem] = useState<string | null>(null);
   const [settings, setSettings] = useShared<string | null>('settings.open', null);
   const [requestedSideView, setSideView] = useShared<SideView>('ct.side.view', 'machine');
@@ -129,9 +128,9 @@ export function Desk() {
   const [computers, setComputers] = useState<Computer[]>([]);
   const readComputers = useCallback(() => {
     client.call<{ peers: Peer[] }>('mesh.peers', {}, { signal: AbortSignal.timeout(8000) }).then((list) => setComputers((list?.peers ?? [])
-      // Keep offline members even without a shell here; an absent card must not hide a machine.
-      // Another app on this Mac is still this computer.
-      .filter((peer) => !peer.member.local)
+      // A host is represented by its CortexTerm, not each app running on it. Cached cards keep
+      // known terminals visible while offline; unclassified members wait for their first card.
+      .filter((peer) => !peer.member.local && peer.card?.software === 'cortexterm')
       .map((peer) => ({ node: peer.member.node, name: peer.card?.name || peer.member.name, reachable: peer.reachable, path: peer.path }))))
       .catch(() => undefined);
   }, [client]);
@@ -177,10 +176,6 @@ export function Desk() {
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  useEffect(() => {
-    client.call<{ places: Place[] }>('terminal.places', { limit: 8 }).then((list) => setPlaces(list?.places ?? [])).catch(() => undefined);
-  }, [client, desk?.focus]);
 
   const newSession = async (project: string, title: string) => {
     const session = await client.call<{ id: string }>('frame.session.create', { project_id: project, title, flow: 'terminal' }).catch(() => null);
@@ -277,7 +272,7 @@ export function Desk() {
   const setSideRun = useCallback((run: string) => setSideDetails((current) => ({ ...current, [sideNode ?? '']: { ...current[sideNode ?? ''], run } })), [sideNode, setSideDetails]);
   const setSidePid = useCallback((pid: number) => setSideDetails((current) => ({ ...current, [sideNode ?? '']: { ...current[sideNode ?? ''], pid } })), [sideNode, setSideDetails]);
   const setSideTrace = useCallback((trace: string) => setSideDetails((current) => ({ ...current, [sideNode ?? '']: { ...current[sideNode ?? ''], trace } })), [sideNode, setSideDetails]);
-  const sideView = (requestedSideView === 'log' && !sideRun || requestedSideView === 'investigate' && !sidePid) ? 'machine' : requestedSideView;
+  const sideView = (requestedSideView === 'log' && !sideRun || requestedSideView === 'investigate' && !sidePid || requestedSideView === 'files' && (!sideNode || !filesAvailable)) ? 'machine' : requestedSideView;
 
   function focusedCwd() {
     const term = focusedTerm?.termId ? live.states.get(focusedTerm.termId) : undefined;
@@ -549,9 +544,9 @@ export function Desk() {
       {openAlerts.length > 0 && <button type="button" className="ct-band-note warn" onClick={openAlertsPane}>{openAlerts.length} ALERT{openAlerts.length > 1 ? 'S' : ''}</button>}
       <span className={`ct-band-note${model?.extra?.source === 'borrowed' ? ' blue' : ''}`} title={modelProblem ?? ''}>{modelLabel(model, modelProblem)}</span>
       <button type="button" className="ct-band-note ct-band-gear" onClick={() => setSettings((open) => (open === null ? '' : null))} title="Settings (⌘,)" aria-label="Settings">
-        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden fill="none" stroke="currentColor" strokeWidth="1.3">
-          <circle cx="8" cy="8" r="2.2" />
-          <path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M3.4 12.6l1.4-1.4M11.2 4.8l1.4-1.4" strokeLinecap="round" />
+        <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="12" cy="12" r="3" />
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
         </svg>
       </button>
     </>
@@ -562,10 +557,6 @@ export function Desk() {
       {bandTarget && createPortal(band, bandTarget)}
       <div ref={columns.work} className="ct-work" style={columns.style} inert={clusterOpen || undefined}>
         <nav className="ct-nav cx-sidebar" aria-label="Desks and computers" hidden={!columns.navOpen}>
-          <div className="bar cx-sidebar-actions">
-            <button type="button" className="detent" onClick={() => void newDesk()}>NEW DESK</button>
-            <button type="button" className="detent" onClick={() => void openTerm()}>NEW SHELL <span className="k">⌘T</span></button>
-          </div>
           <div className="cx-sidebar-scroll">
             {doc.desks.map((entry) => {
               const on = entry.id === desk.id;
@@ -588,6 +579,9 @@ export function Desk() {
               <div className="cx-proj-h"><span className="cx-proj-name ct-faint">LOCAL COMPUTER</span></div>
               <div className="ct-computer">
                 <div className="cx-proj-h"><span className="cx-proj-name">THIS MAC</span></div>
+                <div className="ct-computer-actions">
+                  <button type="button" className="detent ct-computer-new" onClick={() => void openTerm()}>NEW SHELL <span className="k">⌘T</span></button>
+                </div>
                 <ul className="lst cx-sessions" aria-label="Sessions on this Mac">
                   {desk.panes.filter((pane) => !pane.node).map((pane) => (
                     <SessionRow key={pane.id} pane={pane} home={home} selected={desk.stage.includes(pane.id)}
@@ -606,25 +600,6 @@ export function Desk() {
                       onNew={() => void openTerm(undefined, 'stage', 'shell', computer.node).catch((cause) => host.notify(`No shell on ${computer.name}: ${errorMessage(cause)}`))} />
                   </ComputerScope>
                 ))}
-              </section>
-            )}
-            {places.length > 0 && (
-              <section className="cx-proj">
-                <div className="cx-proj-h"><span className="cx-proj-name ct-faint">PLACES I KNOW</span></div>
-                <ul className="lst cx-sessions" aria-label="Places">
-                  {places.map((place) => (
-                    <li key={place.path} className="cx-row">
-                      <button type="button" onClick={() => void openTerm(place.path)} title="Open a shell there">
-                        <div className="t ct-mono ct-place-t">{shortPath(place.path, home)}</div>
-                        <div className="r">
-                          <span className="ap faint">{place.runs} COMMANDS{place.git ? ' · GIT' : ''}</span>
-                          <span className="grow" />
-                          <span className="ap faint">{place.last ? ago(place.last) : ''}</span>
-                        </div>
-                      </button>
-                    </li>
-                  ))}
-                </ul>
               </section>
             )}
           </div>
@@ -652,7 +627,7 @@ export function Desk() {
               <ComputerPicker computers={machineOptions} node={sideNode ?? ''} colors={cluster.layout.colors}
                 onSelect={selectSideNode} onCluster={() => { setOverlay(null); setClusterOpen(true); }} />
               <div className="ct-side-tabs" role="tablist" aria-label={`Views for ${selectedComputer.name}`}>
-                {([['machine', 'MACHINE'], ['alerts', sideAlertCount ? `ALERTS · ${sideAlertCount}` : 'ALERTS'], ['traces', 'TRACES'], ['ssh', 'SSH'], ['schedules', 'SCHEDULES'], ...(sideRun ? [['log', 'LOG']] : []), ...(sidePid ? [['investigate', `PID ${sidePid}`]] : [])] as [SideView, string][]).map(([view, label]) => (
+                {([['machine', 'MACHINE'], ['alerts', sideAlertCount ? `ALERTS · ${sideAlertCount}` : 'ALERTS'], ['traces', 'TRACES'], ['ssh', 'SSH'], ['schedules', 'SCHEDULES'], ...(sideNode && filesAvailable ? [['files', 'FILES']] : []), ...(sideRun ? [['log', 'LOG']] : []), ...(sidePid ? [['investigate', `PID ${sidePid}`]] : [])] as [SideView, string][]).map(([view, label]) => (
                   <button key={view} id={`ct-side-tab-${view}`} type="button" role="tab" aria-selected={sideView === view} aria-controls="ct-machine-panel"
                     className={`ct-side-tab${sideView === view ? ' on' : ''}${view === 'alerts' && sideAlertCount ? ' hot' : ''}`} onClick={() => setSideView(view)}>{label}</button>
                 ))}
@@ -670,6 +645,7 @@ export function Desk() {
                   onOpenRun={(runId) => { setSideRun(runId); setSideView('log'); }} />}
                 {sideView === 'ssh' && <SshPane {...sideFrame('ssh')} onShell={onSideShell} onAsk={onSideAsk} />}
                 {sideView === 'schedules' && <SchedulesPane {...sideFrame('schedules')} home={sideHome} />}
+                {sideView === 'files' && sideNode && <host.Slot name="machine.files@1" className="ct-side-files" />}
                 {sideView === 'investigate' && sidePid > 0 && <Investigate pid={sidePid} home={sideHome} onAsk={onSideAsk} onSignal={onSignal}
                   onShell={onSideShell} onInvestigate={onInvestigate} onOpenTrace={onOpenTrace}
                   onOpenFile={(path) => addPane({ id: newId('pane'), kind: 'editor', title: path.split('/').pop() || path, cwd: sideHome, path, ...(sideNode ? { node: sideNode } : {}) })}
@@ -780,6 +756,9 @@ function ComputerShells({ computer, home, shown, stage, onOpen, onShow, onClose,
         <span className="grow" />
         <span className="ap faint">{computer.reachable ? (computer.path || 'mesh').toUpperCase() : 'AWAY'}</span>
       </div>
+      {computer.reachable && <div className="ct-computer-actions">
+        <button type="button" className="detent ct-computer-new" onClick={onNew}>NEW SHELL THERE</button>
+      </div>}
       <ul className="lst cx-sessions" aria-label={`Sessions on ${computer.name}`}>
         {panes.map((pane) => {
           const isAttached = shown.some((entry) => entry.id === pane.id);
@@ -788,7 +767,6 @@ function ComputerShells({ computer, home, shown, stage, onOpen, onShow, onClose,
             onClose={isAttached ? () => onClose(pane.id) : undefined} />;
         })}
       </ul>
-      {computer.reachable && <button type="button" className="detent sm ct-computer-new" onClick={onNew}>NEW SHELL THERE</button>}
     </div>
   );
 }

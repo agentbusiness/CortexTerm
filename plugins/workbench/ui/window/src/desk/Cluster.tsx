@@ -2,7 +2,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties, KeyboardEvent, PointerEvent, ReactNode } from 'react';
 import { Caret, ComputerScope, useShared } from '@cortex/sdk';
-import { GB, rate, size } from './api';
+import { GB } from './api';
 import { MachineReadings, useMetrics } from './Sidebar';
 import { useMachineAlerts } from './machine-data';
 import './cluster.css';
@@ -280,9 +280,7 @@ export function Cluster({ open, computers, selected, layout, order, onLayout, on
     onPointerCancel={() => finish(false)} onLostPointerCapture={() => { if (drag.current?.pointer != null) finish(false); }}>
     <header className="ct-cluster-bar">
       <button ref={closeButton} type="button" className="detent" onClick={() => { finish(false); onClose(); }}>BACK TO TERMINAL <span className="k">ESC</span></button>
-      <h1>Cluster</h1>
       <span className="ct-label ct-faint">{computers.filter((computer) => computer.reachable).length} ONLINE · {computers.length} COMPUTERS</span>
-      <span className="grow" /><span className="ct-cluster-help">Drag a handle to arrange. Pick a colour for each computer.</span>
     </header>
     <div ref={scroll} className="ct-cluster-scroll" onScroll={() => {
       positions.current = new Map([...slots.current].map(([node, element]) => [node, element.getBoundingClientRect()]));
@@ -346,16 +344,6 @@ function ClusterCard({ computer, selected, color, lifted, dragStyle, grip, onCol
     {problem && <p className="ct-cluster-note ct-warn" role="status">Metrics unavailable. Retrying automatically.</p>}
     {stale && metrics && <p className="ct-cluster-note ct-faint">Last sample {new Date(metrics.at).toLocaleTimeString()} · readings below are paused.</p>}
     <div className="ct-cluster-readings"><MachineReadings metrics={metrics} history={history} /></div>
-    {metrics && <dl className="ct-cluster-details ct-mono">
-      <div><dt>Load</dt><dd>{metrics.load.map((value) => value.toFixed(1)).join(' / ')}</dd></div>
-      <div><dt>Disk</dt><dd>{size(metrics.disk_total - metrics.disk_free)} / {size(metrics.disk_total)}</dd></div>
-      <div><dt>Swap</dt><dd>{size(metrics.swap_used)}</dd></div>
-      <div><dt>Thermal</dt><dd>{metrics.thermal}</dd></div>
-      {metrics.cpu_power != null && <div><dt>CPU power</dt><dd>{metrics.cpu_power.toFixed(1)} W</dd></div>}
-      {metrics.ane_power != null && <div><dt>ANE power</dt><dd>{metrics.ane_power.toFixed(1)} W</dd></div>}
-      {metrics.battery && <div><dt>Battery</dt><dd>{Math.round(metrics.battery.percent)}% · {metrics.battery.charging ? 'charging' : 'on battery'}{metrics.battery.watts != null ? ` · ${metrics.battery.watts.toFixed(1)} W` : ''}</dd></div>}
-      <div><dt>Network</dt><dd>↓ {rate(metrics.net_rx)} · ↑ {rate(metrics.net_tx)}</dd></div>
-    </dl>}
     <footer className="ct-cluster-card-foot">
       {computer.reachable ? <ClusterAlerts node={computer.node} /> : <span className="ct-label ct-faint">READINGS RESUME WHEN ONLINE</span>}
       <span className="grow" /><button type="button" className="ct-link" onClick={onSelect}>VIEW MACHINE <span aria-hidden>→</span></button>

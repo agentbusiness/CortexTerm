@@ -3,7 +3,7 @@
 [plugin]
 id = "chatflow-terminal"
 name = "Terminal flow"
-version = "0.1.12"
+version = "0.1.13"
 description = "The terminal chat flow: plain-language questions about the shell and the machine, one proposed command checked by the risk engine, explanations of commands, lines and processes, and fixes for failed Runs."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

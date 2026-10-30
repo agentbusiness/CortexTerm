@@ -458,10 +458,10 @@
 /* the Desks column uses the CortexCode sidebar's grammar (sidebar.css) */
 #cc .ct-nav.cx-sidebar{padding:0;gap:0;overflow:hidden;}
 #cc .ct-nav .cx-row{position:relative;}
-#cc .ct-place-t{font-size:12.5px;}
-/* A joined computer in the nav (COMPUTERS): its shells, then a new shell there. */
+/* Each computer starts with a full-width shell action inset to match its session rows. */
 #cc .ct-computer{padding:0 0 6px;}
-#cc .ct-computer-new{margin:4px 0 0;}
+#cc .ct-computer-actions{padding:4px 16px 6px;}
+#cc .ct-computer-new{width:100%;box-sizing:border-box;justify-content:center;text-align:center;}
 /* where the shell is, above its stream */
 #cc .ct-term-float{justify-content:flex-start;padding:4px 0 8px;}
 #cc .ct-crumbs{display:flex;align-items:baseline;gap:6px;min-width:0;overflow:hidden;white-space:nowrap;font:13px var(--font-mono);}
@@ -540,7 +540,8 @@
 
 /* memory over time: apps (blue) and compressed (orange) stacked up to all the RAM, swap dashed */
 #cc .ct-memchart{width:100%;height:34px;display:block;margin:6px 0 4px;border-bottom:1px solid var(--rule);}
-#cc .ct-memkey{display:flex;flex-wrap:wrap;gap:2px 10px;white-space:normal;}
+#cc .ct-memkey{display:flex;flex-wrap:nowrap;gap:4px;white-space:nowrap;}
+#cc .ct-memkey>span{flex-shrink:0;}
 #cc .ct-memkey .app{color:var(--counter);}
 #cc .ct-memkey .comp{color:var(--rubric-lift);}
 #cc .ct-memkey .swap{color:var(--ink-3);}
@@ -571,6 +572,26 @@
 #cc .ct-block-acts .ct-act{font:600 9px Archivo,sans-serif;letter-spacing:.12em;color:var(--ink-3);}
 #cc .ct-block-acts .ct-act:hover{color:var(--ink);}
 #cc .ct-block.ask .ct-ask-body{border-left:2px solid var(--rubric);padding-left:12px;margin-left:28px;}
+/* Thinking lives on one quiet line; it recedes when the answer arrives. */
+#cc .ct-thinking{position:relative;min-width:0;margin:0 0 10px;color:var(--ink-3);}
+#cc .ct-thinking::after{content:"";position:absolute;left:0;right:0;bottom:0;height:1px;background:linear-gradient(90deg,var(--rule-2),transparent);opacity:0;transform:scaleX(.65);transform-origin:left;transition:opacity .24s ease-out,transform .32s ease-out;pointer-events:none;}
+#cc .ct-thinking.active::after{opacity:1;transform:scaleX(1);}
+#cc .ct-thinking summary{display:flex;align-items:baseline;gap:12px;min-width:0;min-height:26px;cursor:pointer;list-style:none;}
+#cc .ct-thinking summary::-webkit-details-marker{display:none;}
+#cc .ct-thinking-caret{flex:none;align-self:center;transition:transform .16s ease-out;}
+#cc .ct-thinking[open] .ct-thinking-caret{transform:rotate(90deg);}
+#cc .ct-thinking summary:focus-visible{outline:1px solid var(--rubric);outline-offset:3px;}
+#cc .ct-thinking-label{flex:none;font:500 11px/24px Archivo,sans-serif;color:var(--ink-3);transition:color .24s ease-out;}
+#cc .ct-thinking.active .ct-thinking-label,#cc .ct-thinking summary:hover .ct-thinking-label{color:var(--ink-2);}
+#cc .ct-thinking-preview{display:flex;justify-content:flex-end;flex:1;min-width:0;overflow:hidden;white-space:nowrap;font:italic 13px/24px "Source Serif 4",Georgia,serif;mask-image:linear-gradient(90deg,transparent,#000 8%,#000 85%,transparent);opacity:0;transition:opacity .24s ease-out;}
+#cc .ct-thinking-preview>span{flex:none;}
+#cc .ct-thinking.active .ct-thinking-preview{opacity:1;}
+#cc .ct-thinking[open] .ct-thinking-preview{opacity:0;}
+#cc .ct-thinking-text{max-height:160px;overflow-y:auto;overscroll-behavior:contain;margin:0;padding:4px 0 10px;white-space:pre-wrap;overflow-wrap:anywhere;font:italic 13px/1.55 "Source Serif 4",Georgia,serif;color:var(--ink-2);}
+@media(prefers-reduced-motion:reduce){
+  #cc .ct-thinking::after{transform:none;transition:none;}
+  #cc .ct-thinking-label,#cc .ct-thinking-preview,#cc .ct-thinking-caret{transition:none;}
+}
 /* actions sit in flow on a fixed 20px row (the height of a small detent), 10px under the output and
    12px above the next turn's rule; hidden until hover, but the row keeps its place so nothing jumps */
 #cc .ct-block{position:relative;padding:12px 0;}

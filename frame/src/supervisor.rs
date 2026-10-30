@@ -445,6 +445,9 @@ fn set_state(frame: &Frame, instance: &Arc<Instance>, state: &'static str) {
 // ----- process start -----
 
 async fn spawn_instance(frame: &Arc<Frame>, slot: &Arc<Slot>, spec: ExecSpec) -> Result<Arc<Instance>, String> {
+    if frame.runner && slot.category == "model" {
+        return Err("local models stay off in the runner".into());
+    }
     if frame.is_shutting_down() {
         return Err("the frame is shutting down".into());
     }

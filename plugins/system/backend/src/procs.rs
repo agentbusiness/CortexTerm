@@ -178,7 +178,7 @@ pub fn detail(snapshot: &Snapshot, pid: u32, history: Vec<ProcSample>, monitor: 
         next = parent.proc.ppid;
     }
     if parents.is_empty() && entry.proc.ppid == 1 {
-        parents.push((1, "launchd".into()));
+        parents.push((1, if cfg!(target_os = "macos") { "launchd".into() } else { "init".into() }));
     }
     let (cwd, open_files, threads) = host::process_facts(pid);
     let exe = Path::new(&entry.exe);
