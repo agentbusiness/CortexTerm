@@ -10,8 +10,8 @@
  *
  * A pane may run on a joined computer (`PaneRec.node`): it renders inside that computer's
  * `ComputerScope`, so its calls go to that frame through `mesh.link`, and the Line, the AI and the
- * side pane follow the focused pane there. COMPUTERS in the nav lists the joined computers that run
- * CortexTerm, with the shells open on each.
+ * side pane follow the focused pane there. The nav lists this Mac first, then joined computers
+ * that run CortexTerm, with each shell listed once under its computer.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -212,7 +212,7 @@ export function Desk() {
 
   /** A shell already open on a joined computer, as a pane here (or the pane that shows it already). */
   const attachTerm = useCallback((node: string, info: TermInfo) => {
-    const shown = desk?.panes.find((pane) => pane.termId === info.term_id);
+    const shown = desk?.panes.find((pane) => pane.node === node && pane.termId === info.term_id);
     if (shown) promote(shown.id);
     else addPane({ id: newId('pane'), kind: 'term', title: 'shell', cwd: info.cwd, termId: info.term_id, node });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -514,7 +514,7 @@ export function Desk() {
     <div className="ct-desk">
       {bandTarget && createPortal(band, bandTarget)}
       <div ref={columns.work} className="ct-work" style={columns.style}>
-        <nav className="ct-nav cx-sidebar" aria-label="Desks" hidden={!columns.navOpen}>
+        <nav className="ct-nav cx-sidebar" aria-label="Desks and computers" hidden={!columns.navOpen}>
           <div className="bar cx-sidebar-actions">
             <button type="button" className="detent" onClick={() => void newDesk()}>NEW DESK</button>
             <button type="button" className="detent" onClick={() => void openTerm()}>NEW SHELL <span className="k">⌘T</span></button>
@@ -534,40 +534,29 @@ export function Desk() {
                     {running > 0 && <span className="cx-run-badge" title={`${running} running`}>{running}</span>}
                     {doc.desks.length > 1 && <CloseButton label={`Close Desk ${entry.name}`} title={`Close ${entry.name}?`} body="Its shells end and whatever runs in them stops; their commands stay in the history." action="Close Desk" onConfirm={() => closeDesk(entry.id)} />}
                   </div>
-                  {on && (
-                    <ul className="lst cx-sessions" aria-label={`Shells in ${entry.name}`}>
-                      {entry.panes.map((pane) => {
-                        const attention = live.attention(pane);
-                        const [status, label, tone] = ROW_STATE[attention];
-                        const selected = entry.stage.includes(pane.id);
-                        return (
-                          <li key={pane.id} className={['cx-row', selected ? 'sel' : '', NEEDS_YOU.has(attention) ? 'cx-attn' : ''].filter(Boolean).join(' ')}>
-                            <button type="button" onClick={() => promote(pane.id)} aria-current={selected ? 'true' : undefined}>
-                              <div className="t">{pane.node && <span className="ct-blue">{nameOf(pane.node)} </span>}{paneTitle(pane, home)}</div>
-                              <div className="r">
-                                <span className={`cx-pip cx-pip-${status}`} aria-hidden />
-                                <span className={`ap ${tone}`}>{label}</span>
-                                <span className="grow" />
-                                <span className="ap faint">{paneWhen(pane)}</span>
-                              </div>
-                            </button>
-                            <CloseButton label="Close this shell" title="Close this shell?"
-                              body={live.states.get(pane.termId ?? '')?.running ? `“${paneTitle(pane, home)}” is still running: closing the shell stops it.` : 'The shell ends; its commands stay in the history.'}
-                              action="Close shell" onConfirm={() => closePane(pane.id)} />
-                          </li>
-                        );
-                      })}
-                    </ul>
-                  )}
                 </section>
               );
             })}
+            <section className="cx-proj">
+              <div className="cx-proj-h"><span className="cx-proj-name ct-faint">LOCAL COMPUTER</span></div>
+              <div className="ct-computer">
+                <div className="cx-proj-h"><span className="cx-proj-name">THIS MAC</span></div>
+                <ul className="lst cx-sessions" aria-label="Sessions on this Mac">
+                  {desk.panes.filter((pane) => !pane.node).map((pane) => (
+                    <SessionRow key={pane.id} pane={pane} home={home} selected={desk.stage.includes(pane.id)}
+                      onOpen={() => promote(pane.id)} onClose={() => closePane(pane.id)} />
+                  ))}
+                </ul>
+              </div>
+            </section>
             {computers.length > 0 && (
               <section className="cx-proj">
-                <div className="cx-proj-h"><span className="cx-proj-name ct-faint">COMPUTERS</span></div>
+                <div className="cx-proj-h"><span className="cx-proj-name ct-faint">MESH COMPUTERS</span></div>
                 {computers.map((computer) => (
                   <ComputerScope key={computer.node} node={computer.node}>
-                    <ComputerShells computer={computer} home={home} shown={desk.panes} onOpen={(info) => attachTerm(computer.node, info)} onNew={() => void openTerm(undefined, 'stage', 'shell', computer.node).catch((cause) => host.notify(`No shell on ${computer.name}: ${errorMessage(cause)}`))} />
+                    <ComputerShells computer={computer} home={home} shown={desk.panes.filter((pane) => pane.node === computer.node)} stage={desk.stage}
+                      onOpen={(info) => attachTerm(computer.node, info)} onShow={promote} onClose={closePane}
+                      onNew={() => void openTerm(undefined, 'stage', 'shell', computer.node).catch((cause) => host.notify(`No shell on ${computer.name}: ${errorMessage(cause)}`))} />
                   </ComputerScope>
                 ))}
               </section>
@@ -673,9 +662,36 @@ function CloseButton({ label, title, body, action, onConfirm }: { label: string;
   );
 }
 
-/** A joined computer in the nav: its name in blue, the shells open there (`terminal.list` on its
- * frame) and a new shell there; greyed while it is away. */
-function ComputerShells({ computer, home, shown, onOpen, onNew }: { computer: Computer; home: string; shown: PaneRec[]; onOpen: (info: TermInfo) => void; onNew: () => void }) {
+/** The same session row under every computer, using the existing sidebar's appearance. */
+function SessionRow({ pane, home, selected, disabled = false, onOpen, onClose }: {
+  pane: PaneRec; home: string; selected: boolean; disabled?: boolean; onOpen: () => void; onClose?: () => void;
+}) {
+  const attention = live.attention(pane);
+  const [status, label, tone] = ROW_STATE[attention];
+  return (
+    <li className={['cx-row', selected ? 'sel' : '', NEEDS_YOU.has(attention) ? 'cx-attn' : ''].filter(Boolean).join(' ')}>
+      <button type="button" onClick={onOpen} disabled={disabled} aria-current={selected ? 'true' : undefined}>
+        <div className="t">{paneTitle(pane, home)}</div>
+        <div className="r">
+          <span className={`cx-pip cx-pip-${status}`} aria-hidden />
+          <span className={`ap ${tone}`}>{label}</span>
+          <span className="grow" />
+          <span className="ap faint">{paneWhen(pane)}</span>
+        </div>
+      </button>
+      {onClose && <CloseButton label="Close this shell" title="Close this shell?"
+        body={live.states.get(pane.termId ?? '')?.running ? `“${paneTitle(pane, home)}” is still running: closing the shell stops it.` : 'The shell ends; its commands stay in the history.'}
+        action="Close shell" onConfirm={onClose} />}
+    </li>
+  );
+}
+
+/** A joined computer in the nav: its attached panes and live shells merged by terminal id.
+ * Stored panes stay visible while it is away. */
+function ComputerShells({ computer, home, shown, stage, onOpen, onShow, onClose, onNew }: {
+  computer: Computer; home: string; shown: PaneRec[]; stage: string[];
+  onOpen: (info: TermInfo) => void; onShow: (id: string) => void; onClose: (id: string) => void; onNew: () => void;
+}) {
   useLive();
   const { client } = useRuntime();
   const [shells, setShells] = useState<TermInfo[]>([]);
@@ -694,6 +710,10 @@ function ComputerShells({ computer, home, shown, onOpen, onNew }: { computer: Co
     const timer = setInterval(read, 5000);
     return () => { stopped = true; clearInterval(timer); };
   }, [client, computer.reachable, computer.node]);
+  const attached = new Set(shown.flatMap((pane) => pane.termId ? [pane.termId] : []));
+  const panes: PaneRec[] = [...shown, ...(computer.reachable ? shells : [])
+    .filter((term) => !attached.has(term.term_id) && !live.ended.has(term.term_id))
+    .map((term): PaneRec => ({ id: term.term_id, kind: 'term', title: 'shell', cwd: term.cwd, termId: term.term_id, node: computer.node }))];
   return (
     <div className="ct-computer">
       <div className="cx-proj-h">
@@ -701,32 +721,15 @@ function ComputerShells({ computer, home, shown, onOpen, onNew }: { computer: Co
         <span className="grow" />
         <span className="ap faint">{computer.reachable ? (computer.path || 'mesh').toUpperCase() : 'AWAY'}</span>
       </div>
-      {computer.reachable && (
-        <>
-          <ul className="lst cx-sessions" aria-label={`Shells on ${computer.name}`}>
-            {shells.map((term) => {
-              const pane: PaneRec = { id: term.term_id, kind: 'term', title: 'shell', cwd: term.cwd, termId: term.term_id, node: computer.node };
-              const attention = live.attention(pane);
-              const [status, label, tone] = ROW_STATE[attention];
-              const here = shown.some((entry) => entry.termId === term.term_id);
-              return (
-                <li key={term.term_id} className={['cx-row', here ? 'sel' : '', NEEDS_YOU.has(attention) ? 'cx-attn' : ''].filter(Boolean).join(' ')}>
-                  <button type="button" onClick={() => onOpen(term)} title={here ? 'Show it' : 'Open it here'}>
-                    <div className="t ct-mono ct-place-t">{shortPath(live.states.get(term.term_id)?.cwd || term.cwd, home)}</div>
-                    <div className="r">
-                      <span className={`cx-pip cx-pip-${status}`} aria-hidden />
-                      <span className={`ap ${tone}`}>{live.states.get(term.term_id)?.running ? `${label} · ${live.states.get(term.term_id)!.running!.command.split(/\s+/)[0]!.toUpperCase()}` : label}</span>
-                      <span className="grow" />
-                      <span className="ap faint">{paneWhen(pane)}</span>
-                    </div>
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
-          <button type="button" className="detent sm ct-computer-new" onClick={onNew}>NEW SHELL THERE</button>
-        </>
-      )}
+      <ul className="lst cx-sessions" aria-label={`Sessions on ${computer.name}`}>
+        {panes.map((pane) => {
+          const isAttached = shown.some((entry) => entry.id === pane.id);
+          return <SessionRow key={pane.id} pane={pane} home={home} selected={stage.includes(pane.id)} disabled={!computer.reachable}
+            onOpen={() => isAttached ? onShow(pane.id) : onOpen({ term_id: pane.termId!, cwd: pane.cwd, alive: true })}
+            onClose={isAttached ? () => onClose(pane.id) : undefined} />;
+        })}
+      </ul>
+      {computer.reachable && <button type="button" className="detent sm ct-computer-new" onClick={onNew}>NEW SHELL THERE</button>}
     </div>
   );
 }
