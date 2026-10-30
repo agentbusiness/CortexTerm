@@ -15,7 +15,9 @@ name = "cc-model-llama"
 path = "src/main.rs"
 
 [dependencies]
-cc-protocol = { path = "../../../protocol", features = ["memory", "mesh", "model", "models", "preserve_order"] }
+cc-protocol = { path = "../../../protocol", features = ["memory", "mesh", "model", "preserve_order"] }
+# The models folder the Cortex apps share (~/.cortex-models), where Gemma lives.
+cc-shared-models = { path = "../../../shared-models" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["preserve_order"] }
 tokio = { version = "1.53", features = ["full"] }

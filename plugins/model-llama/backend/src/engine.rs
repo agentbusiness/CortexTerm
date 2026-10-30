@@ -110,8 +110,9 @@ impl Engine {
         let models = match &config.models_dir {
             Some(dir) => PathBuf::from(dir),
             None => {
-                cc_protocol::models::move_old(&home.join("models"));
-                cc_protocol::models::dir()
+                let root = cc_shared_models::root();
+                cc_shared_models::move_in(&home.join("models"), &root);
+                root
             }
         };
         let memory = physical_memory();

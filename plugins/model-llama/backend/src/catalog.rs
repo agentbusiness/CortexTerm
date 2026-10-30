@@ -1,5 +1,5 @@
 //! The two Gemma 4 variants, their pinned files, and getting them onto disk in the shared models
-//! folder (`cc_protocol::models`): with the revision's download lock held, a file already there at
+//! folder (`cc_shared_models`): with the revision's download lock held, a file already there at
 //! its pinned size (another app may have just fetched it) is used when its SHA-256 matches, else it
 //! is downloaded with resume to `<file>.part`, checked, and renamed into place. Every check is
 //! recorded beside the file in `<file>.digest`.
@@ -186,11 +186,16 @@ pub async fn install(spec: &'static Spec, models: PathBuf, report: Report) -> Re
     let dir = spec.dir(&models);
     let total: u64 = spec.files().iter().map(|f| f.bytes).sum();
     // Another app downloading the same revision holds the lock: wait for it, then look again.
-    let locked = dir.clone();
-    let _lock = tokio::task::spawn_blocking(move || cc_protocol::models::lock(&locked))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| format!("cannot lock {}: {e}", dir.display()))?;
+    let failed = |e: std::io::Error| format!("cannot lock {}: {e}", dir.join(cc_shared_models::LOCK).display());
+    let _lock = match cc_shared_models::try_lock(&dir).map_err(failed)? {
+        Some(lock) => lock,
+        None => {
+            let detail = "waiting while another Cortex app downloads this model".to_owned();
+            report(InstallProgress { variant: spec.id.into(), phase: "download".into(), file: String::new(), bytes: 0, total, detail });
+            let locked = dir.clone();
+            tokio::task::spawn_blocking(move || cc_shared_models::lock(&locked)).await.map_err(|e| e.to_string())?.map_err(failed)?
+        }
+    };
     let mut before = 0u64;
     for file in spec.files() {
         let target = dir.join(file.name);

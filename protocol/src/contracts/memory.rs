@@ -1793,8 +1793,8 @@ pub struct EngineStatus {
     pub downloaded_bytes: u64,
     #[serde(default)]
     pub resumed_from: u64,
-    /// How the model files arrived on this start: `installed` (already present and verified) or
-    /// `network`.
+    /// How the model files arrived on this start: `installed` (already present and verified),
+    /// `local:<dir>` (copied from another verified installation) or `network`.
     #[serde(default)]
     pub source: Option<String>,
     /// Time spent installing / verifying the model, and opening the database (model load + warm-up).
