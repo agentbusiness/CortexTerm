@@ -738,29 +738,6 @@ impl Frame {
             }
             methods::MACHINE => to_value(&self.machine),
             methods::UPDATE_STATUS => to_value(&crate::update::status(&self.home.root)),
-            methods::UPDATE_RESTART => {
-                let status = crate::update::status(&self.home.root);
-                let development_runner = self.runner && std::env::var("CORTEX_NO_HANDOVER").is_ok_and(|value| value == "1");
-                if status.staged.is_none() && !development_runner {
-                    return Err(RpcError::invalid_params("no newer frame is staged; nothing to restart into"));
-                }
-                if self.runner {
-                    // Covers explicit schedule/sweep/service calls that have not returned yet;
-                    // the updater separately waits for background jobs and due schedules.
-                    for category in ["system", "terminal"] {
-                        if let Some(slot) = self.sup.slot(category)
-                            && slot.live_current().is_some()
-                            && crate::supervisor::in_flight(&slot).await.is_none_or(|count| count > 0)
-                        {
-                            return Err(RpcError::new("busy", format!("{category} is still working; runner restart deferred")).retryable());
-                        }
-                    }
-                }
-                tracing::info!(staged = ?status.staged, "restarting onto the staged frame");
-                crate::update::request_restart();
-                self.shell.quit.notify_one();
-                to_value(&status)
-            }
             methods::ROUTE_SET => {
                 let params: RouteSetParams = parse_params(params)?;
                 if params.key.is_empty() {
@@ -861,6 +838,7 @@ impl Frame {
                 | methods::PLUGINS_INSTALL_WAIT
                 | methods::PLUGINS_SWITCH
                 | methods::UPDATE_STAGE
+                | methods::UPDATE_RESTART
         )
     }
 
@@ -927,6 +905,29 @@ impl Frame {
             methods::UI_OPEN => {
                 let (running, pid) = self.shell.open(&self).await?;
                 to_value(&UiOpenResult { running, pid })
+            }
+            methods::UPDATE_RESTART => {
+                let status = crate::update::status(&self.home.root);
+                let development_runner = self.runner && std::env::var("CORTEX_NO_HANDOVER").is_ok_and(|value| value == "1");
+                if status.staged.is_none() && !development_runner {
+                    return Err(RpcError::invalid_params("no newer frame is staged; nothing to restart into"));
+                }
+                if self.runner {
+                    // Covers explicit schedule/sweep/service calls that have not returned yet;
+                    // the updater separately waits for background jobs and due schedules.
+                    for category in ["system", "terminal"] {
+                        if let Some(slot) = self.sup.slot(category)
+                            && slot.live_current().is_some()
+                            && crate::supervisor::in_flight(&slot).await.is_none_or(|count| count > 0)
+                        {
+                            return Err(RpcError::new("busy", format!("{category} is still working; runner restart deferred")).retryable());
+                        }
+                    }
+                }
+                tracing::info!(staged = ?status.staged, "restarting onto the staged frame");
+                crate::update::request_restart();
+                self.shell.quit.notify_one();
+                to_value(&status)
             }
             methods::UPDATE_STAGE => {
                 let params: cc_protocol::contracts::frame::UpdateStageParams = parse_params(params)?;
