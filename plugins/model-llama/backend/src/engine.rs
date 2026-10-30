@@ -106,7 +106,14 @@ impl Engine {
     pub async fn new(config: Config, home: PathBuf, data_dir: PathBuf, publish: Publisher, ctx: Option<Ctx>) -> Arc<Engine> {
         let _ = std::fs::create_dir_all(&data_dir);
         crate::server::reclaim_stale(&data_dir);
-        let models = config.models_dir.as_ref().map(PathBuf::from).unwrap_or_else(|| home.join("models"));
+        // The shared models folder; this app's old one (`<CORTEX_HOME>/models`) is moved in first.
+        let models = match &config.models_dir {
+            Some(dir) => PathBuf::from(dir),
+            None => {
+                cc_protocol::models::move_old(&home.join("models"));
+                cc_protocol::models::dir()
+            }
+        };
         let memory = physical_memory();
         // The chosen model (setting `model.variant`); the memory plugin is waited for a few seconds
         // at most, and when it answers later the choice applies if no model is loaded yet.

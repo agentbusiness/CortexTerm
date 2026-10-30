@@ -20,6 +20,8 @@ pub mod checks;
 pub mod hashline;
 #[cfg(feature = "host")]
 pub mod host;
+#[cfg(feature = "models")]
+pub mod models;
 #[cfg(feature = "release")]
 pub mod release;
 #[cfg(feature = "stored")]

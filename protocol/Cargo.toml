@@ -41,6 +41,7 @@ vcs = []
 checks = ["memory"]
 hashline = []
 host = []
+models = []
 release = []
 stored = ["memory"]
 

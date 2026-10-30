@@ -1,5 +1,5 @@
 //! The embedded IronGraph instance: one per process, exclusive owner of `<CORTEX_HOME>/irongraph`.
-//! Its embedding model and vector cache live in `<CORTEX_HOME>/irongraph-models` and
+//! Its embedding model lives in the shared models folder (`~/.cortex-models`), its vector cache in
 //! `<CORTEX_HOME>/irongraph-cache` (see `engine`); nothing is read from or written to `~/.irongraph`.
 //!
 //! Every statement names its layers explicitly (see the `layer` constants): a statement without a

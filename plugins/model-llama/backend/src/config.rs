@@ -19,7 +19,7 @@ pub struct Config {
     pub borrow: bool,
     /// The llama-server binary (default: beside this executable).
     pub server_bin: Option<String>,
-    /// Where models live (default `$CORTEX_HOME/models`).
+    /// Where models live (default `~/.cortex-models`, the folder every Cortex app shares).
     pub models_dir: Option<String>,
 }
 

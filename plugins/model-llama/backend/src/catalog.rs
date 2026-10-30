@@ -1,6 +1,8 @@
-//! The two Gemma 4 variants, their pinned files, and getting them onto disk: reuse an identical
-//! local copy (APFS clone or hard link), else download with resume; every file is checked against
-//! its pinned size and SHA-256 once, and the check is recorded beside it in `<file>.digest`.
+//! The two Gemma 4 variants, their pinned files, and getting them onto disk in the shared models
+//! folder (`cc_protocol::models`): with the revision's download lock held, a file already there at
+//! its pinned size (another app may have just fetched it) is used when its SHA-256 matches, else it
+//! is downloaded with resume to `<file>.part`, checked, and renamed into place. Every check is
+//! recorded beside the file in `<file>.digest`.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -99,20 +101,6 @@ impl Spec {
     }
 }
 
-/// Places where another app on this Mac may already keep the same pinned file (read only).
-fn known_copies(spec: &Spec, file: &FileSpec) -> Vec<PathBuf> {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return Vec::new() };
-    let dashed = spec.repo.replace('/', "-");
-    let mut paths = vec![
-        home.join(".globalcortex/models").join(&dashed).join(spec.revision).join(file.name),
-        home.join(".cortexcode/models").join(&dashed).join(spec.revision).join(file.name),
-    ];
-    // The Hugging Face cache keeps a snapshot per revision.
-    let hf = format!("models--{}", spec.repo.replace('/', "--"));
-    paths.push(home.join(".cache/huggingface/hub").join(hf).join("snapshots").join(spec.revision).join(file.name));
-    paths
-}
-
 #[derive(Serialize, Deserialize, PartialEq)]
 struct DigestRecord {
     bytes: u64,
@@ -182,7 +170,7 @@ pub fn installed(spec: &Spec, models: &Path) -> bool {
 #[derive(Debug, Clone, Serialize)]
 pub struct InstallProgress {
     pub variant: String,
-    /// reuse | verify | download | done | failed
+    /// verify | download | done | failed
     pub phase: String,
     pub file: String,
     pub bytes: u64,
@@ -196,8 +184,13 @@ pub type Report = std::sync::Arc<dyn Fn(InstallProgress) + Send + Sync>;
 /// Make the variant present and checked under `models`. Returns its directory.
 pub async fn install(spec: &'static Spec, models: PathBuf, report: Report) -> Result<PathBuf, String> {
     let dir = spec.dir(&models);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let total: u64 = spec.files().iter().map(|f| f.bytes).sum();
+    // Another app downloading the same revision holds the lock: wait for it, then look again.
+    let locked = dir.clone();
+    let _lock = tokio::task::spawn_blocking(move || cc_protocol::models::lock(&locked))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("cannot lock {}: {e}", dir.display()))?;
     let mut before = 0u64;
     for file in spec.files() {
         let target = dir.join(file.name);
@@ -214,77 +207,45 @@ pub async fn install(spec: &'static Spec, models: PathBuf, report: Report) -> Re
                 })
             }
         };
-        if !recorded_ok(&target, &file) {
-            let present = std::fs::metadata(&target).map(|m| m.len() == file.bytes).unwrap_or(false);
-            if !present {
-                // A reused copy was hashed (and matched) at its source: it is recorded as is.
-                if reuse(spec, &file, &target, &say).await {
-                    record(&target, file.sha256);
-                    before += file.bytes;
-                    continue;
-                }
-                download(&spec.url(&file), &file, &target, &say).await?;
-            }
-            let path = target.clone();
-            let say_verify = say.clone();
-            let sha = tokio::task::spawn_blocking(move || sha256_file(&path, &mut |done| say_verify("verify", done, String::new())))
-                .await
-                .map_err(|e| e.to_string())??;
-            if sha != file.sha256 {
-                let _ = std::fs::remove_file(&target);
-                let message = format!("{} has sha256 {sha}, expected {}", target.display(), file.sha256);
-                say("failed", 0, message.clone());
-                return Err(message);
-            }
-            record(&target, &sha);
+        if recorded_ok(&target, &file) {
+            before += file.bytes;
+            continue;
         }
+        if std::fs::metadata(&target).is_ok_and(|m| m.len() == file.bytes) {
+            if verify(&target, &say).await? == file.sha256 {
+                record(&target, file.sha256);
+                before += file.bytes;
+                continue;
+            }
+            tracing::warn!(file = %target.display(), "a model file does not match its pinned digest; downloading it again");
+            let _ = std::fs::remove_file(&target);
+        }
+        let part = dir.join(format!("{}.part", file.name));
+        download(&spec.url(&file), &file, &part, &say).await?;
+        let sha = verify(&part, &say).await?;
+        if sha != file.sha256 {
+            let _ = std::fs::remove_file(&part);
+            let message = format!("{} has sha256 {sha}, expected {}", part.display(), file.sha256);
+            say("failed", 0, message.clone());
+            return Err(message);
+        }
+        std::fs::rename(&part, &target).map_err(|e| format!("cannot move {} into place: {e}", part.display()))?;
+        record(&target, &sha);
         before += file.bytes;
     }
     report(InstallProgress { variant: spec.id.into(), phase: "done".into(), file: String::new(), bytes: total, total, detail: dir.display().to_string() });
     Ok(dir)
 }
 
-/// Put an identical local copy in place: a copy of the exact size whose SHA-256 matches the pin
-/// (hashed once, read only) is APFS-cloned, else hard-linked. Returns whether it did.
-async fn reuse(spec: &Spec, file: &FileSpec, target: &Path, say: &(dyn Fn(&str, u64, String) + Send + Sync)) -> bool {
-    for source in known_copies(spec, file) {
-        if std::fs::metadata(&source).map(|m| m.len() != file.bytes).unwrap_or(true) {
-            continue;
-        }
-        say("reuse", 0, format!("checking {}", source.display()));
-        let hashed = source.clone();
-        let sha = tokio::task::spawn_blocking(move || sha256_file(&hashed, &mut |_| {})).await.ok().and_then(Result::ok);
-        if sha.as_deref() != Some(file.sha256) {
-            tracing::warn!(source = %source.display(), "a local copy has the pinned size but not the pinned digest; not reused");
-            continue;
-        }
-        let part = target.with_extension("reuse.part");
-        let _ = std::fs::remove_file(&part);
-        let cloned = tokio::process::Command::new("cp")
-            .arg("-c")
-            .arg(&source)
-            .arg(&part)
-            .status()
-            .await
-            .is_ok_and(|status| status.success());
-        let placed = if cloned {
-            std::fs::rename(&part, target).is_ok()
-        } else {
-            let _ = std::fs::remove_file(&part);
-            std::fs::hard_link(&source, target).is_ok()
-        };
-        if placed {
-            tracing::info!(source = %source.display(), target = %target.display(), cloned, "reused a local copy of the model file");
-            say("reuse", file.bytes, format!("{} from {}", if cloned { "cloned" } else { "linked" }, source.display()));
-            return true;
-        }
-    }
-    false
+/// The SHA-256 of `path`, hashed on a blocking thread.
+async fn verify(path: &Path, say: &(impl Fn(&str, u64, String) + Clone + Send + Sync + 'static)) -> Result<String, String> {
+    let (path, say) = (path.to_path_buf(), say.clone());
+    tokio::task::spawn_blocking(move || sha256_file(&path, &mut |done| say("verify", done, String::new()))).await.map_err(|e| e.to_string())?
 }
 
-async fn download(url: &str, file: &FileSpec, target: &Path, say: &(dyn Fn(&str, u64, String) + Send + Sync)) -> Result<(), String> {
+/// Fetch `file` into `part`, resuming what an earlier attempt left there.
+async fn download(url: &str, file: &FileSpec, part: &Path, say: &(dyn Fn(&str, u64, String) + Send + Sync)) -> Result<(), String> {
     use futures_util::StreamExt;
-    let part = target.with_extension("part");
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
         .read_timeout(Duration::from_secs(120))
@@ -350,5 +311,5 @@ async fn download(url: &str, file: &FileSpec, target: &Path, say: &(dyn Fn(&str,
             Err(error) => return Err(error),
         }
     }
-    std::fs::rename(&part, target).map_err(|e| format!("cannot move {} into place: {e}", part.display()))
+    Ok(())
 }

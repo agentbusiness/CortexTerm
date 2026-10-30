@@ -3,7 +3,8 @@
 `cc-memory` is the CortexTerm memory plugin (CPP/1, category `memory`, contract `memory@1`), built on
 `irongraph-sdk =0.1.8`. It keeps one embedded IronGraph instance per process, the exclusive owner of
 `<CORTEX_HOME>/irongraph` (`CORTEX_HOME`, else derived from `CORTEX_PLUGIN_DATA`). IronGraph's
-embedding model lives in `<CORTEX_HOME>/irongraph-models` and its rebuildable vector cache in
+embedding model lives in `~/.cortex-models`, the models folder every Cortex app shares
+(`<org>-<repo>/<revision>/<file>`, `docs/SHARED-MODELS.md`), and its rebuildable vector cache in
 `<CORTEX_HOME>/irongraph-cache` (`EmbeddedOptions::with_model_dir` / `with_embedding_cache_dir`, new
 in 0.1.8). Nothing is read from or written to `~/.irongraph`.
 
@@ -92,11 +93,14 @@ itself before it opens the database (`src/engine.rs`):
 - every file is pinned to the size and digest Hugging Face publishes for that revision (SHA-256 of
   the LFS object; git blob SHA-1 for `config.json`) and re-verified on every start; a file that does
   not match is never handed to the SDK;
-- the first start of a fresh `CORTEX_HOME` is the one-time install download: HTTPS from Hugging Face
-  into `<file>.part`, resumed with an HTTP range request after an interruption (in-process retries,
-  and across restarts), then verified and renamed into place;
-- a verified copy in another model directory is cloned instead of downloaded: the directories in
-  `CORTEX_IRONGRAPH_MODEL_SOURCE` (colon-separated), then `~/.cortexterm/irongraph-models`;
+- the install holds `<revision>/.download.lock`, so a Cortex app fetching the same model at the same
+  time downloads it once and the other waits, then finds it in place;
+- when no Cortex app has it yet, the one-time install download: HTTPS from Hugging Face into
+  `<file>.part`, resumed with an HTTP range request after an interruption (in-process retries, and
+  across restarts), then verified and renamed into place;
+- on every start, before the model is looked up, this app's old `<CORTEX_HOME>/irongraph-models` is
+  moved into `~/.cortex-models` (`cc_protocol::models::move_old`: renamed, never copied; a file
+  already there at the same size is deleted from the old folder);
 - progress and state: `memory.engine.status` (answered without the database, so it works during the
   download) and `memory.engine` events (`EngineStatus`: `installing | loading | ready | error`,
   `bytes_done / bytes_total`, `downloaded_bytes`, `resumed_from`, `source`, `install_ms`, `open_ms`),
