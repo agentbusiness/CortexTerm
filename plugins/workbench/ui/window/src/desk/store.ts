@@ -145,7 +145,7 @@ class LiveStore {
   }
 
   attention(pane: PaneRec): Attention {
-    if (pane.kind !== 'term' || !pane.termId) return pane.kind === 'alerts' && this.alerts.some((a) => !a.dismissed && a.severity !== 'info') ? 'alert' : 'idle';
+    if (pane.kind !== 'term' || !pane.termId) return 'idle';
     if (this.ended.has(pane.termId)) return 'ended';
     if (this.unseen.has(pane.id)) return 'proposal';
     const state = this.states.get(pane.termId);
