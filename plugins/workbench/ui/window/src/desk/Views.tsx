@@ -266,18 +266,9 @@ export function ProcessPane({ pane, focused, bare, onFocus, onShelf, onClose, on
 
 // --- alerts and the security sweep ------------------------------------------------------------
 
-/** The sweep's areas, in the order they are listed; a finding's kind places it. */
-const AREAS: [string, string[]][] = [
-  ['INTRUSION & MALWARE', ['malware', 'intrusion', 'persistence']],
-  ['AI AGENTS', ['agent']],
-  ['NETWORK', ['network', 'lan']],
-  ['PRIVACY', ['privacy']],
-  ['MAC SETTINGS', ['posture']],
-  ['SOFTWARE', ['vuln', 'outdated', 'app']],
-  ['SECRETS & KEYS', ['secret', 'ssh']],
-  ['OTHER', []],
-];
-const KNOWN_KINDS = new Set(AREAS.flatMap(([, kinds]) => kinds));
+/** Most serious first: alerts and sweep findings are listed in this order. */
+const SEVERITY_ORDER: Record<string, number> = { critical: 0, high: 1, medium: 2, warn: 2, low: 3, info: 4 };
+const bySeverity = (a: { severity: string }, b: { severity: string }) => (SEVERITY_ORDER[a.severity] ?? 9) - (SEVERITY_ORDER[b.severity] ?? 9);
 
 /** Open an advisory in the person's own browser (the shell's bridge; a plain link outside the app). */
 function openAdvisory(url: string) {
@@ -382,9 +373,8 @@ export function AlertsPane({ pane, focused, bare, onFocus, onShelf, onClose, onA
       live.changed();
     }).catch(() => undefined);
   };
-  const alerts = live.alerts.filter((alert) => !alert.dismissed);
-  const order = { high: 0, medium: 1, warn: 1, low: 2, info: 3 } as Record<string, number>;
-  const findings = (report?.findings ?? []).slice().sort((a, b) => (order[a.severity] ?? 9) - (order[b.severity] ?? 9));
+  const alerts = live.alerts.filter((alert) => !alert.dismissed).sort(bySeverity);
+  const findings = (report?.findings ?? []).slice().sort(bySeverity);
   const open = findings.filter((finding) => !finding.ignored);
   const ignored = findings.filter((finding) => finding.ignored);
   const checked = report ? `Checked ${report.checked.length} sources${report.skipped.length ? `, skipped ${report.skipped.length}` : ''}` : '';
@@ -416,9 +406,7 @@ export function AlertsPane({ pane, focused, bare, onFocus, onShelf, onClose, onA
           </header>
           {problem && <p className="ct-asec-note ct-warn">{problem}</p>}
           {report && open.length === 0 && <p className="ct-asec-note">Nothing to worry about.</p>}
-          {AREAS.map(([area, kinds]) => [area, open.filter((finding) => (kinds.length ? kinds.includes(finding.kind) : !KNOWN_KINDS.has(finding.kind)))] as const).filter(([, list]) => list.length > 0).map(([area, list]) => [
-            <div key={`area-${area}`} className="ct-asec-area ct-label ct-faint">{area} · {list.length}</div>,
-            ...list.map((finding) => (
+          {open.map((finding) => (
             <article key={finding.key} className={`ct-issue ${finding.severity}`}>
               <div className="ct-issue-meta"><span className="ct-label sev">{finding.severity.toUpperCase()}</span><span className="ct-label ct-faint">{finding.source.toUpperCase()}</span></div>
               <p className="ct-issue-text">{finding.text}</p>
@@ -428,7 +416,7 @@ export function AlertsPane({ pane, focused, bare, onFocus, onShelf, onClose, onA
                 <button type="button" className="detent sm" title="Stop listing and alerting this; it stays under Ignored" onClick={() => ignore(finding, true)}>DON'T WORRY</button>
               </div>
             </article>
-          ))])}
+          ))}
           {ignored.length > 0 && (
             <button type="button" className="ct-asec-fold" onClick={() => setShowIgnored((value) => !value)}>
               <span className="ct-label ct-faint">{showIgnored ? '▾' : '▸'} IGNORED · {ignored.length}</span>

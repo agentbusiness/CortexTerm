@@ -497,7 +497,7 @@
 #cc .ct-asec-head .detent{align-self:center;}
 #cc .ct-asec-note{margin:0;font:13px/1.5 Archivo,sans-serif;color:var(--ink-3);}
 #cc .ct-issue{--sev:var(--ink-3);display:flex;flex-direction:column;gap:6px;padding:10px 12px;border-left:3px solid var(--sev);background:color-mix(in srgb, var(--sev) 7%, var(--ground));}
-#cc .ct-issue.high,#cc .ct-issue.warn{--sev:var(--rubric);}
+#cc .ct-issue.critical,#cc .ct-issue.high,#cc .ct-issue.warn{--sev:var(--rubric);}
 #cc .ct-issue.medium{--sev:var(--rubric-lift);}
 #cc .ct-issue.low{--sev:var(--counter);}
 #cc .ct-issue-meta{display:flex;gap:10px;align-items:baseline;}
@@ -510,7 +510,6 @@
 #cc .ct-issue-ignored .ct-issue-text{flex:1;font-size:12.5px;color:var(--ink-3);text-decoration:line-through;text-decoration-color:var(--rule-2);}
 #cc .ct-issue-match{font:12.5px/1.45 Archivo,sans-serif;color:var(--ink-2);overflow-wrap:anywhere;}
 #cc .ct-asec .ct-find .detent{flex:none;}
-#cc .ct-asec-area{margin-top:6px;}
 #cc .ct-asec-foot{margin:2px 0 0;cursor:help;}
 
 /* --- the side LOG: which Run it is, then its lines ------------------------------------------ */
