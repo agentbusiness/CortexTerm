@@ -7,7 +7,7 @@
 [plugin]
 id = "terminal"
 name = "Terminal"
-version = "0.2.1"
+version = "0.2.2"
 description = "PTY terminals running the user's login shell, kept alive by the cortexd daemon across app restarts and plugin swaps, with output events, resize, VT-parsed screen snapshots, Runs and learned habits; the Terminal tab of the right pane."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
