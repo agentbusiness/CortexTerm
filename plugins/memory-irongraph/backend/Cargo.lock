@@ -158,6 +158,7 @@ dependencies = [
  "blake3",
  "cc-lang-kit",
  "cc-protocol",
+ "cc-shared-models",
  "ignore",
  "irongraph-sdk",
  "notify",
@@ -184,6 +185,13 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "cc-shared-models"
+version = "0.1.0"
+dependencies = [
+ "tracing",
 ]
 
 [[package]]

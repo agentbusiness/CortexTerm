@@ -99,7 +99,7 @@ itself before it opens the database (`src/engine.rs`):
   `<file>.part`, resumed with an HTTP range request after an interruption (in-process retries, and
   across restarts), then verified and renamed into place;
 - on every start, before the model is looked up, this app's old `<CORTEX_HOME>/irongraph-models` is
-  moved into `~/.cortex-models` (`cc_protocol::models::move_old`: renamed, never copied; a file
+  moved into `~/.cortex-models` (`cc_shared_models::move_in`, `shared-models/`: renamed, never copied; a file
   already there at the same size is deleted from the old folder);
 - progress and state: `memory.engine.status` (answered without the database, so it works during the
   download) and `memory.engine` events (`EngineStatus`: `installing | loading | ready | error`,

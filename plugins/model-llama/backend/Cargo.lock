@@ -90,6 +90,7 @@ name = "cc-model-llama"
 version = "0.1.0"
 dependencies = [
  "cc-protocol",
+ "cc-shared-models",
  "futures-util",
  "libc",
  "reqwest",
@@ -113,6 +114,13 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "cc-shared-models"
+version = "0.1.0"
+dependencies = [
+ "tracing",
 ]
 
 [[package]]

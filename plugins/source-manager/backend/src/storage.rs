@@ -25,7 +25,7 @@ fn size(path: &Path) -> u64 {
 /// walk; run off the async threads).
 pub fn measure(home: &Path, live: &Path) -> Storage {
     let item = |name: &str, path: &Path| StorageItem { name: name.into(), bytes: size(path), path: path.display().to_string() };
-    let mut items = vec![item("Models", &cc_protocol::models::dir()), item("Live data (skills, prompts, texts)", live)];
+    let mut items = vec![item("Models", &cc_shared_models::root()), item("Live data (skills, prompts, texts)", live)];
     items.extend(ITEMS.iter().map(|(name, folder)| item(name, &home.join(folder))));
     Storage { home: home.display().to_string(), items }
 }

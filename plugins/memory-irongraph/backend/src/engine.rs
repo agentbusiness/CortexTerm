@@ -1,5 +1,5 @@
 //! IronGraph's embedding engine files: the embedding model in the models folder every Cortex app
-//! shares (`~/.cortex-models`, `cc_protocol::models`; this app's old `<CORTEX_HOME>/irongraph-models`
+//! shares (`~/.cortex-models`, `cc_shared_models`; this app's old `<CORTEX_HOME>/irongraph-models`
 //! is moved in on every start), the SDK's rebuildable passage-vector cache in
 //! `<CORTEX_HOME>/irongraph-cache` (never `~/.irongraph`).
 //!
@@ -68,8 +68,8 @@ pub struct EnginePaths {
 impl EnginePaths {
     /// The paths for `home`, after moving its old model folder into the shared one.
     pub fn under(home: &Path) -> Self {
-        cc_protocol::models::move_old(&home.join("irongraph-models"));
-        Self { data_dir: home.join("irongraph"), model_dir: cc_protocol::models::dir(), cache_dir: home.join("irongraph-cache") }
+        cc_shared_models::move_in(&home.join("irongraph-models"), &cc_shared_models::root());
+        Self { data_dir: home.join("irongraph"), model_dir: cc_shared_models::root(), cache_dir: home.join("irongraph-cache") }
     }
 
     /// The directory holding the pinned revision's files.
@@ -187,10 +187,10 @@ impl Engine {
         std::fs::create_dir_all(&self.paths.cache_dir).map_err(|e| io_error("cannot create", &self.paths.cache_dir, e))?;
         // One download per revision at a time, across every Cortex app.
         let locked = dir.clone();
-        let lock = tokio::task::spawn_blocking(move || cc_protocol::models::lock(&locked))
+        let lock = tokio::task::spawn_blocking(move || cc_shared_models::lock(&locked))
             .await
             .map_err(|e| RpcError::internal(format!("download lock task: {e}")))?
-            .map_err(|e| io_error("cannot lock", &dir, e))?;
+            .map_err(|e| io_error("cannot lock", &dir.join(cc_shared_models::LOCK), e))?;
 
         let mut origins = Vec::new();
         let mut done = 0u64;
