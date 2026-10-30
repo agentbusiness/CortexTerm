@@ -459,6 +459,9 @@
 #cc .ct-nav.cx-sidebar{padding:0;gap:0;overflow:hidden;}
 #cc .ct-nav .cx-row{position:relative;}
 #cc .ct-place-t{font-size:12.5px;}
+/* A joined computer in the nav (COMPUTERS): its shells, then a new shell there. */
+#cc .ct-computer{padding:0 0 6px;}
+#cc .ct-computer-new{margin:4px 0 0;}
 /* where the shell is, above its stream */
 #cc .ct-term-float{justify-content:flex-start;padding:4px 0 8px;}
 #cc .ct-crumbs{display:flex;align-items:baseline;gap:6px;min-width:0;overflow:hidden;white-space:nowrap;font:13px var(--font-mono);}

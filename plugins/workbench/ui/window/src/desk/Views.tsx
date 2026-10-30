@@ -11,7 +11,7 @@ import { defaultKeymap, history, historyKeymap, undo, redo, deleteLine } from '@
 import { search, openSearchPanel, replaceAll, searchKeymap } from '@codemirror/search';
 import { LanguageDescription, syntaxHighlighting, defaultHighlightStyle } from '@codemirror/language';
 import { languages } from '@codemirror/language-data';
-import { ago, errorMessage, runtime } from '@cortex/sdk';
+import { ago, errorMessage, useRuntime } from '@cortex/sdk';
 import type { Alert, CveReport, FileText, Finding, Histogram, Proc, Run, RunOutput, SweepReport } from './api';
 import { quote, seconds, shortPath, size } from './api';
 import { Processes } from './Sidebar';
@@ -55,7 +55,7 @@ export function EditorPane({ pane, focused, bare, home, onFocus, onShelf, onClos
   const [problem, setProblem] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
   const [line, setLine] = useState({ n: 1, text: '' });
-  const client = runtime().client;
+  const client = useRuntime().client;
   const saveRef = useRef<() => void>(() => undefined);
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
@@ -160,7 +160,7 @@ export function RunPane({ pane, focused, bare, home, named, inCard, onFocus, onS
   const [output, setOutput] = useState<RunOutput | null>(null);
   const [filter, setFilter] = useState('');
   const [problem, setProblem] = useState<string | null>(null);
-  const client = runtime().client;
+  const client = useRuntime().client;
   const runId = pane.runId ?? '';
 
   useEffect(() => {
@@ -311,7 +311,7 @@ const LOOKUP_KEYS = [['virustotal', 'VIRUSTOTAL'], ['abusech', 'ABUSE.CH']] as c
 type KeysStatus = Record<(typeof LOOKUP_KEYS)[number][0], boolean>;
 
 function LookupKeys() {
-  const client = runtime().client;
+  const client = useRuntime().client;
   const [status, setStatus] = useState<KeysStatus | null>(null);
   const [values, setValues] = useState<Record<string, string>>({});
   const [problem, setProblem] = useState<string | null>(null);
@@ -350,7 +350,7 @@ export function AlertsPane({ pane, focused, bare, onFocus, onShelf, onClose, onA
   const [showIgnored, setShowIgnored] = useState(false);
   const [cveId, setCveId] = useState('');
   const [cve, setCve] = useState<{ loading?: boolean; error?: string; report?: CveReport } | null>(null);
-  const client = runtime().client;
+  const client = useRuntime().client;
   const checkCve = () => {
     const id = cveId.trim().toUpperCase();
     if (!id) return;

@@ -10,7 +10,7 @@
  */
 
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState, type KeyboardEvent } from 'react';
-import { runtime } from '@cortex/sdk';
+import { useRuntime } from '@cortex/sdk';
 import type { Assessment, Completion, Completions, PackageCheck, Run, Script } from './api';
 import { size, shortPath } from './api';
 import { riskLabel } from './TermPane';
@@ -54,7 +54,7 @@ export const Line = forwardRef<LineHandle, LineProps>(function Line({ termId, ho
   const [guardError, setGuardError] = useState('');
   const pasted = useRef(false);
   const input = useRef<HTMLTextAreaElement>(null);
-  const client = runtime().client;
+  const client = useRuntime().client;
 
   useImperativeHandle(ref, () => ({
     focus: () => input.current?.focus(),

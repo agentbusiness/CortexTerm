@@ -7,7 +7,7 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ago, errorMessage, runtime } from '@cortex/sdk';
+import { ago, errorMessage, useRuntime } from '@cortex/sdk';
 import type { TraceGraph, TraceInfo, TraceRecord, TraceSummary } from './api';
 import { rate, seconds, shortPath, size } from './api';
 
@@ -28,7 +28,7 @@ function sourceOf(trace: TraceInfo): string {
 }
 
 function TraceList({ home, onOpen }: { home: string; onOpen: (id: string) => void }) {
-  const client = runtime().client;
+  const client = useRuntime().client;
   const [traces, setTraces] = useState<TraceInfo[] | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const [filter, setFilter] = useState('ALL');
@@ -98,7 +98,7 @@ function TraceList({ home, onOpen }: { home: string; onOpen: (id: string) => voi
 // --- one trace ----------------------------------------------------------------------------------
 
 function TraceView({ id, home, onClose, onAsk, onOpenRun }: { id: string; home: string; onClose: () => void; onAsk: Ask; onOpenRun: (runId: string) => void }) {
-  const client = runtime().client;
+  const client = useRuntime().client;
   const [summary, setSummary] = useState<TraceSummary | null>(null);
   const [whole, setWhole] = useState<TraceSummary | null>(null);
   const [starts, setStarts] = useState<TraceRecord[]>([]);
@@ -388,7 +388,7 @@ const SHOWN = 4;
 
 /** Programs in rows by who started whom; under them the folders, hosts and ports they used. */
 function Graph({ id, home, refresh }: { id: string; home: string; refresh: number }) {
-  const client = runtime().client;
+  const client = useRuntime().client;
   const box = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(320);
   const [graph, setGraph] = useState<TraceGraph | null>(null);
@@ -477,7 +477,7 @@ function Graph({ id, home, refresh }: { id: string; home: string; refresh: numbe
 }
 
 function Log({ id, from, to, home }: { id: string; from: number; to: number; home: string }) {
-  const client = runtime().client;
+  const client = useRuntime().client;
   const [records, setRecords] = useState<TraceRecord[] | null>(null);
   const [more, setMore] = useState(false);
   useEffect(() => {

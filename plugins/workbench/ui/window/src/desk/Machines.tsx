@@ -4,7 +4,7 @@
  */
 
 import { useEffect, useState } from 'react';
-import { errorMessage, runtime, useEvent } from '@cortex/sdk';
+import { errorMessage, useRuntime, useEvent } from '@cortex/sdk';
 import { seconds } from './api';
 import type { PaneRec } from './store';
 import { PaneFrame } from './Views';
@@ -24,7 +24,7 @@ export function SshPane({ onShell, onAsk, ...frame }: Controls & { onShell: (com
   const [keys, setKeys] = useState<SshKey[] | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const [filter, setFilter] = useState('');
-  const client = runtime().client;
+  const client = useRuntime().client;
   useEffect(() => {
     client.call<{ hosts: SshHost[]; agent: string; agent_socket: string }>('system.ssh.hosts', {}).then(setHosts).catch((cause) => setProblem(errorMessage(cause)));
     client.call<{ keys: SshKey[] }>('system.ssh.keys', {}).then((list) => setKeys(list?.keys ?? [])).catch((cause) => setProblem(errorMessage(cause)));
@@ -81,7 +81,7 @@ export function SchedulesPane({ home, ...frame }: Controls & { home: string }) {
   const [draft, setDraft] = useState<Schedule | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const [running, setRunning] = useState<string | null>(null);
-  const client = runtime().client;
+  const client = useRuntime().client;
   const load = () => client.call<{ schedules: Schedule[] }>('system.schedule.list', {}).then((result) => setList(result?.schedules ?? [])).catch((cause) => setProblem(errorMessage(cause)));
   useEffect(() => { void load(); }, []);
   useEvent('system.schedule.done', () => void load());
