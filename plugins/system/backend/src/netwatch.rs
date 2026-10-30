@@ -166,9 +166,11 @@ struct Flow {
     remote_port: u16,
     bytes_in: u64,
     bytes_out: u64,
+    counted: bool,
 }
 
 /// pid -> (name, its flows with a remote end).
+#[cfg(target_os = "macos")]
 fn sample() -> Result<HashMap<u32, (String, Vec<Flow>)>, String> {
     let out = crate::util::run("/usr/bin/nettop", &["-L", "1", "-x", "-n", "-J", "bytes_in,bytes_out"], Duration::from_secs(10))?;
     if !out.ok {
@@ -187,7 +189,7 @@ fn sample() -> Result<HashMap<u32, (String, Vec<Flow>)>, String> {
             let bytes_in = fields.get(1).and_then(|f| f.parse().ok()).unwrap_or(0);
             let bytes_out = fields.get(2).and_then(|f| f.parse().ok()).unwrap_or(0);
             if let Some((_, flows)) = by_pid.get_mut(&pid) {
-                flows.push(Flow { proto: proto.trim_end_matches(['4', '6']).to_owned(), local_port, remote, remote_port, bytes_in, bytes_out });
+                flows.push(Flow { proto: proto.trim_end_matches(['4', '6']).to_owned(), local_port, remote, remote_port, bytes_in, bytes_out, counted: true });
             }
             continue;
         }
@@ -202,6 +204,23 @@ fn sample() -> Result<HashMap<u32, (String, Vec<Flow>)>, String> {
 }
 
 /// `1.2.3.4:443` or `2001:db8::1%en0.443`; `None` for a wildcard end.
+#[cfg(target_os = "linux")]
+fn sample() -> Result<HashMap<u32, (String, Vec<Flow>)>, String> {
+    let owners = crate::linux::socket_owners();
+    let mut result: HashMap<u32, (String, Vec<Flow>)> = HashMap::new();
+    for socket in crate::linux::sockets().map_err(|error| error.to_string())?.into_values() {
+        if socket.remote.ip().is_unspecified() || socket.remote.port() == 0 { continue; }
+        for (pid, name) in owners.get(&socket.inode).into_iter().flatten() {
+            let (_, flows) = result.entry(*pid).or_insert_with(|| (name.clone(), Vec::new()));
+            flows.push(Flow { proto: socket.proto.into(), local_port: socket.local.port(), remote: socket.remote.ip(), remote_port: socket.remote.port(), bytes_in: 0, bytes_out: 0, counted: false });
+        }
+    }
+    Ok(result)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn sample() -> Result<HashMap<u32, (String, Vec<Flow>)>, String> { Err("network watcher is unavailable on this OS".into()) }
+
 fn endpoint(text: &str) -> Option<(IpAddr, u16)> {
     let (host, port) = match text.rsplit_once(':') {
         Some((host, port)) if !host.contains(':') => (host, port),
@@ -403,7 +422,7 @@ impl Watch {
         let app = entry.map(|e| e.proc.app.clone()).unwrap_or_else(|| crate::procs::app_of(&exe, &name, pid, u32::MAX));
         let command = entry.map(|e| e.proc.command.clone()).unwrap_or_default();
         let system = ["/System/", "/usr/libexec/", "/usr/sbin/", "/usr/bin/", "/sbin/", "/bin/"].iter().any(|p| exe.starts_with(p));
-        let signature = if system || exe.is_empty() {
+        let signature = if (system || exe.is_empty()) && cfg!(target_os = "macos") {
             crate::codesign::Signature { status: "signed".into(), apple: true, identifier: name.clone(), ..Default::default() }
         } else {
             crate::codesign::check(std::path::Path::new(&exe))
@@ -414,7 +433,7 @@ impl Watch {
         let id = if signature.identifier.is_empty() { app.clone() } else { signature.identifier.clone() };
         let key = if exe.is_empty() {
             format!("name:{name}")
-        } else if signature.apple {
+        } else if signature.apple && cfg!(target_os = "macos") {
             format!("apple:{id}")
         } else if signature.status == "signed" && !signature.team_id.is_empty() {
             format!("team:{}:{id}", signature.team_id)
@@ -477,7 +496,7 @@ impl Watch {
             let online: Vec<&Flow> = flows.iter().filter(|f| public(f.remote)).collect();
             // Bytes sent to the internet since the last sample (a new flow counts whole).
             let mut uploaded = 0;
-            for f in flows {
+            for f in flows.iter().filter(|f| f.counted) {
                 let key = (*pid, f.proto.clone(), f.local_port, f.remote, f.remote_port);
                 let before = self.flows.get(&key).copied();
                 flows_now.insert(key, f.bytes_out);
@@ -503,7 +522,7 @@ impl Watch {
                 profile.exe = info.exe.clone();
                 profile.dirty = true;
             }
-            profile.signed = if info.adhoc { "adhoc" } else if info.unsigned { "unsigned" } else { "signed" }.into();
+            profile.signed = if cfg!(target_os = "linux") { "unknown" } else if info.adhoc { "adhoc" } else if info.unsigned { "unsigned" } else { "signed" }.into();
             profile.team = info.team.clone();
             // Bytes per network since the last sample.
             for f in flows.iter().filter(|f| public(f.remote)) {
@@ -514,8 +533,10 @@ impl Watch {
                     continue;
                 }
                 let usage = profile.nets.entry(owner.asn).or_insert_with(|| NetUse { owner: owner.name.clone(), country: owner.country.clone(), ..Default::default() });
-                usage.bytes_out += f.bytes_out.saturating_sub(out_before);
-                usage.bytes_in += f.bytes_in.saturating_sub(in_before);
+                if f.counted {
+                    usage.bytes_out += f.bytes_out.saturating_sub(out_before);
+                    usage.bytes_in += f.bytes_in.saturating_sub(in_before);
+                }
                 usage.ports.insert(f.remote_port);
                 profile.dirty = true;
             }
@@ -827,7 +848,7 @@ pub async fn run(
     runs: impl Fn() -> Vec<(u32, String)> + Send + Sync + 'static,
     fire: impl Fn(Candidate) + Send + Sync + 'static,
 ) {
-    if !cfg!(target_os = "macos") {
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
         return;
     }
     // The lists are kept in the graph: their age is known once it is loaded.
@@ -850,6 +871,8 @@ pub async fn run(
             }
         }
     };
+    #[cfg(target_os = "linux")]
+    note("Network", "network", "info", "Linux socket monitoring checks destinations and connection patterns; per-connection byte counts are unavailable from procfs, so upload-volume detection is unavailable.".into());
     let mut every = tokio::time::interval(Duration::from_secs(15));
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_net: Option<Instant> = None;

@@ -72,6 +72,9 @@ const FRAME: &str = "frame";
 #[derive(Debug, Clone)]
 pub struct Config {
     pub enabled: bool,
+    pub auto_restart: bool,
+    pub development: bool,
+    pub development_build: Option<Vec<u8>>,
     pub catalog_url: String,
     pub every: Duration,
 }
@@ -83,6 +86,9 @@ impl Config {
         let repo = value.get("repo").and_then(Value::as_str).filter(|repo| !repo.is_empty()).unwrap_or(release::DEFAULT_REPO);
         Config {
             enabled: value.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+            auto_restart: value.get("auto_restart").and_then(Value::as_bool).unwrap_or(false),
+            development: value.get("development").and_then(Value::as_bool).unwrap_or(false),
+            development_build: value.get("development_build").and_then(Value::as_str).map(|s| s.as_bytes().to_vec()),
             catalog_url: value
                 .get("catalog_url")
                 .and_then(Value::as_str)
@@ -144,6 +150,8 @@ pub struct Updater {
     at_restart: Mutex<BTreeSet<(String, String)>>,
     /// The current check or reset has put plugins in the round (the next one starts a new list).
     round_open: AtomicBool,
+    /// A successful local build changes this marker only when the frame/config/shell changed.
+    development_build: Mutex<Option<Vec<u8>>>,
 }
 
 impl Updater {
@@ -173,6 +181,7 @@ impl Updater {
             wake: Notify::new(),
             at_restart: Mutex::new(BTreeSet::new()),
             round_open: AtomicBool::new(false),
+            development_build: Mutex::new(None),
         })
     }
 
@@ -181,6 +190,7 @@ impl Updater {
     pub fn attach(self: &Arc<Self>, ctx: &Ctx) {
         if self.ctx.set(ctx.clone()).is_ok() {
             let config = Config::from_value(&ctx.config());
+            *self.development_build.lock().unwrap_or_else(|p| p.into_inner()) = config.development_build.clone();
             self.with_status(|status| status.enabled = config.enabled);
             *self.config.lock().unwrap_or_else(|p| p.into_inner()) = config;
             self.graph.start(graph::ctx_caller(ctx));
@@ -658,7 +668,9 @@ impl Updater {
     /// updates wait for runs to end, and whenever asked.
     pub fn spawn_loop(self: &Arc<Self>, stop: CancellationToken) {
         let me = self.clone();
+        let catalog_stop = stop.clone();
         tokio::spawn(async move {
+            let stop = catalog_stop;
             tokio::select! {
                 _ = tokio::time::sleep(FIRST_CHECK) => {}
                 _ = me.wake.notified() => {}
@@ -666,11 +678,25 @@ impl Updater {
             }
             loop {
                 me.check().await;
+                // Core restarts are checked separately from catalog polling, so a running job
+                // finishing does not leave a prepared update waiting for an hour.
                 let wait = if me.status().waiting.is_empty() { me.config().every } else { WAITING_CHECK };
                 tokio::select! {
                     _ = tokio::time::sleep(wait) => {}
                     _ = me.wake.notified() => {}
                     _ = stop.cancelled() => return,
+                }
+            }
+        });
+        let me = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    _ = stop.cancelled() => return,
+                }
+                if let Err(error) = me.restart_when_ready().await {
+                    tracing::warn!(%error, "runner update restart deferred");
                 }
             }
         });
@@ -700,6 +726,10 @@ impl Updater {
                 status.state = "idle".into();
                 status.detail = "Updates are off.".into();
             });
+            return;
+        }
+        if config.development {
+            self.state("idle", "Development plugins come from the local build; released packages do not replace them.");
             return;
         }
         self.state("checking", "Looking for updates");
@@ -831,14 +861,67 @@ impl Updater {
 
     /// Whether a conversation run is going in any flow (an update would cut it off).
     async fn run_going(&self, ctx: &Ctx) -> bool {
-        let Ok(list) = call::<PluginListResult>(ctx, frame_methods::PLUGINS_LIST, json!({})).await else { return false };
+        let Ok(list) = call::<PluginListResult>(ctx, frame_methods::PLUGINS_LIST, json!({})).await else { return true };
         for plugin in list.plugins.iter().filter(|plugin| plugin.state == "active") {
             let Some(flow) = flows::flow_of(&plugin.category) else { continue };
-            if call::<RunningResult>(ctx, &flows::method(flow, chatflow_verbs::RUNNING), json!({})).await.is_ok_and(|running| !running.sessions.is_empty()) {
+            if call::<RunningResult>(ctx, &flows::method(flow, chatflow_verbs::RUNNING), json!({})).await.map_or(true, |running| !running.sessions.is_empty()) {
                 return true;
             }
         }
         false
+    }
+
+    /// Restart only after catalog installation and foreground/command work have settled.
+    async fn restart_when_ready(&self) -> Result<(), RpcError> {
+        if !self.config().auto_restart || self.checking.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let outcome = tokio::time::timeout(Duration::from_secs(20), self.restart_when_ready_inner()).await
+            .unwrap_or_else(|_| Err(RpcError::internal("runner activity check timed out; update restart deferred")));
+        self.checking.store(false, Ordering::SeqCst);
+        if outcome.is_err() { self.state("idle", "Runner update restart deferred until activity can be checked and work has settled."); }
+        if self.again.swap(false, Ordering::SeqCst) { self.wake.notify_one(); }
+        outcome
+    }
+
+    async fn restart_when_ready_inner(&self) -> Result<(), RpcError> {
+        let config = self.config();
+        if !config.enabled || !config.auto_restart {
+            return Ok(());
+        }
+        let Some(ctx) = self.ctx.get() else { return Ok(()) };
+        let local = if config.development {
+            let current = development_marker();
+            current.is_some() && current != *self.development_build.lock().unwrap_or_else(|p| p.into_inner())
+        } else { false };
+        let staged: FrameStatus = call(ctx, frame_methods::UPDATE_STATUS, json!({})).await?;
+        if !local && (config.development || staged.staged.is_none()) {
+            return Ok(());
+        }
+        if self.run_going(ctx).await {
+            return Ok(());
+        }
+        let list: PluginListResult = call(ctx, frame_methods::PLUGINS_LIST, json!({})).await?;
+        if list.plugins.iter().any(|plugin| plugin.category == "terminal" && plugin.state == "active") {
+            let jobs: Value = call(ctx, "terminal.command.jobs.list", json!({})).await?;
+            let jobs = jobs.get("jobs").and_then(Value::as_array).ok_or_else(|| RpcError::internal("terminal jobs did not answer with a job list"))?;
+            if jobs.iter().any(|job| matches!(job["state"].as_str(), Some("waiting" | "running"))) {
+                return Ok(());
+            }
+        }
+        if list.plugins.iter().any(|plugin| plugin.category == "system" && plugin.state == "active") {
+            // Scheduled runs keep their due time until they finish. Wait for due work to finish
+            // (or catch up) before restarting the plugin that owns it.
+            let schedules: Value = call(ctx, "system.schedule.list", json!({})).await?;
+            let schedules = schedules.get("schedules").and_then(Value::as_array).ok_or_else(|| RpcError::internal("system schedules did not answer with a schedule list"))?;
+            let now = now_ms();
+            if schedules.iter().any(|job| job["enabled"].as_bool().unwrap_or(true) && job["next"].as_u64().is_some_and(|next| next != 0 && next <= now)) {
+                return Ok(());
+            }
+        }
+        self.state("restarting", "Restarting the background runner to apply its update.");
+        ctx.call(frame_methods::UPDATE_RESTART, json!({})).await?;
+        Ok(())
     }
 
     /// Split what differs from the latest: what applies now, and what asks the user. A build of
@@ -1137,4 +1220,11 @@ async fn install_many(ctx: &Ctx, packages: Vec<&Path>) -> Result<Placed, String>
 async fn call<T: DeserializeOwned>(ctx: &Ctx, method: &str, params: Value) -> Result<T, RpcError> {
     let value = ctx.call(method, params).await?;
     serde_json::from_value(value).map_err(|e| RpcError::internal(format!("{method}: unexpected answer: {e}")))
+}
+
+/// Written atomically only at the end of a successful development build. No source watching or
+/// background compilation is done by the updater itself.
+fn development_marker() -> Option<Vec<u8>> {
+    let root = std::env::var_os("CORTEXTERM_DEV_ROOT")?;
+    std::fs::read(PathBuf::from(root).join("build/.runner-restart")).ok()
 }

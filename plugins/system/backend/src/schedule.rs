@@ -368,7 +368,7 @@ const LINES: usize = 20_000;
 pub fn run_command(schedule: &Schedule, started: impl FnOnce(u32)) -> Outcome {
     let failed = |line: String| Outcome { exit_code: -1, tail: vec![line], matched: false, timed_out: false, lines: Vec::new() };
     let shell = std::env::var("SHELL").ok().filter(|s| s.starts_with('/') && std::path::Path::new(s).is_file());
-    let shell = shell.unwrap_or_else(|| "/bin/zsh".into());
+    let shell = shell.unwrap_or_else(|| if cfg!(target_os = "macos") { "/bin/zsh".into() } else { "/bin/sh".into() });
     let cwd = if schedule.cwd.is_empty() { home() } else { expand(&schedule.cwd) };
     let (reader, writer) = match std::io::pipe() {
         Ok(pair) => pair,

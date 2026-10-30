@@ -97,6 +97,7 @@ pub struct Frame {
     pub socket: PathBuf,
     pub port: AtomicU16,
     pub headless: bool,
+    pub runner: bool,
     /// Calls on the projects, sessions and slot state that came before the records were loaded
     /// from the store, in arrival order; None once loaded ([`Frame::records_ready`]).
     records_waiting: Mutex<Option<Vec<(Arc<Peer>, IncomingRequest)>>>,
@@ -138,6 +139,7 @@ pub struct FrameParts {
     pub token: String,
     pub socket: PathBuf,
     pub headless: bool,
+    pub runner: bool,
     pub machine: Machine,
     pub journal: Journal,
     pub state: StateStore,
@@ -149,8 +151,12 @@ pub struct FrameParts {
 
 impl Frame {
     pub fn new(parts: FrameParts) -> Arc<Frame> {
-        let FrameParts { config, home, token, socket, headless, machine, journal, state, memory, units, live, safe } = parts;
-        let disabled = units.disabled();
+        let FrameParts { config, home, token, socket, headless, runner, machine, journal, state, memory, units, live, safe } = parts;
+        let mut disabled = units.disabled();
+        if runner {
+            disabled.extend(units.backends().iter().filter(|backend| backend.category == "model").map(|backend| backend.plugin.clone()));
+            disabled.remove("updater");
+        }
         let ui_plugins = UiPlugins::new(units.ui_sources(), disabled.clone());
         let window_build = ui_plugins.window().map(|window| window.plugin.hash).unwrap_or_default();
         let sup = Supervisor::new(&units.backends(), &disabled);
@@ -175,6 +181,7 @@ impl Frame {
             command_access: crate::access::CommandAccess::default(),
             socket,
             headless,
+            runner,
             live,
             safe,
             machine,
@@ -733,8 +740,21 @@ impl Frame {
             methods::UPDATE_STATUS => to_value(&crate::update::status(&self.home.root)),
             methods::UPDATE_RESTART => {
                 let status = crate::update::status(&self.home.root);
-                if status.staged.is_none() {
+                let development_runner = self.runner && std::env::var("CORTEX_NO_HANDOVER").is_ok_and(|value| value == "1");
+                if status.staged.is_none() && !development_runner {
                     return Err(RpcError::invalid_params("no newer frame is staged; nothing to restart into"));
+                }
+                if self.runner {
+                    // Covers explicit schedule/sweep/service calls that have not returned yet;
+                    // the updater separately waits for background jobs and due schedules.
+                    for category in ["system", "terminal"] {
+                        if let Some(slot) = self.sup.slot(category)
+                            && slot.live_current().is_some()
+                            && crate::supervisor::in_flight(&slot).await.is_none_or(|count| count > 0)
+                        {
+                            return Err(RpcError::new("busy", format!("{category} is still working; runner restart deferred")).retryable());
+                        }
+                    }
                 }
                 tracing::info!(staged = ?status.staged, "restarting onto the staged frame");
                 crate::update::request_restart();

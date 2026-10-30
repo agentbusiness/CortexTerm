@@ -32,6 +32,12 @@ impl Plugin for FlowPlugin {
         })
     }
 
+    fn event(&self, ctx: Ctx, topic: String, data: Value) -> BoxFuture<'static, ()> {
+        self.flow.connect(ctx);
+        let flow = self.flow.clone();
+        Box::pin(async move { flow.terminal_event(&topic, data) })
+    }
+
     fn probe(&self, ctx: Ctx) -> BoxFuture<'static, Result<ProbeReport, RpcError>> {
         self.flow.connect(ctx);
         let flow = self.flow.clone();
@@ -73,6 +79,7 @@ fn main() {
         };
         let flow = Arc::new(Flow::new(env));
         let mut hello = Hello::new("cc-chatflow-terminal", env!("CARGO_PKG_VERSION"), CATEGORY, "chatflow@1");
+        hello.subscribes = vec!["terminal.run.started".into(), "terminal.run.finished".into()];
         hello.provides = flow::VERBS.iter().map(|verb| format!("{CATEGORY}.{verb}")).collect();
         let plugin = Arc::new(FlowPlugin { flow: flow.clone() });
         let mut terminate = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {

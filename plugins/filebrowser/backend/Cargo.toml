@@ -1,0 +1,18 @@
+[package]
+name = "cc-filebrowser"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+cc-protocol = { path = "../../../protocol", features = ["filebrowser"] }
+serde_json = "1.0.149"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+base64 = "0.22"
+libc = "0.2"
+uuid = { version = "1.23", features = ["v4"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -29,9 +29,11 @@ for arg in "$@"; do
 done
 out="${args[0]:-$repo/dist}"
 case "$out" in /*) ;; *) out="$repo/$out" ;; esac
-app="$out/CortexTerm.app"
-contents="$app/Contents"
-res="$contents/Resources"
+case "$(uname -s)" in
+  Darwin) os=macos; app="$out/CortexTerm.app"; contents="$app/Contents"; res="$contents/Resources"; frame_exe="$contents/MacOS/CortexTerm" ;;
+  Linux) os=linux; app="$out/cortexterm"; contents="$app"; res="$app"; frame_exe="$app/CortexTerm" ;;
+  *) echo "build-app: supported platforms are macOS and Linux" >&2; exit 1 ;;
+esac
 cd "$repo"
 
 step() {
@@ -52,17 +54,22 @@ place() {
 # and HEAD; it is written only when a build ran through.
 stamp_of() {
   # A tracked file deleted from the work tree has nothing to stat: it is left out, not an error.
-  { git rev-parse HEAD 2>/dev/null; git ls-files -co --exclude-standard -z | xargs -0 stat -f '%N %z %m' 2>/dev/null || true; } | shasum -a 256 | cut -c1-16
+  { git rev-parse HEAD 2>/dev/null; git ls-files -co --exclude-standard -z | python3 -c 'import os,sys
+for name in sys.stdin.buffer.read().split(b"\0"):
+ if not name: continue
+ try:
+  s=os.stat(name); print(repr(name),s.st_size,s.st_mtime_ns)
+ except FileNotFoundError: pass'; } | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:16])'
 }
 stamp="$(stamp_of)"
-if [ -x "$contents/MacOS/CortexTerm" ] && [ "$(cat "$out/.stamp" 2>/dev/null)" = "$stamp" ]; then
+if [ -x "$frame_exe" ] && [ "$(cat "$out/.stamp" 2>/dev/null)" = "$stamp" ]; then
   step "nothing changed since the last build; the app is current"
   exit 0
 fi
 rm -f "$out/.stamp"
 # shellcheck source=app/electron.sh
 . "$repo/scripts/app/electron.sh"
-mkdir -p "$contents/MacOS" "$res/packages" "$res/ui/node_modules"
+mkdir -p "$(dirname "$frame_exe")" "$res/packages" "$res/ui/node_modules"
 
 # --- the frame and cortex-pack (which packs the plugins here) ----------------------------------
 for crate in frame packer; do
@@ -83,7 +90,10 @@ step "building the UI packages"
 wanted=()
 for toml in $(grep -l '^slot = "window@1"' plugins/*/plugin.toml) $(grep -L '^slot = "window@1"' plugins/*/plugin.toml); do
   dir="$(dirname "$toml")"
-  read -r id version < <("$pack" info "$dir" | /usr/bin/python3 -c 'import json,sys; p=json.load(sys.stdin)["plugin"]; print(p["id"], p["version"].split("+")[0])')
+  if ! "$pack" info "$dir" | python3 -c 'import json,sys; p=json.load(sys.stdin)["plugin"].get("platforms",[]); sys.exit(0 if not p or sys.argv[1] in p else 1)' "$os"; then
+    continue
+  fi
+  read -r id version < <("$pack" info "$dir" | python3 -c 'import json,sys; p=json.load(sys.stdin)["plugin"]; print(p["id"], p["version"].split("+")[0])')
   digest="$(node scripts/release/digest.mjs plugin "$dir")"
   name="$id@$version+b$digest.ccplugin"
   wanted+=("$name")
@@ -135,22 +145,31 @@ ui_changed="$(printf '%s\n' "$ui_sent" | grep -E '^(>f|\*deleting)' || true)"
 electron_src="ui/node_modules/electron"
 electron_dst="$res/ui/node_modules/electron"
 # Copied again for another Electron version, or a copy made before its fuses were set.
-if [ "$(cat "$electron_dst/version" 2>/dev/null)" != "$(cat "$electron_src/package.json" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')" ] || [ ! -f "$electron_dst/fuses" ]; then
+if [ "$(cat "$electron_dst/version" 2>/dev/null)" != "$(cat "$electron_src/package.json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')" ] || { [ "$os" = macos ] && [ ! -f "$electron_dst/fuses" ]; }; then
   step "copying Electron"
-  electron_mac_branded "$electron_src" "$electron_dst" ui/shell/assets/CortexTerm.icns || exit 1
+  if [ "$os" = macos ]; then
+    electron_mac_branded "$electron_src" "$electron_dst" ui/shell/assets/CortexTerm.icns || exit 1
+  else
+    mkdir -p "$electron_dst"
+    rsync -a --delete "$electron_src/" "$electron_dst/"
+    python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"],end="")' "$electron_src/package.json" > "$electron_dst/version"
+  fi
+  ui_changed="electron changed"
 fi
 
 # --- the frame and the app's own files ---------------------------------------------------------
 # The signature changes the frame's bytes, so whether it changed is told from the copy it was
 # built from ($out/.frame-built), not from the app's.
-frame_exe="$contents/MacOS/CortexTerm"
 frame_changed=0
-if ! cmp -s frame/target/release/cortex-frame "$out/.frame-built" 2>/dev/null; then
+if [ ! -x "$frame_exe" ] || ! cmp -s frame/target/release/cortex-frame "$out/.frame-built" 2>/dev/null; then
   frame_changed=1
   place frame/target/release/cortex-frame "$frame_exe"
   cp frame/target/release/cortex-frame "$out/.frame-built"
 fi
+config_changed=0
+cmp -s scripts/app/cortex.toml "$res/cortex.toml" || config_changed=1
 place scripts/app/cortex.toml "$res/cortex.toml"
+if [ "$os" = macos ]; then
 place ui/shell/assets/CortexTerm.icns "$res/CortexTerm.icns"
 version="$(grep -m1 '^version' frame/Cargo.toml | cut -d'"' -f2)"
 build="$(git rev-parse --short HEAD 2>/dev/null || echo dev)"
@@ -159,12 +178,19 @@ mv -f "$contents/Info.plist.next" "$contents/Info.plist"
 # Signed in the bundle (its identifier and the sealed resources); codesign writes a new file, so a
 # frame running from it keeps its own.
 codesign --force --sign - "$frame_exe" >/dev/null 2>&1
+fi
 
 if [ $live = 1 ]; then
-  [ $frame_changed = 0 ] || step "the frame changed: it runs from the next start"
+  [ $frame_changed = 0 ] || step "the frame changed: a runner restarts after the build; a desktop uses it at the next start"
   [ -z "$ui_changed" ] || step "the shell changed: it loads at the next start"
 fi
 step "done: $app"
 
 # The build ran through: remember what it was built from.
-printf '%s\n' "$stamp" > "$out/.stamp"
+printf '%s\n' "$stamp" > "$out/.stamp.next"
+mv -f "$out/.stamp.next" "$out/.stamp"
+# The runner's updater restarts only after every part of a successful core build is in place.
+if [ "$frame_changed" = 1 ] || [ "$config_changed" = 1 ] || [ -n "$ui_changed" ]; then
+  printf '%s\n' "$stamp" > "$out/.runner-restart.next"
+  mv -f "$out/.runner-restart.next" "$out/.runner-restart"
+fi

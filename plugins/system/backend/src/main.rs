@@ -25,6 +25,8 @@ mod inventory;
 mod keychain;
 mod keys;
 mod launch;
+#[cfg(target_os = "linux")]
+mod linux;
 mod malware;
 mod migrate;
 mod monitor;

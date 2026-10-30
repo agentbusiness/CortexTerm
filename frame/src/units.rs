@@ -753,6 +753,9 @@ pub async fn set_enabled(frame: &Arc<Frame>, id: &str, enabled: bool) -> Result<
     let mut steps = Vec::new();
     let unit = frame.units.get(id).ok_or_else(|| RpcError::not_found(format!("no plugin `{id}`")))?;
     let current = unit.current();
+    if frame.runner && ((enabled && unit.category().as_deref() == Some("model")) || (!enabled && id == "updater")) {
+        return Err(RpcError::invalid_params("the runner keeps local models off and its updater on"));
+    }
     let ui_ids = Unit::ui_ids(&current);
     if unit.enabled() == enabled {
         return Ok(PluginToggleResult { plugin: frame.units.info_of(&unit), changed: false, steps, ui: Vec::new() });
@@ -1048,7 +1051,7 @@ fn add_unit(frame: &Arc<Frame>, installed: Arc<Installed>) -> Result<Arc<Unit>, 
             // Another plugin serves the category: this one waits as its alternative.
             tracing::info!(category = %backend.category, plugin = %unit.id, serving = %existing.plugin(), "installed an alternative; it is on standby");
         } else {
-            frame.sup.add_slot(supervisor::Slot::new(backend, false)).map_err(RpcError::invalid_params)?;
+            frame.sup.add_slot(supervisor::Slot::new(backend, frame.runner && backend.category == "model")).map_err(RpcError::invalid_params)?;
             if let Ok(mut serving) = frame.units.serving.lock() {
                 serving.insert(backend.category.clone(), (unit.id.clone(), "only"));
             }
@@ -1065,6 +1068,10 @@ type Outcome = Result<Option<cc_protocol::contracts::frame::SwapResult>, (String
 
 /// Start a newly added plugin: its backend, then its UI packages and shell modules.
 async fn start_new(frame: &Arc<Frame>, unit: &Arc<Unit>, steps: &mut Vec<SwapStep>) -> Outcome {
+    if frame.runner && unit.category().as_deref() == Some("model") {
+        steps.push(SwapStep { step: "backend".into(), ok: true, ms: 0, detail: "installed; local models stay off in the runner".into() });
+        return Ok(None);
+    }
     let mut backend_swap = None;
     if let Some(category) = unit.category().filter(|_| frame.units.is_standby(unit)) {
         let serving = frame.units.serving_of(&category).unwrap_or_default();
@@ -1129,7 +1136,7 @@ async fn move_category(frame: &Arc<Frame>, unit: &Arc<Unit>, to: Arc<Installed>,
     if let Some(backend) = backend_config(&to, &frame.units.override_of(&unit.id))
         && frame.sup.slot(&backend.category).is_none()
     {
-        frame.sup.add_slot(supervisor::Slot::new(&backend, false)).map_err(|error| (error, None))?;
+        frame.sup.add_slot(supervisor::Slot::new(&backend, frame.runner && backend.category == "model")).map_err(|error| (error, None))?;
         if let Ok(mut serving) = frame.units.serving.lock() {
             serving.insert(backend.category.clone(), (unit.id.clone(), "only"));
         }
@@ -1141,7 +1148,7 @@ async fn move_category(frame: &Arc<Frame>, unit: &Arc<Unit>, to: Arc<Installed>,
 /// Swap `unit` to `to`: the backend first (the swap engine probes it and keeps the old version on
 /// failure), then the UI packages and shell modules. Returns the backend swap, or the error.
 async fn switch(frame: &Arc<Frame>, unit: &Arc<Unit>, to: Arc<Installed>, why: &str, steps: &mut Vec<SwapStep>) -> Outcome {
-    let enabled = unit.enabled();
+    let enabled = if frame.runner { unit.category().as_deref() != Some("model") && (unit.id == "updater" || unit.enabled()) } else { unit.enabled() };
     let mut backend_swap = None;
     if frame.units.is_standby(unit) {
         steps.push(SwapStep { step: "backend".into(), ok: true, ms: 0, detail: "the plugin is on standby; the new version starts when it is switched to".into() });
@@ -1267,6 +1274,9 @@ pub fn publish_units(frame: &Frame) {
 
 /// `frame.plugins.switch`: serve `category` with `plugin`, another installed plugin of it.
 pub async fn switch_provider(frame: &Arc<Frame>, category: &str, plugin: &str) -> Result<SwitchResult, RpcError> {
+    if frame.runner && category == "model" {
+        return Err(RpcError::invalid_params("local models stay off in the runner; use a model on the mesh"));
+    }
     let _op = frame.units.op.lock().await;
     let unit = frame.units.get(plugin).ok_or_else(|| RpcError::not_found(format!("no plugin `{plugin}`")))?;
     if unit.category().as_deref() != Some(category) {

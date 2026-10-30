@@ -204,6 +204,7 @@ fn out(program: &str, args: &[&str]) -> String {
 }
 
 /// Read the network now; `None` without a default route on a real interface.
+#[cfg(target_os = "macos")]
 fn current() -> Option<Net> {
     let routes = out("/usr/sbin/netstat", &["-rn", "-f", "inet"]);
     let (router, interface) = routes.lines().find_map(|line| {
@@ -243,6 +244,49 @@ fn current() -> Option<Net> {
     net.key = if net.ssid.is_empty() { format!("{interface} {subnet}") } else { format!("Wi-Fi {}", net.ssid) };
     Some(net)
 }
+
+#[cfg(target_os = "linux")]
+fn current() -> Option<Net> {
+    // procfs works on minimal servers without the macOS network tools or iproute2.
+    let routes = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+    let route = routes.lines().skip(1).filter_map(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 8 || fields[1] != "00000000" { return None; }
+        let flags = u32::from_str_radix(fields[3], 16).ok()?;
+        if flags & 1 == 0 { return None; }
+        let router = Ipv4Addr::from(u32::from_str_radix(fields[2], 16).ok()?.to_ne_bytes()).to_string();
+        Some((fields[6].parse::<u64>().unwrap_or(u64::MAX), fields[0].to_owned(), router))
+    }).min_by_key(|route| route.0);
+    let (interface, router) = if let Some((_, interface, router)) = route { (interface, router) } else {
+        let routes = std::fs::read_to_string("/proc/net/ipv6_route").ok()?;
+        let route = routes.lines().filter_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() < 10 || fields[4].len() != 32 || fields[0] != "00000000000000000000000000000000" || fields[1] != "00" || fields[9] == "lo" { return None; }
+            Some((u32::from_str_radix(fields[5], 16).unwrap_or(u32::MAX), fields[9].to_owned(), fields[4].to_owned()))
+        }).min_by_key(|route| route.0)?;
+        let address = (0..8).map(|i| &route.2[i * 4..i * 4 + 4]).collect::<Vec<_>>().join(":");
+        (route.1, address.parse::<std::net::Ipv6Addr>().ok()?.to_string())
+    };
+    let dns = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default().lines().filter_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next()? == "nameserver").then(|| fields.next().unwrap_or("").to_owned())
+    }).filter(|s| !s.is_empty()).collect();
+    let router_mac = std::fs::read_to_string("/proc/net/arp").unwrap_or_default().lines().skip(1).find_map(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        (fields.len() >= 6 && fields[0] == router && fields[5] == interface).then(|| fields[3].to_owned())
+    }).unwrap_or_default();
+    let public6 = std::fs::read_to_string("/proc/net/if_inet6").unwrap_or_default().lines().filter_map(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 6 || fields[5] != interface || fields[0].len() != 32 { return None; }
+        let address = (0..8).map(|i| &fields[0][i * 4..i * 4 + 4]).collect::<Vec<_>>().join(":");
+        let ip = address.parse::<IpAddr>().ok()?;
+        netwatch::public(ip).then(|| ip.to_string())
+    }).collect();
+    Some(Net { key: format!("{interface} via {router}"), interface, router, router_mac, dns, public6, ..Default::default() })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn current() -> Option<Net> { None }
 
 fn open_wifi(security: &str) -> bool {
     let s = security.to_ascii_uppercase();
@@ -394,6 +438,10 @@ struct Local {
     v6_interface: String,
 }
 
+#[cfg(target_os = "linux")]
+fn local_checks() -> Local { linux_local_checks() }
+
+#[cfg(not(target_os = "linux"))]
 fn local_checks() -> Local {
     let mut part = Part::default();
     // Changes since the last look (the watcher may have seen them first: they are in the digest).
@@ -489,6 +537,23 @@ fn local_checks() -> Local {
     let v6 = out("/sbin/route", &["-n", "get", "-inet6", "default"]);
     let v6_interface = field(&v6, "interface").unwrap_or("").to_owned();
     Local { part, net: Some(net), answers, arp, vpn, resolver, v6_interface }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_local_checks() -> Local {
+    let mut part = Part::default();
+    for change in network_changes() { netwatch::note("Network", "lan", &change.severity, change.text); }
+    let net = current();
+    if net.is_some() { part.checked.push("Linux default route, router neighbour, resolver and public IPv6 addresses".into()); }
+    else { part.skipped.push("Linux network: no readable default route".into()); }
+    part.skipped.push("Wi-Fi security, DHCP-server identity and per-connection transfer volumes are unavailable from the Linux procfs collector".into());
+    let arp = std::fs::read_to_string("/proc/net/arp").unwrap_or_default().lines().skip(1).filter_map(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        (fields.len() >= 4 && fields[3] != "00:00:00:00:00:00").then(|| (fields[0].to_owned(), fields[3].to_owned()))
+    }).collect();
+    let vpn = net.as_ref().is_some_and(|net| ["tun", "tap", "wg", "ppp"].iter().any(|prefix| net.interface.starts_with(prefix)));
+    let v6_interface = net.as_ref().map(|net| net.interface.clone()).unwrap_or_default();
+    Local { part, net, answers: Vec::new(), arp, vpn, resolver: None, v6_interface }
 }
 
 fn capital(text: &str) -> String {

@@ -155,6 +155,12 @@ The first start builds the app into `build/` and installs its plugins into `~/.c
 starts open at once and rebuild beside the running app; a changed plugin is swapped in as soon as it
 is packed.
 
+## Background runner
+
+`npx cortexterm runner` keeps terminal execution, metrics, monitoring and updates running without a window or a local chat model. AI can use a model elsewhere in the mesh. macOS uses a login service; Linux uses systemd with startup at boot and persistence after SSH logout. Core updates restart the runner automatically; PTY shells survive.
+
+For development, use `./cortexterm runner`; it stays on this checkout's build. Stop with `runner off` through the same launcher. See [RUNNER.md](RUNNER.md) for setup, update behavior and Linux monitoring capabilities. The new launcher behavior becomes available through npx after release.
+
 ## Releasing
 
 Everything is built on a Mac with Apple silicon; Linux builds run in Docker on it. Each plugin is
