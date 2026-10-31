@@ -139,8 +139,9 @@ export function ResetAll() {
   const differ = (plan?.plugins ?? []).filter((item) => item.action === 'install');
   const ownBuilds = differ.filter((item) => (item.installed ?? '').split('+')[1]?.startsWith('dev.'));
   const changedOnes = (plan?.plugins ?? []).filter((item) => (item.files?.length ?? 0) > 0);
-  const outside = (plan?.plugins ?? []).filter((item) => item.action === 'unofficial' || item.action === 'frame');
-  const clean = plan !== null && differ.length === 0 && changedOnes.length === 0;
+  const blocked = (plan?.plugins ?? []).filter((item) => item.action === 'frame');
+  const outside = (plan?.plugins ?? []).filter((item) => item.action === 'unofficial');
+  const clean = plan !== null && differ.length === 0 && changedOnes.length === 0 && blocked.length === 0;
   const state = planned.error && !plan ? 'error' : !plan ? 'loading' : clean ? 'clean' : 'differs';
   const button = (
     <div className="cx-reset-all" data-reset-all={phase} data-reset-state={state} data-differ={differ.length} data-changed={changedOnes.length}>
@@ -149,22 +150,22 @@ export function ResetAll() {
         {state === 'error' && <span className="inline-error">The comparison failed: {planned.error}</span>}
         {state === 'clean' && (
           <>
-            <span className="t">Every plugin runs {source}. No changes of yours.</span>
-            {outside.length > 0 && <span className="cx-settings-line">Not in it, left as they are: {some(outside)}.</span>}
+            <span className="t">{outside.length ? 'Plugins with a matching release run' : 'Every plugin runs'} {source}. No changes of yours.</span>
           </>
         )}
         {state === 'differs' && (
           <>
+            {blocked.length > 0 && <span className="t">Restart CortexTerm to update {blocked.length} plugin{blocked.length === 1 ? '' : 's'}. They need the newer frame.</span>}
             {differ.length > 0 && <span className="t">{differ.length === 1 ? '1 plugin differs' : `${differ.length} plugins differ`} from {source}: {some(differ)}.{ownBuilds.length ? ` ${ownBuilds.length === 1 ? 'It is a build of yours' : `${ownBuilds.length} are builds of yours`}, left alone.` : ''}</span>}
             {changedOnes.length > 0 && <span className={differ.length > 0 ? 'cx-settings-line' : 't'}>{changedOnes.length === 1 ? '1 plugin carries' : `${changedOnes.length} plugins carry`} your changes: {some(changedOnes)}.</span>}
-            {outside.length > 0 && <span className="cx-settings-line">Not in it, left as they are: {some(outside)}.</span>}
           </>
         )}
+        {outside.length > 0 && <span className="cx-settings-line">No matching release: {some(outside)}. Left unchanged.</span>}
         {plan?.offline && <span className="cx-settings-line cx-reset-offline" title={plan.offline}>No official release can be read; the app's own build is the reference.</span>}
       </div>
       <CheckUpdates />
-      <button className="detent warn" type="button" data-action="reset-all" disabled={open || state !== 'differs'} onClick={start}
-        title={state === 'differs' ? 'Every plugin back to the build it should run, your changes dropped' : 'Nothing to reset'}>Reset all plugins…</button>
+      <button className="detent warn" type="button" data-action="reset-all" disabled={open || touched.length === 0} onClick={start}
+        title={touched.length ? 'Every plugin back to the build it should run, your changes dropped' : 'Nothing to reset'}>Reset all plugins…</button>
     </div>
   );
   if (!open) return button;
@@ -189,7 +190,7 @@ export function ResetAll() {
                 <>
                   {plan.offline && <p className="hint" data-reset-offline="">The official releases could not be read ({plan.offline}). The packages this app was built with stand in.</p>}
                   {touched.length === 0
-                    ? <p>Every plugin runs its {plan.offline ? "app's build" : 'official release'}, with no changes of yours. Nothing to reset.</p>
+                    ? <p>{blocked.length ? 'Restart CortexTerm first; plugin updates need the newer frame.' : outside.length ? 'No matching plugins need a reset.' : `Every plugin runs its ${plan.offline ? "app's build" : 'official release'}, with no changes of yours. Nothing to reset.`}</p>
                     : <p>Your changes to {touched.length === 1 ? 'this plugin are' : `these ${touched.length} plugins are`} dropped and the package installed. The frame, your projects and sessions stay. This cannot be undone.</p>}
                   <ul className="cx-reset-list">
                     {plan.plugins.map((item) => (
@@ -239,7 +240,7 @@ export function ResetAll() {
   );
 }
 
-interface CheckStatus { state: string; detail: string; error?: string | null; waiting?: string[]; pending?: unknown[]; round?: { status: string }[]; restart?: unknown | null }
+interface CheckStatus { state: string; detail: string; error?: string | null; waiting?: string[]; pending?: unknown[]; round?: { state: string }[]; restart?: unknown | null }
 
 /** Look at the catalog now (update.check): what applies by itself installs, as the updater's popup
  * shows; here one line says what the check found. */
@@ -252,7 +253,7 @@ function CheckUpdates() {
     setFound(null);
     try {
       const status = await client.call<CheckStatus>('update.check', {});
-      const busy = (status.round ?? []).filter((item) => item.status !== 'done' && item.status !== 'failed').length;
+      const busy = (status.round ?? []).filter((item) => ['queued', 'downloading', 'installing'].includes(item.state)).length;
       setFound(status.error ? `The check failed: ${status.error}`
         : busy > 0 ? `${busy === 1 ? '1 update' : `${busy} updates`} installing`
         : (status.waiting?.length ?? 0) > 0 ? 'Updates wait for the running work to end'
