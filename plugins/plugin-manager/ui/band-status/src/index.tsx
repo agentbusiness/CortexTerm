@@ -13,7 +13,7 @@ function Status() {
   const listed = useQuery<{ plugins: PluginInfo[]; units: PluginUnit[] }>('frame.plugins.list:band', async (client) => {
     const result = await client.call<PluginInfo[] | { plugins: PluginInfo[]; units?: PluginUnit[] }>('frame.plugins.list', {});
     return Array.isArray(result) ? { plugins: result, units: [] } : { plugins: result?.plugins ?? [], units: result?.units ?? [] };
-  }, { topics: ['plugin.state', 'plugin.swapped'] });
+  }, { topics: ['plugin.state', 'plugin.swapped', 'plugin.unit'] });
   const [, setSettings] = useShared<string | null>('settings.open', null);
   const [, setOverlay] = useShared<boolean>('overlay.open', false);
   if (!listed.data) return null;
