@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -430,7 +430,7 @@ fn text_of(dict: &plist::Dictionary, key: &str) -> String {
 
 impl Local {
     /// What `scope` needs of this Mac. Blocking.
-    pub fn gather(scope: Scope) -> Local {
+    pub fn gather(scope: Scope, discovery: &crate::filesystem::Discovery) -> Local {
         let mut local = Local {
             os: run("/usr/bin/sw_vers", &["-productVersion"], STEP).map(|o| o.stdout.trim().to_owned()).unwrap_or_default(),
             safari: info(Path::new("/Applications/Safari.app/Contents/Info.plist"))
@@ -439,13 +439,13 @@ impl Local {
             ..Default::default()
         };
         if scope.updates || scope.apps {
-            local.apps(scope.apps);
+            local.apps(scope.apps, discovery);
         }
         if scope.updates {
             local.toolchains();
         }
         if scope.deps || scope.secrets {
-            local.projects();
+            local.projects(discovery);
         }
         if scope.apps {
             local.extensions();
@@ -454,50 +454,24 @@ impl Local {
         if scope.secrets {
             secret_files(&mut local.part, &local.projects);
         }
+        discovery.report(&mut local.part);
         local
     }
 
     /// What an advisory is compared with: macOS and Safari, the apps (not inspected), the
     /// installed casks and the projects' packages. Blocking.
     pub fn installed() -> Local {
-        let mut local = Local::gather(Scope::default());
-        local.apps(false);
-        local.projects();
+        let discovery = crate::filesystem::Discovery::scan();
+        let mut local = Local::gather(Scope::default(), &discovery);
+        local.apps(false, &discovery);
+        local.projects(&discovery);
         local
     }
 
     /// The apps; `inspect` also checks their signatures and library loading (slower).
-    fn apps(&mut self, inspect: bool) {
-        let mut found = BTreeSet::new();
-        fn collect(dir: &Path, depth: u32, found: &mut BTreeSet<PathBuf>) {
-            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-                let path = entry.path();
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.ends_with(".app") {
-                    found.insert(path);
-                } else if depth > 1 && !name.starts_with('.') && path.is_dir() {
-                    collect(&path, depth - 1, found);
-                }
-            }
-        }
-        let places = [PathBuf::from("/Applications"), home().join("Applications"), home().join("Downloads"), home().join("Desktop")];
-        for place in &places[..2] {
-            collect(place, 2, &mut found);
-        }
-        // Spotlight also finds apps in subfolders, Downloads and the Desktop.
-        match run("/usr/bin/mdfind", &["kMDItemContentType == 'com.apple.application-bundle'"], STEP) {
-            Ok(out) => {
-                for line in out.stdout.lines() {
-                    let path = PathBuf::from(line);
-                    let nested = line.trim_end_matches(".app").contains(".app/") || line.contains("/node_modules/");
-                    let shallow = places.iter().any(|p| path.strip_prefix(p).is_ok_and(|rest| rest.components().count() <= 3));
-                    if !nested && shallow {
-                        found.insert(path);
-                    }
-                }
-            }
-            Err(error) => self.part.skipped.push(format!("Spotlight app search: {error}")),
-        }
+    fn apps(&mut self, inspect: bool, discovery: &crate::filesystem::Discovery) {
+        let mut found: Vec<PathBuf> = discovery.apps.iter().cloned().collect();
+        found.sort_by_key(|path| !path.starts_with(home()));
         for prefix in ["/opt/homebrew/Caskroom", "/usr/local/Caskroom"] {
             for entry in std::fs::read_dir(prefix).into_iter().flatten().flatten() {
                 self.casks_installed.insert(entry.file_name().to_string_lossy().into_owned());
@@ -688,27 +662,25 @@ impl Local {
         self.toolchains = list;
     }
 
-    fn projects(&mut self) {
-        let h = home();
-        let mut roots = BTreeSet::new();
-        // The folders CortexTerm's Runs happened in and the repositories the graph knows, each to
-        // its repository.
+    fn projects(&mut self, discovery: &crate::filesystem::Discovery) {
+        let mut dirs = discovery.projects.clone();
         match places() {
-            Ok(list) => roots.extend(list.iter().filter_map(|p| git_root(Path::new(p)))),
+            Ok(list) => dirs.extend(list.iter().map(PathBuf::from).filter(|p| p.is_dir())),
             Err(error) => self.part.skipped.push(format!("places from CortexTerm's Runs: {error}")),
         }
-        for base in ["DEV", "dev", "Developer", "code", "Code", "projects", "Projects", "src", "work"] {
-            find_git(&h.join(base), 3, &mut roots);
+        let mut projects: BTreeMap<PathBuf, Project> = BTreeMap::new();
+        for dir in dirs {
+            let root = git_root(&dir).unwrap_or_else(|| dir.clone());
+            let project = projects.entry(root.clone()).or_insert_with(|| Project { root: root.clone(), ..Default::default() });
+            if dir.join("pyvenv.cfg").is_file() {
+                read_venv(&dir, project, &mut self.toolchains);
+            }
+            // Discovery already visited every directory, including nested/hidden projects.
+            // Read each directory once, grouping artifacts under its nearest repository.
+            walk_project(&root, &dir, project, &mut self.part);
         }
-        let library = h.join("Library");
-        // ~/DEV and ~/dev are one folder on a case-insensitive disk.
-        let mut seen = HashSet::new();
-        let roots = roots.into_iter().filter(|r| std::fs::metadata(r).is_ok_and(|m| seen.insert((m.dev(), m.ino()))));
-        for root in roots.filter(|r| r != &h && !r.starts_with(&library)).take(80) {
-            let mut project = Project { root: root.clone(), ..Default::default() };
-            walk_project(&root, &root, 3, &mut project, &mut self.toolchains);
-            self.projects.push(project);
-        }
+        self.projects = projects.into_values().collect();
+        self.projects.sort_by_key(|project| !project.root.starts_with(home()));
         let lockfiles: usize = self.projects.iter().map(|p| p.lockfiles.len()).sum();
         self.part.checked.push(format!("projects ({}, with {})", self.projects.len(), plural(lockfiles, "lockfile or venv", "lockfiles and venvs")));
     }
@@ -952,41 +924,23 @@ fn places() -> Result<Vec<String>, String> {
 }
 
 fn git_root(path: &Path) -> Option<PathBuf> {
-    let h = home();
-    path.ancestors().take_while(|p| p.starts_with(&h) && *p != h).find(|p| p.join(".git").exists()).map(Path::to_path_buf)
+    path.ancestors().find(|p| p.join(".git").exists()).map(Path::to_path_buf)
 }
 
-fn find_git(dir: &Path, depth: u32, roots: &mut BTreeSet<PathBuf>) {
-    if dir.join(".git").exists() {
-        roots.insert(dir.to_path_buf());
-        return;
-    }
-    if depth == 0 {
-        return;
-    }
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with('.') && name != "node_modules" && entry.file_type().is_ok_and(|t| t.is_dir()) {
-            find_git(&entry.path(), depth - 1, roots);
+/// Read artifacts in one directory from the complete filesystem discovery.
+fn walk_project(root: &Path, dir: &Path, project: &mut Project, part: &mut Part) {
+    let read = match std::fs::read_dir(dir) {
+        Ok(read) => read,
+        Err(error) => {
+            part.skipped.push(format!("project files in {}: {error}", tilde(dir)));
+            return;
         }
-    }
-}
-
-const SKIP_DIRS: [&str; 14] =
-    ["node_modules", ".git", "target", "dist", "build", "vendor", "__pycache__", "Pods", ".next", "DerivedData", ".build", ".cargo", ".tox", "site-packages"];
-
-/// Lockfiles, Python venvs and .env files of one project, up to `depth` folders down.
-fn walk_project(root: &Path, dir: &Path, depth: u32, project: &mut Project, toolchains: &mut Vec<Toolchain>) {
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+    };
+    for entry in read.flatten() {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Ok(kind) = entry.file_type() else { continue };
-        if kind.is_dir() {
-            if path.join("pyvenv.cfg").is_file() {
-                read_venv(&path, project, toolchains);
-            } else if depth > 0 && !SKIP_DIRS.contains(&name.as_str()) && !(name.starts_with('.') && name != ".github") {
-                walk_project(root, &path, depth - 1, project, toolchains);
-            }
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        if !meta.is_file() {
             continue;
         }
         if name.starts_with(".env") && !["example", "sample", "template", "dist", "defaults"].iter().any(|s| name.contains(s)) {
@@ -1004,11 +958,15 @@ fn walk_project(root: &Path, dir: &Path, depth: u32, project: &mut Project, tool
             _ => continue,
         };
         if entry.metadata().is_ok_and(|m| m.len() > 30 * 1024 * 1024) {
+            part.skipped.push(format!("dependency file {}: larger than 30 MiB", tilde(&path)));
             continue;
         }
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            parser(&text, &mut project.packages);
-            project.lockfiles.push(path.strip_prefix(root).unwrap_or(&path).display().to_string());
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                parser(&text, &mut project.packages);
+                project.lockfiles.push(path.strip_prefix(root).unwrap_or(&path).display().to_string());
+            }
+            Err(error) => part.skipped.push(format!("dependency file {}: {error}", tilde(&path))),
         }
     }
 }
@@ -1424,7 +1382,13 @@ fn secret_files(part: &mut Part, projects: &[Project]) {
     };
     let mut envs = Vec::new();
     for path in projects.iter().flat_map(|p| &p.envs) {
-        let Ok(text) = std::fs::read_to_string(path) else { continue };
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) => {
+                part.skipped.push(format!("secrets in {}: {error}", tilde(path)));
+                continue;
+            }
+        };
         let lines = text.lines().filter(|l| env_re.is_match(l) || shared.iter().any(|(_, s)| s.is_match(l))).count();
         if lines > 0 {
             envs.push(format!("{} ({lines})", tilde(path)));
@@ -1461,8 +1425,8 @@ async fn when(wanted: bool, work: impl Future<Output = Part>) -> Part {
     if wanted { work.await } else { Part::default() }
 }
 
-/// The inventory checks `scope` asks for, in about two minutes at most.
-pub async fn checks(scope: Scope) -> Part {
+/// The inventory checks `scope` asks for; full checks wait for filesystem discovery.
+pub async fn checks(scope: Scope, discovery: crate::filesystem::Shared) -> Part {
     let mut part = Part::default();
     if !cfg!(target_os = "macos") {
         part.skipped.push("installed software: not a Mac".into());
@@ -1480,7 +1444,11 @@ pub async fn checks(scope: Scope) -> Part {
             return part;
         }
     };
-    let gathering = tokio::task::spawn_blocking(move || Local::gather(scope));
+    let gathering = tokio::task::spawn_blocking(move || {
+        let found = discovery.get();
+        if discovery.is_cancelled() { return Local::default(); }
+        Local::gather(scope, found)
+    });
     let (feeds, notes) = match tokio::time::timeout(Duration::from_secs(50), load_feeds(&client)).await {
         Ok(loaded) => loaded,
         Err(_) => {
@@ -1490,21 +1458,21 @@ pub async fn checks(scope: Scope) -> Part {
         }
     };
     part.merge(notes);
-    let local = match tokio::time::timeout(Duration::from_secs(60), gathering).await {
-        Ok(Ok(local)) => local,
-        _ => {
-            part.skipped.push("installed software: reading the apps and projects took longer than 60 s".into());
+    let local = match gathering.await {
+        Ok(local) => local,
+        Err(error) => {
+            part.skipped.push(format!("installed software: filesystem discovery failed: {error}"));
             return part;
         }
     };
     // What is installed goes to the graph first, so the findings below can point at it.
     part.graph.extend(local.graph());
     let (apps, os, eol, deps, docker) = tokio::join!(
-        when(scope.updates, limited("app versions", 45, apps_section(&client, &feeds, &local))),
+        when(scope.updates, apps_section(&client, &feeds, &local)),
         when(scope.updates, limited("macOS and Safari patch level", 30, os_section(&client, &feeds, &local))),
-        when(scope.updates, limited("end-of-life runtimes", 30, eol_section(&client, &local))),
-        when(scope.deps, limited("project dependencies (OSV)", 50, deps_section(&client, &feeds, &local))),
-        when(scope.apps, limited("Docker images", 50, async { tokio::task::spawn_blocking(docker_checks).await.unwrap_or_default() })),
+        when(scope.updates, eol_section(&client, &local)),
+        when(scope.deps, deps_section(&client, &feeds, &local)),
+        when(scope.apps, async { tokio::task::spawn_blocking(docker_checks).await.unwrap_or_default() }),
     );
     for each in [apps, os, eol, deps, docker] {
         part.merge(each);
@@ -1580,22 +1548,25 @@ async fn apps_section(client: &reqwest::Client, feeds: &Feeds, local: &Local) ->
         part.checked.push("app versions (Homebrew cask catalogue)".into());
     }
 
-    // Sparkle feeds for the rest, at most 20, side by side.
-    let mut tasks = tokio::task::JoinSet::new();
-    for (i, app) in apps.iter().enumerate().filter(|(i, _)| latest[*i].is_none()).take(20) {
-        if let Some(url) = app.feed.clone() {
-            let client = client.clone();
-            tasks.spawn(async move {
-                let bytes = tokio::time::timeout(Duration::from_secs(15), get(&client, &url)).await.ok()?.ok()?;
-                Some((i, sparkle_latest(&String::from_utf8_lossy(&bytes))?))
-            });
-        }
-    }
+    // Bound concurrency, not coverage: visit every remaining app with a Sparkle feed.
+    let pending: Vec<usize> = apps.iter().enumerate().filter(|(i, _)| latest[*i].is_none()).map(|(i, _)| i).collect();
     let mut sparkle = 0;
-    while let Some(done) = tasks.join_next().await {
-        if let Ok(Some((i, version))) = done {
-            latest[i] = Some((version, "Sparkle feed"));
-            sparkle += 1;
+    for chunk in pending.chunks(20) {
+        let mut tasks = tokio::task::JoinSet::new();
+        for &i in chunk {
+            if let Some(url) = apps[i].feed.clone() {
+                let client = client.clone();
+                tasks.spawn(async move {
+                    let bytes = tokio::time::timeout(Duration::from_secs(15), get(&client, &url)).await.ok()?.ok()?;
+                    Some((i, sparkle_latest(&String::from_utf8_lossy(&bytes))?))
+                });
+            }
+        }
+        while let Some(done) = tasks.join_next().await {
+            if let Ok(Some((i, version))) = done {
+                latest[i] = Some((version, "Sparkle feed"));
+                sparkle += 1;
+            }
         }
     }
     if sparkle > 0 {
@@ -2057,7 +2028,7 @@ fn docker_checks() -> Part {
         return part;
     };
     let path = path.display().to_string();
-    for image in images.iter().take(3) {
+    for image in &images {
         let out = match tool {
             "grype" => run(&path, &[image.as_str(), "-o", "json", "-q"], Duration::from_secs(40)),
             _ => run(&path, &["scan", "image", "--format", "json", image.as_str()], Duration::from_secs(40)),
@@ -2100,9 +2071,6 @@ fn docker_checks() -> Part {
             Some(format!("docker pull {image}")),
             tool,
         );
-    }
-    if images.len() > 3 {
-        part.skipped.push(format!("Docker image scan: only the first 3 of {} images are scanned each day", images.len()));
     }
     part
 }

@@ -2,6 +2,56 @@
 
 PTY terminals running the user's login shell: `terminal.open`, `terminal.write`, `terminal.resize`, `terminal.close`, `terminal.list`, `terminal.snapshot` (VT-parsed screen text) and `terminal.output` events. The UI package is the right pane's Terminal tab (xterm.js with WebGL).
 
+## Terminal application compatibility (source only)
+
+The shared `terminal@1` additions provide binary input and formatted screen restoration with byte
+offsets. Both apps' terminal panes use one SDK transport for ordered input, mouse bytes, resize and
+reconnect. See [shared contract and release targets](../../docs/SHARED-TERMINAL.md).
+No build, install or live app verification was performed for this change.
+
+## Explicit file editing
+
+`edit` is the only command that opens a built-in view. `nano`, `pico`, `vi`, `vim`, `nvim`, `micro`,
+`top`, `htop`, `btop`, `less`, `more`, `most`, `man` and `tail -f` keep their normal terminal behavior.
+The process sidebar and other built-in views remain available through their own UI controls.
+
+Typing `edit` turns the existing Line green and shows a file picker above it. It lists the focused
+machine's current folder through `terminal.complete`, ranks filename matches by exact match, prefix,
+substring and subsequence, and lets the user browse directories (including `../`, absolute paths and
+`~/`). Hidden entries appear when the filename filter starts with a dot. Results are capped at 12;
+filtering applies to the folder being browsed, without a recursive disk scan. Files with spaces can
+be entered literally, quoted or backslash-escaped. No shell expansion or command execution occurs.
+
+Use ↑↓ to choose, Tab to complete a path, Enter/click to browse a folder or open a file, and Escape to
+cancel. For a nonexistent filename, an explicit Create row opens a new document; saving creates the
+file. The same input returns to shell/chat afterwards, and ⌘I still switches to Ask. Opening and
+saving remote files use the focused machine's existing routing and permissions.
+
+This green EDIT mode intentionally extends the earlier blue SHELL / orange ASK design, as requested
+on 2026-10-31. Source review only: no build, app launch or screenshot comparison was performed; the
+external mockup board could not be retrieved during this change.
+
+## Inline suggestions in the Line
+
+Shell suggestions rank recorded user commands by the current folder and its parents, successful use,
+frequency, recency, and observed command sequences in the same shell (including whether the preceding
+command failed). Commands recorded only as failures and agent/service checks are excluded. The latest
+unexecuted command offered in this shell's conversation takes priority for 30 minutes. When history has
+no match, a single unambiguous live completion can finish the current word.
+
+Ask mode completes prior questions from this shell's Desk conversation, ranked by topic, repetition
+and recency. It also completes questions about the actual latest command, its recorded failure or
+output, and the current folder. These predictions use existing Runs and journal entries without a
+model call, model load, new persistent store, or wire-contract change.
+
+Suggestions only append text. Plain Right Arrow at the end accepts; Escape dismisses the suggestion
+without clearing the input. A selection, cursor in the middle, IME composition, multiline input or
+disabled composer suppresses the ghost. Late responses are ignored after input or shell changes.
+The Tab menu keeps its interaction, with UTF-8 completion offsets translated for the textarea.
+
+Source-reviewed on 2026-10-31. Build, runtime, Gemma/Qwen and 8 GB Mac verification were deliberately
+not performed for this change, as requested.
+
 ## Shells that outlive the app: `cortexd`
 
 The shells belong to `cortexd`, a small daemon shipped beside `cc-terminal` (`backend/src/daemon.rs`, protocol in `wire.rs`, the plugin side in `client.rs`). The plugin is its client; the `terminal@1` contract and events are unchanged.

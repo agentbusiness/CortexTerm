@@ -2,18 +2,20 @@
  * The Line: one input for shell commands and plain language. Before Enter it says what the input
  * is (SHELL / ASK, with AUTO when it decided), what would run, where, what its globs match and how
  * risky it is (`terminal.assess`: the risk engine is code, not the model). Tab completes
- * (`terminal.complete`), → takes the grey history suggestion, ⌘I switches shell / ask.
+ * (`terminal.complete`), → takes the grey contextual suggestion, ⌘I switches shell / ask.
  *
  * The paste guard shows here too: what the scan found (a pasted command reads stronger), the
  * script a `curl … | sh` would run (CHECK SCRIPT FIRST: fetched, scanned, never run), known
  * malware among the packages an install names (OSV), and RUN SANDBOXED (no access to secrets).
  */
 
-import { forwardRef, useEffect, useImperativeHandle, useRef, useState, type KeyboardEvent } from 'react';
-import { useRuntime } from '@cortex/sdk';
+import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { useEvent, useJournal, useRuntime } from '@cortex/sdk';
 import type { Assessment, Completion, Completions, PackageCheck, Run, Script } from './api';
 import { size, shortPath } from './api';
 import { riskLabel } from './TermPane';
+import { byteCursor, contextualSuggestion, inputText, shellSuggestion, textCursor } from './suggestions';
+import { EditFiles, EDIT_FILES_ID, editQuery, useEditFiles } from './EditFiles';
 
 export interface LineHandle {
   focus: () => void;
@@ -22,28 +24,36 @@ export interface LineHandle {
 
 export interface LineProps {
   termId?: string;
+  sessionId?: string;
   home: string;
   disabled?: string | null;
   onShell: (command: string, how: 'here' | 'pane' | 'background' | 'watch') => void;
   onAsk: (text: string, intent: 'ask' | 'explain') => void;
-  onNative: (view: string, target: string | null | undefined, command: string) => boolean;
+  onEdit: (path: string) => void;
 }
 
 type Mode = 'shell' | 'ask' | 'unsure';
+type Client = ReturnType<typeof useRuntime>['client'];
 
 const DANGEROUS = new Set(['delete', 'admin', 'unknown']);
+const NO_RUNS: Run[] = [];
 /** Lines of a fetched script shown before it is explained or run. */
 const SCRIPT_LINES = 40;
 /** What the model is given of a script to explain. */
 const SCRIPT_EXPLAINED = 8000;
 
-export const Line = forwardRef<LineHandle, LineProps>(function Line({ termId, home, disabled, onShell, onAsk, onNative }, ref) {
+export const Line = forwardRef<LineHandle, LineProps>(function Line({ termId, sessionId, home, disabled, onShell, onAsk, onEdit }, ref) {
   const [value, setValue] = useState('');
   const [forced, setForced] = useState<Mode | null>(null);
-  const [assessment, setAssessment] = useState<Assessment | null>(null);
+  const [assessed, setAssessed] = useState<{ termId: string; client: Client; result: Assessment } | null>(null);
   const [completions, setCompletions] = useState<Completions | null>(null);
   const [picked, setPicked] = useState(0);
-  const [suggestion, setSuggestion] = useState<string | null>(null);
+  const [prediction, setPrediction] = useState<{ value: string; termId: string; client: Client; text: string } | null>(null);
+  const [runContext, setRunContext] = useState<{ termId: string; client: Client; runs: Run[] } | null>(null);
+  const [focused, setFocused] = useState(false);
+  const [atEnd, setAtEnd] = useState(true);
+  const [composing, setComposing] = useState(false);
+  const [dismissed, setDismissed] = useState<string | null>(null);
   const [confirm, setConfirm] = useState(false);
   const [preview, setPreview] = useState(false);
   const [history, setHistory] = useState<string[]>([]);
@@ -55,6 +65,32 @@ export const Line = forwardRef<LineHandle, LineProps>(function Line({ termId, ho
   const pasted = useRef(false);
   const input = useRef<HTMLTextAreaElement>(null);
   const client = useRuntime().client;
+  const journal = useJournal(sessionId ?? null);
+  const assessment = assessed?.termId === termId && assessed?.client === client ? assessed.result : null;
+  const editActive = forced !== 'ask' && editQuery(value) !== null;
+  const mode: Mode = forced ?? (editActive ? 'shell' : value.startsWith('?') ? 'ask' : value.startsWith('!') ? 'shell' : assessment?.kind ?? 'shell');
+  const currentInput = useRef({ value, termId, client, mode });
+  currentInput.current = { value, termId, client, mode };
+  const runs = runContext?.termId === termId && runContext?.client === client ? runContext.runs : NO_RUNS;
+  const cwd = assessment?.cwd ?? runs.at(-1)?.cwd ?? '';
+  const contextual = useMemo(() => contextualSuggestion(value, mode, journal.entries, termId, runs, cwd), [value, mode, journal.entries, termId, runs, cwd]);
+  const predicted = prediction?.value === value && prediction.termId === termId && prediction.client === client && mode === 'shell' ? prediction.text : null;
+  const suggestion = focused && atEnd && !composing && !disabled && !editActive && !completions && dismissed !== value ? contextual ?? predicted : null;
+  const filePicker = useEditFiles(value, termId, editActive && !disabled && !composing, (next) => {
+    setValue(next);
+    setCompletions(null);
+    setHistoryAt(-1);
+    requestAnimationFrame(() => {
+      input.current?.focus();
+      input.current?.setSelectionRange(next.length, next.length);
+    });
+  }, (path) => { onEdit(path); reset(); }, () => reset());
+
+  useEffect(() => {
+    setCompletions(null);
+    setHistory([]);
+    setHistoryAt(-1);
+  }, [termId, client]);
 
   useImperativeHandle(ref, () => ({
     focus: () => input.current?.focus(),
@@ -62,6 +98,7 @@ export const Line = forwardRef<LineHandle, LineProps>(function Line({ termId, ho
       pasted.current = false;
       setValue(text);
       setForced('shell');
+      setDismissed(null);
       requestAnimationFrame(() => {
         input.current?.focus();
         input.current?.setSelectionRange(text.length, text.length);
@@ -76,20 +113,62 @@ export const Line = forwardRef<LineHandle, LineProps>(function Line({ termId, ho
     setGuardError('');
     if (!value.trim()) pasted.current = false;
     if (!value.trim() || !termId) {
-      setAssessment(null);
-      setSuggestion(null);
+      setAssessed(null);
       return;
     }
+    let stopped = false;
     const timer = setTimeout(() => {
-      client.call<Assessment>('terminal.assess', { term_id: termId, input: value, pasted: pasted.current }).then(setAssessment).catch(() => setAssessment(null));
-      if (!value.includes('\n')) {
-        client.call<Completions>('terminal.complete', { term_id: termId, line: value, cursor: value.length })
-          .then((result) => setSuggestion(result?.suggestion && result.suggestion.startsWith(value) && result.suggestion !== value ? result.suggestion : null))
-          .catch(() => setSuggestion(null));
-      }
+      client.call<Assessment>('terminal.assess', { term_id: termId, input: value, pasted: pasted.current })
+        .then((result) => { if (!stopped) setAssessed({ termId, client, result }); })
+        .catch(() => { if (!stopped) setAssessed(null); });
     }, 120);
-    return () => clearTimeout(timer);
+    return () => { stopped = true; clearTimeout(timer); };
   }, [value, termId, client]);
+
+  // Only shell mode asks the completion broker. Conversation predictions are local and instant.
+  useEffect(() => {
+    setPrediction(null);
+    if (!termId || !focused || !atEnd || composing || disabled || editActive || mode !== 'shell' || dismissed === value) return;
+    const { text } = inputText(value);
+    if (text.trim().length < 2 || /[\r\n]/.test(text)) return;
+    let stopped = false;
+    const timer = setTimeout(() => {
+      client.call<Completions>('terminal.complete', { term_id: termId, line: text, cursor: byteCursor(text) })
+        .then((result) => {
+          if (stopped || !result) return;
+          const next = shellSuggestion(value, result);
+          if (next) setPrediction({ value, termId, client, text: next });
+        })
+        .catch(() => undefined);
+    }, 160);
+    return () => { stopped = true; clearTimeout(timer); };
+  }, [value, termId, client, mode, focused, atEnd, composing, disabled, editActive, dismissed]);
+
+  // Refresh context on focus and live Run events, not on every keystroke.
+  useEffect(() => {
+    if (!termId || !focused) return;
+    let stopped = false;
+    client.call<{ runs: Run[] }>('terminal.runs', { term_id: termId, limit: 100 })
+      .then((list) => {
+        if (stopped) return;
+        setRunContext((context) => {
+          const all = new Map((list?.runs ?? []).map((run) => [run.id, run]));
+          if (context?.termId === termId && context.client === client) context.runs.forEach((run) => {
+            const fetched = all.get(run.id);
+            if (!fetched || (fetched.ended == null && run.ended != null)) all.set(run.id, run);
+          });
+          return { termId, client, runs: [...all.values()].sort((a, b) => a.started - b.started).slice(-100) };
+        });
+      }).catch(() => undefined);
+    return () => { stopped = true; };
+  }, [termId, client, focused]);
+  useEvent('terminal.run.', (topic, data) => {
+    if (topic !== 'terminal.run.started' && topic !== 'terminal.run.finished') return;
+    const run = data as Run;
+    if (!run || run.term_id !== termId || !termId) return;
+    setRunContext((context) => ({ termId, client, runs: [...(context?.termId === termId && context.client === client ? context.runs : [])
+      .filter((entry) => entry.id !== run.id), run].sort((a, b) => a.started - b.started).slice(-100) }));
+  });
 
   // The packages an install names, looked up in OSV (the network; never in assess itself).
   const installs = assessment && assessment.kind !== 'ask' && assessment.risk !== 'read' ? assessment.text : '';
@@ -116,13 +195,13 @@ export const Line = forwardRef<LineHandle, LineProps>(function Line({ termId, ho
   const loadHistory = () => {
     client.call<{ runs: Run[] }>('terminal.runs', { limit: 100 })
       .then((list) => {
+        if (currentInput.current.client !== client || currentInput.current.termId !== termId) return;
         const seen = new Set<string>();
         setHistory((list?.runs ?? []).map((run) => run.command).filter((command) => command && !seen.has(command) && (seen.add(command), true)));
       })
       .catch(() => undefined);
   };
 
-  const mode: Mode = forced ?? (value.startsWith('?') ? 'ask' : value.startsWith('!') ? 'shell' : assessment?.kind ?? 'shell');
   const text = value.replace(/^[?!]\s*/, '');
   const threats = assessment?.threats ?? [];
   const malware = packages?.packages.filter((p) => p.malicious.length > 0) ?? [];
@@ -132,9 +211,10 @@ export const Line = forwardRef<LineHandle, LineProps>(function Line({ termId, ho
   const reset = () => {
     setValue('');
     setForced(null);
-    setAssessment(null);
+    setAssessed(null);
     setCompletions(null);
-    setSuggestion(null);
+    setPrediction(null);
+    setDismissed(null);
     setConfirm(false);
     setPreview(false);
     setHistoryAt(-1);
@@ -145,15 +225,10 @@ export const Line = forwardRef<LineHandle, LineProps>(function Line({ termId, ho
   };
 
   const submit = (how: 'here' | 'pane' | 'background' | 'watch' = 'here') => {
+    if (editActive) { filePicker.accept(); return; }
     if (!text.trim()) return;
     if (mode !== 'shell') {
       onAsk(text, 'ask');
-      reset();
-      return;
-    }
-    // A tool CortexTerm has its own view for opens there (nothing runs, so nothing to confirm);
-    // `!` in front runs the real one.
-    if (how === 'here' && !value.startsWith('!') && assessment?.native_view && onNative(assessment.native_view, assessment.native_target, text)) {
       reset();
       return;
     }
@@ -169,17 +244,21 @@ export const Line = forwardRef<LineHandle, LineProps>(function Line({ termId, ho
   const complete = () => {
     if (!termId) return;
     const cursor = input.current?.selectionStart ?? value.length;
-    client.call<Completions>('terminal.complete', { term_id: termId, line: value, cursor })
+    const field = input.current;
+    client.call<Completions>('terminal.complete', { term_id: termId, line: value, cursor: byteCursor(value, cursor) })
       .then((result) => {
+        if (currentInput.current.client !== client || currentInput.current.termId !== termId || currentInput.current.mode !== mode) return;
+        if (!field || input.current !== field || field.value !== value || field.selectionStart !== cursor) return;
         if (!result || result.items.length === 0) {
           setCompletions(null);
           return;
         }
-        if (result.items.length === 1) {
-          accept(result, result.items[0]!);
+        const normalized = { ...result, from: textCursor(value, result.from) };
+        if (normalized.items.length === 1) {
+          accept(normalized, normalized.items[0]!);
           return;
         }
-        setCompletions(result);
+        setCompletions(normalized);
         setPicked(0);
       })
       .catch(() => undefined);
@@ -193,6 +272,7 @@ export const Line = forwardRef<LineHandle, LineProps>(function Line({ termId, ho
     const next = `${before}${item.value}${tail}${after}`;
     setValue(next);
     setCompletions(null);
+    setDismissed(null);
     requestAnimationFrame(() => {
       const at = before.length + item.value.length + tail.length;
       input.current?.setSelectionRange(at, at);
@@ -200,6 +280,8 @@ export const Line = forwardRef<LineHandle, LineProps>(function Line({ termId, ho
   };
 
   const onKey = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (composing || event.nativeEvent.isComposing) return;
+    if (filePicker.onKey(event)) return;
     const meta = event.metaKey || event.ctrlKey;
     if (completions) {
       if (event.key === 'ArrowDown') { event.preventDefault(); setPicked((at) => (at + 1) % completions.items.length); return; }
@@ -212,9 +294,12 @@ export const Line = forwardRef<LineHandle, LineProps>(function Line({ termId, ho
       complete();
       return;
     }
-    if (event.key === 'ArrowRight' && suggestion && input.current?.selectionStart === value.length) {
+    if (event.key === 'ArrowRight' && !meta && !event.altKey && !event.shiftKey && suggestion?.startsWith(value)
+      && input.current?.selectionStart === value.length && input.current.selectionEnd === value.length) {
       event.preventDefault();
       setValue(suggestion);
+      setHistoryAt(-1);
+      requestAnimationFrame(() => input.current?.setSelectionRange(suggestion.length, suggestion.length));
       return;
     }
     if (meta && event.key.toLowerCase() === 'i') {
@@ -236,6 +321,7 @@ export const Line = forwardRef<LineHandle, LineProps>(function Line({ termId, ho
     if (event.key === 'Escape') {
       event.preventDefault();
       if (confirm) setConfirm(false);
+      else if (suggestion) setDismissed(value);
       else reset();
       return;
     }
@@ -272,8 +358,9 @@ export const Line = forwardRef<LineHandle, LineProps>(function Line({ termId, ho
   const ghost = suggestion ? suggestion.slice(value.length) : '';
 
   return (
-    <div className={`composer flush ct-line${disabled ? ' off' : ''}`} data-mode={mode}>
-      {completions && (
+    <div className={`composer flush ct-line${disabled ? ' off' : ''}`} data-mode={editActive ? 'edit' : mode}>
+      {editActive && focused && !disabled && <EditFiles picker={filePicker} cwd={shortPath(cwd, home)} termId={termId} />}
+      {!editActive && completions && (
         <ul className="ct-complete" role="listbox" aria-label="Completions">
           {completions.items.slice(0, 12).map((item, index) => (
             <li key={`${item.kind}:${item.value}`} role="option" aria-selected={index === picked} className={index === picked ? 'on' : ''}
@@ -287,32 +374,42 @@ export const Line = forwardRef<LineHandle, LineProps>(function Line({ termId, ho
           <li className="ct-complete-foot ct-label ct-faint">⇥ ACCEPT · ↑↓ CHOOSE · ESC CLOSE</li>
         </ul>
       )}
-      <div className={`ct-write${mode === 'shell' ? ' shell' : ' ask'}`} onMouseDown={(event) => { if (event.target === event.currentTarget) { event.preventDefault(); input.current?.focus(); } }}>
+      <div className={`ct-write${editActive ? ' edit' : mode === 'shell' ? ' shell' : ' ask'}`} onMouseDown={(event) => { if (event.target === event.currentTarget) { event.preventDefault(); input.current?.focus(); } }}>
         <button type="button" className="ct-mode" onClick={() => setForced(mode === 'shell' ? 'ask' : 'shell')}
-          title={auto ? 'Decided from what you type · click or ⌘I to switch' : 'Click or ⌘I to switch'}>{mode === 'shell' ? 'SHELL' : 'ASK'}</button>
+          title={editActive ? 'Find a file · Escape to cancel · click or ⌘I to ask about this text' : auto ? 'Decided from what you type · click or ⌘I to switch' : 'Click or ⌘I to switch'}>{editActive ? 'EDIT' : mode === 'shell' ? 'SHELL' : 'ASK'}</button>
         <div className="ct-write-field">
           <div className="ct-line-mirror" aria-hidden>
-            {mode === 'shell' ? highlight(value) : <span>{value}</span>}
+            {mode === 'shell' && !editActive ? highlight(value) : <span>{value}</span>}
             <span className="ct-ghost">{ghost}</span>
           </div>
           <textarea
             ref={input}
             className="ct-line-input"
-            aria-label="Command or question"
+            aria-label={editActive ? 'Find a file to edit' : 'Command or question'}
+            role={editActive ? 'combobox' : undefined}
+            aria-expanded={editActive ? focused : undefined}
+            aria-controls={editActive && focused ? EDIT_FILES_ID : undefined}
+            aria-activedescendant={editActive && focused && filePicker.items[filePicker.picked] ? `${EDIT_FILES_ID}-${filePicker.picked}` : undefined}
             rows={1}
             spellCheck={false}
+            aria-autocomplete={editActive ? 'list' : 'inline'}
             value={value}
             disabled={Boolean(disabled)}
-            placeholder={disabled ?? (termId ? 'Type a command, or ask in plain words…   ⇥ complete · ↑ history' : 'Open a shell to run commands (⌘T), or ask in plain words…')}
-            onFocus={loadHistory}
-            onChange={(event) => { setValue(event.target.value); setHistoryAt(-1); setCompletions(null); }}
+            placeholder={disabled ?? (termId ? 'Type a command, ask in plain words, or edit to find a file…' : 'Open a shell to run commands (⌘T), or ask in plain words…')}
+            onFocus={() => { setFocused(true); loadHistory(); }}
+            onBlur={() => setFocused(false)}
+            onSelect={(event) => setAtEnd(event.currentTarget.selectionStart === value.length && event.currentTarget.selectionEnd === value.length)}
+            onChange={(event) => { setValue(event.target.value); setHistoryAt(-1); setCompletions(null); setDismissed(null);
+              setAtEnd(event.target.selectionStart === event.target.value.length && event.target.selectionEnd === event.target.value.length); }}
+            onCompositionStart={() => setComposing(true)}
+            onCompositionEnd={() => setComposing(false)}
             onPaste={() => { pasted.current = true; }}
             onKeyDown={onKey}
           />
         </div>
         <div className="ct-line-acts">
-          {value.trim() && <button type="button" className="ct-more-btn" aria-expanded={more} onClick={() => setMore((open) => !open)} title="More ways to run it">⋯</button>}
-          {more && (
+          {value.trim() && !editActive && <button type="button" className="ct-more-btn" aria-expanded={more} onClick={() => setMore((open) => !open)} title="More ways to run it">⋯</button>}
+          {more && !editActive && (
             <div className="ct-line-menu" role="menu" onMouseLeave={() => setMore(false)}>
               {mode === 'shell' ? (<>
                 <button type="button" role="menuitem" onClick={() => { setMore(false); setPreview((shown) => !shown); }}>Preview what it touches <span className="k">⌥↵</span></button>
@@ -325,25 +422,26 @@ export const Line = forwardRef<LineHandle, LineProps>(function Line({ termId, ho
               )}
             </div>
           )}
-          <button type="button" className={`ct-send${confirm ? ' confirm' : ''}`} disabled={!value.trim()} onClick={() => submit('here')}>
-            {mode === 'shell' ? (confirm ? 'CONFIRM' : 'RUN') : 'ASK'} <span aria-hidden>↵</span>
+          <button type="button" className={`ct-send${confirm && !editActive ? ' confirm' : ''}`}
+            disabled={editActive ? filePicker.busy || filePicker.opening || !termId || (filePicker.picked < 0 && !editQuery(value)?.trim()) : !value.trim()}
+            onClick={() => submit('here')}>
+            {editActive ? (filePicker.opening ? 'OPENING' : filePicker.items[filePicker.picked]?.kind === 'dir' ? 'BROWSE' : filePicker.items[filePicker.picked]?.kind === 'new' ? 'CREATE' : 'OPEN') : mode === 'shell' ? (confirm ? 'CONFIRM' : 'RUN') : 'ASK'} <span aria-hidden>↵</span>
           </button>
         </div>
       </div>
-      {value.trim() && mode === 'shell' && assessment && (confirm || !assessment.safe || (assessment.matches && assessment.matches.files + assessment.matches.dirs > 0) || (assessment.native_view && !value.startsWith('!'))) && (
+      {value.trim() && !editActive && mode === 'shell' && assessment && (confirm || !assessment.safe || (assessment.matches && assessment.matches.files + assessment.matches.dirs > 0)) && (
         <div className={`ct-preview${confirm ? ' confirm' : ''}`}>
           {assessment.program && <span><span className="ct-faint">RUNS</span> {assessment.program}</span>}
           <span><span className="ct-faint">IN</span> {shortPath(assessment.cwd, home)}</span>
           {matches && (matches.files + matches.dirs > 0) && (
             <span><span className="ct-faint">MATCHES</span> {matches.dirs > 0 ? `${matches.dirs} folders + ` : ''}{matches.files} files · {size(matches.bytes)}</span>
           )}
-          {!(assessment.native_view && !value.startsWith('!')) && <span className={`ct-label ${assessment.safe ? 'ct-ok' : 'ct-warn'}`}>{riskLabel(assessment)}{!assessment.safe && DANGEROUS.has(assessment.risk) ? ' · ASKS FIRST' : ''}</span>}
+          <span className={`ct-label ${assessment.safe ? 'ct-ok' : 'ct-warn'}`}>{riskLabel(assessment)}{!assessment.safe && DANGEROUS.has(assessment.risk) ? ' · ASKS FIRST' : ''}</span>
           {assessment.reasons.length > 0 && <span className="ct-faint">{assessment.reasons.join(' · ')}</span>}
-          {assessment.native_view && !value.startsWith('!') && <span className="ct-label ct-blue">OPENS IN CORTEXTERM · ! FOR THE REAL ONE</span>}
           {confirm && <span className="ct-label ct-warn">PRESS ↵ AGAIN TO RUN · ESC TO STOP</span>}
         </div>
       )}
-      {value.trim() && mode === 'shell' && (threats.length > 0 || malware.length > 0 || vulnerable.length > 0) && (
+      {value.trim() && !editActive && mode === 'shell' && (threats.length > 0 || malware.length > 0 || vulnerable.length > 0) && (
         <div className="ct-preview-list">
           {threats.map((threat) => (
             <div key={threat.rule}><span className="ct-label ct-warn">{threat.severity === 'high' ? 'DANGER' : 'CAUTION'}</span> {threat.text}</div>

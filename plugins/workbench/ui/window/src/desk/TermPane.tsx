@@ -11,22 +11,18 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
 import '@xterm/xterm/css/xterm.css';
-import { activeTheme, currentGround, useRuntime, subscribeTheme, useEvent, useJournal, type TermSnapshot } from '@cortex/sdk';
+import { activeTheme, currentGround, useRuntime, subscribeTheme, useEvent, useJournal, connectTerminal } from '@cortex/sdk';
 import type { Ask, Assessment, OutputLine, Run, RunOutput, Threat } from './api';
 import { quote, seconds, shortPath } from './api';
 import { live, useLive, type PaneRec } from './store';
 import { LineActions, RunPane } from './Views';
+import { CommandOutput } from './CommandOutput';
+import { TerminalProgress, type RunProgress, type ProgressItem } from './terminal-progress';
 
 function palette() {
   return activeTheme()?.xterm[currentGround()];
 }
 
-function decodeBase64(data: string): Uint8Array {
-  const binary = atob(data);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-}
 
 export interface TermActions {
   runCommand: (termId: string, command: string) => void;
@@ -36,14 +32,12 @@ export interface TermActions {
   explain: (pane: PaneRec, text: string) => void;
 }
 
-/** Lines a finished block shows before "N more lines". */
-const SHOWN_LINES = 24;
 /** Lines fetched per block (the full output is the LOG view's). */
 const FETCHED_LINES = 400;
 /** Blocks kept in the stream (older ones stay in the Run ledger). */
 const KEPT_RUNS = 60;
 
-export function TermPane({ pane, focused, sessionId, computer, home, onFocus, actions }: {
+export function TermPane({ pane, focused, sessionId, computer, home, onFocus, onKeyboard, actions }: {
   pane: PaneRec;
   focused: boolean;
   sessionId?: string;
@@ -52,6 +46,7 @@ export function TermPane({ pane, focused, sessionId, computer, home, onFocus, ac
   home: string;
   slot: number;
   onFocus: () => void;
+  onKeyboard: (termId: string, active: boolean) => void;
   onShelf: () => void;
   onClose: () => void;
   actions: TermActions;
@@ -63,24 +58,41 @@ export function TermPane({ pane, focused, sessionId, computer, home, onFocus, ac
   }, [termId, pane.node]);
   const state = live.states.get(termId);
   const [raw, setRaw] = useState(false);
-  // A program that needs the keyboard gets the live terminal; it goes back to the stream after.
-  // Only a full-screen program (vim, htop) takes the live terminal; a quiet command never does.
-  const needsKeys = Boolean(state?.alternate_screen);
-  const showTerminal = raw || needsKeys;
+  const [alternate, setAlternate] = useState(false);
+  const [progress, setProgress] = useState<RunProgress>({ runId: null, items: [] });
+  // Raw foreground jobs and alternate-screen apps use the same real terminal. A shell whose
+  // integration is unavailable stays usable through the terminal rather than an inert stream.
+  const needsKeys = Boolean(alternate || state?.interactive || state?.alternate_screen);
+  const showTerminal = raw || needsKeys || !state?.integrated;
+  const wasTerminal = useRef(showTerminal);
+  useEffect(() => {
+    if (termId) onKeyboard(termId, showTerminal);
+    return () => { if (termId) onKeyboard(termId, false); };
+  }, [termId, showTerminal, onKeyboard]);
+  useEffect(() => {
+    const returned = wasTerminal.current && !showTerminal;
+    wasTerminal.current = showTerminal;
+    if (returned && focused) {
+      const frame = requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('.ct-line-input')?.focus());
+      return () => cancelAnimationFrame(frame);
+    }
+  }, [showTerminal, focused]);
 
   return (
     <section className={`ct-pane ct-term${focused ? ' focused' : ''}`} onMouseDown={onFocus} aria-label={`Shell ${pane.title}`}>
       <div className="ct-term-float">
         {computer && <span className="ct-label ct-blue">{computer.toUpperCase()}</span>}
-        <Crumbs cwd={state?.cwd || pane.cwd} home={home} branch={state?.git_branch ?? null} onGo={(path) => actions.runCommand(termId, `cd ${quote(path)}`)} />
+        <Crumbs cwd={state?.cwd || pane.cwd} home={home} branch={state?.git_branch ?? null} onGo={(path) => { if (state?.at_prompt) actions.runCommand(termId, `cd ${quote(path)}`); }} />
         <span className="grow" />
         {state?.running && <span className="ct-label ct-blue">RUNNING</span>}
-        {needsKeys && <span className="ct-label ct-lift">THE PROGRAM HAS THE KEYBOARD</span>}
-        <button type="button" className="ct-act" disabled={needsKeys} onClick={() => setRaw((value) => !value)}
+        {needsKeys && <span className="ct-label ct-lift" title={state?.running?.command}>THE PROGRAM HAS THE KEYBOARD</span>}
+        <button type="button" className="ct-act" disabled={needsKeys || !state?.integrated} onClick={() => setRaw((value) => !value)}
           title="The live terminal, as the shell draws it">{showTerminal ? 'blocks' : 'terminal'}</button>
       </div>
-      {termId && !showTerminal && <Stream pane={pane} termId={termId} sessionId={sessionId} home={home} actions={actions} />}
-      {termId ? <XTerm termId={termId} visible={showTerminal} focused={focused} /> : <p className="ct-empty">This pane has no shell.</p>}
+      {termId && <div className={`ct-blocks${showTerminal ? ' hidden' : ''}`} inert={showTerminal || undefined}>
+        <Stream pane={pane} termId={termId} sessionId={sessionId} home={home} actions={actions} progress={progress} visible={!showTerminal} />
+      </div>}
+      {termId ? <XTerm termId={termId} runId={state?.running?.id ?? null} visible={showTerminal} focused={focused} onProgress={setProgress} onAlternate={setAlternate} /> : <p className="ct-empty">This pane has no shell.</p>}
     </section>
   );
 }
@@ -177,7 +189,7 @@ function useExchanges(sessionId: string | undefined, termId: string): { exchange
   return { exchanges, loaded: journal.status !== 'loading' };
 }
 
-function Stream({ pane, termId, sessionId, home, actions }: { pane: PaneRec; termId: string; sessionId?: string; home: string; actions: TermActions }) {
+function Stream({ pane, termId, sessionId, home, actions, progress, visible }: { pane: PaneRec; termId: string; sessionId?: string; home: string; actions: TermActions; progress: RunProgress; visible: boolean }) {
   const runs = useRuns([termId, ...(pane.workers ?? [])]);
   const { exchanges, loaded } = useExchanges(sessionId, termId);
   const scroller = useRef<HTMLDivElement>(null);
@@ -242,7 +254,7 @@ function Stream({ pane, termId, sessionId, home, actions }: { pane: PaneRec; ter
       }}>
         <div className="ct-stream-inner" ref={content}>
           {items.map((item) => item.kind === 'run'
-            ? <RunBlock key={item.run.id} run={item.run} pane={pane} home={home} actions={actions} latest={item.run.id === runs.at(-1)?.id} />
+            ? <RunBlock key={item.run.id} run={item.run} pane={pane} home={home} actions={actions} latest={item.run.id === runs.at(-1)?.id} progress={progress.runId === item.run.id ? progress.items : []} visible={visible} />
             : <AskBlock key={`ask:${item.exchange.runId}`} exchange={item.exchange} pane={pane} termId={termId} actions={actions} fromHistory={Boolean(known.current?.has(item.exchange.runId))} />)}
         </div>
       </div>
@@ -256,23 +268,39 @@ function Stream({ pane, termId, sessionId, home, actions }: { pane: PaneRec; ter
   );
 }
 
-function RunBlock({ run, pane, home, actions, latest }: { run: Run; pane: PaneRec; home: string; actions: TermActions; latest: boolean }) {
+function RunBlock({ run, pane, home, actions, latest, progress, visible }: { run: Run; pane: PaneRec; home: string; actions: TermActions; latest: boolean; progress: ProgressItem[]; visible: boolean }) {
   const client = useRuntime().client;
   const [output, setOutput] = useState<RunOutput | null>(null);
+  const outputRef = useRef(output);
+  outputRef.current = output;
+  // A fixed line window keeps the reader's place when the live tail moves beyond 400 lines.
+  const windowFrom = useRef<number | null>(null);
+  const windowVersion = useRef(0);
+  const readOutput = useRef<() => void>(() => undefined);
   // Open by default: a card shows its output; folding one is the person's choice.
   const [open, setOpen] = useState(true);
   void latest;
-  const [all, setAll] = useState(false);
   const [view, setView] = useState<'out' | 'table' | 'log' | 'errors'>('out');
   const running = run.ended == null;
   const failed = run.exit_code != null && run.exit_code !== 0;
 
   useEffect(() => {
-    if (!open || run.fullscreen) return;
+    if (!visible || !open || run.fullscreen) return;
     let stopped = false;
-    const read = () => client.call<RunOutput>('terminal.run.output', { run_id: run.id, from: -FETCHED_LINES, count: FETCHED_LINES })
-      .then((result) => { if (!stopped) setOutput(result); })
-      .catch(() => undefined);
+    let pending = false;
+    const read = () => {
+      if (pending) return;
+      pending = true;
+      const version = windowVersion.current;
+      void client.call<RunOutput>('terminal.run.output', { run_id: run.id, from: windowFrom.current ?? -FETCHED_LINES, count: FETCHED_LINES })
+        .then((result) => { if (!stopped && version === windowVersion.current) setOutput(result); })
+        .catch(() => undefined)
+        .finally(() => {
+          pending = false;
+          if (!stopped && version !== windowVersion.current) read();
+        });
+    };
+    readOutput.current = read;
     void read();
     if (!running) return () => { stopped = true; };
     const timer = setInterval(read, 500);
@@ -280,13 +308,15 @@ function RunBlock({ run, pane, home, actions, latest }: { run: Run; pane: PaneRe
       stopped = true;
       clearInterval(timer);
     };
-  }, [open, run.id, running, run.fullscreen, run.lines, client]);
+  }, [visible, open, run.id, running, run.fullscreen, run.lines, client]);
 
-  // Progress bars and spinners redraw the same line many times; the card shows each one's latest frame.
-  const lines = useMemo(() => collapseProgress(output?.lines ?? []), [output]);
-  const hidden = all || running ? 0 : Math.max(0, lines.length - SHOWN_LINES);
-  const shown = hidden ? lines.slice(-SHOWN_LINES) : lines;
-  const more = (output ? output.total : run.lines) - shown.length;
+  const lines = output?.lines ?? [];
+  const followOutput = (following: boolean) => {
+    windowFrom.current = following ? null : (outputRef.current?.lines[0]?.n ?? 0);
+    windowVersion.current += 1;
+    readOutput.current();
+  };
+  const earlier = lines[0]?.n ?? 0;
   const table = useMemo(() => toTable(lines.map((line) => line.text), run.format), [lines, run.format]);
   const views: ['out' | 'table' | 'log' | 'errors', string][] = [['out', 'output']];
   if (table) views.push(['table', 'table']);
@@ -314,26 +344,39 @@ function RunBlock({ run, pane, home, actions, latest }: { run: Run; pane: PaneRe
           </span>
         )}
       </header>
+      {running && progress.length > 0 && <div className="ct-command-progress">
+        {progress.map((item, index) => <div key={index} className={`ct-progress ${item.state}`}>
+          <div className="ct-progress-label"><span title={item.label}>{item.label}</span>
+            <span>{item.state === 'error' ? 'error' : item.state === 'paused' ? 'paused' : item.percent === null ? 'working' : `${Math.round(item.percent)}%`}</span>
+          </div>
+          <div className="ct-progress-track" role="progressbar" aria-label={item.label} aria-valuemin={0} aria-valuemax={100}
+            aria-valuenow={item.percent ?? undefined} aria-valuetext={item.percent === null ? 'Working; progress unknown' : `${Math.round(item.percent)} percent reported by the program`}>
+            <span style={item.percent === null ? undefined : { width: `${item.percent}%` }} />
+          </div>
+        </div>)}
+      </div>}
       {open && view === 'table' && table && <TableView table={table} />}
       {open && view === 'log' && <div className="ct-block-log"><RunPane pane={{ id: `log-${run.id}`, kind: 'run', title: run.command, cwd: run.cwd, runId: run.id }} focused={false} bare inCard home={home} onRun={(command) => actions.runCommand(run.term_id, command)} onFocus={() => undefined} onShelf={() => undefined} onClose={() => setView('out')} onAsk={(text, intent, runId) => intent === 'fix' ? actions.fix(pane, run) : actions.explain(pane, runId ? text : text)} /></div>}
       {open && view === 'errors' && (
-        <div className="ct-block-out ct-mono">
+        <CommandOutput className="ct-block-out ct-mono" label="Command warnings and errors" initialFollowing={windowFrom.current === null} onFollowChange={followOutput}>
           {lines.filter((line) => line.level === 'error' || line.level === 'warn').map((line) => <Ansi key={line.n} line={line} />)}
-        </div>
+        </CommandOutput>
       )}
-      {open && view === 'out' && !run.fullscreen && shown.length > 0 && (
-        <div className="ct-block-out ct-mono">
-          {hidden > 0 && <button type="button" className="ct-more" onClick={() => setAll(true)}>{hidden} earlier lines</button>}
-          {shown.map((line) => (
+      {open && view === 'out' && !run.fullscreen && lines.length > 0 && (
+        <CommandOutput className="ct-block-out ct-mono" label="Command output" initialFollowing={windowFrom.current === null} onFollowChange={followOutput}
+          earlier={earlier} onEarlier={() => {
+            windowFrom.current = Math.max(0, earlier - FETCHED_LINES);
+            windowVersion.current += 1;
+            readOutput.current();
+          }}>
+          {lines.map((line) => (
             <div key={line.n} className="ct-line-wrap">
               <Ansi line={line} />
-              {(line as Collapsed).frames ? <span className="ct-frames">↻ {(line as Collapsed).frames}</span> : null}
               {line.hidden ? <span className="ct-frames ct-warn" title="Invisible characters or terminal codes were removed from this line; you and the assistant read the same text">hidden text removed</span> : null}
               <LineActions text={line.text} cwd={run.cwd} command={run.command} onExplain={(text) => actions.explain(pane, text)} onRun={(command) => actions.runCommand(run.term_id, command)} />
             </div>
           ))}
-          {more > 0 && !running && all && lines.length < (output?.total ?? 0) && <button type="button" className="ct-more" onClick={() => actions.openRun(run)}>{(output?.total ?? 0) - lines.length} more in the log view</button>}
-        </div>
+        </CommandOutput>
       )}
       {open && run.fullscreen && <p className="ct-block-note ct-faint">full-screen program</p>}
       {running && !run.fullscreen && <AskRow run={run} />}
@@ -370,30 +413,6 @@ function Crumbs({ cwd, home, branch, onGo }: { cwd: string; home: string; branch
       {branch && <span className="ct-crumb-branch" title="git branch"><span aria-hidden>⎇ </span>{branch}</span>}
     </nav>
   );
-}
-
-type Collapsed = OutputLine & { frames?: number };
-
-/** A redrawn line's shape without what changes between frames: numbers, bars, spinner glyphs. */
-function frameKey(text: string): string {
-  return text.replace(/[\d.,:%/]+/g, '0').replace(/[#=>\-─━█▓▒░|*·⠁-⣿⢀-⣿\s]+/g, ' ').replace(/[^\x20-\x7e]/g, '').trim();
-}
-
-/** Consecutive frames of the same redrawn line (within a few lines, for several bars at once) become one. */
-function collapseProgress(lines: OutputLine[]): Collapsed[] {
-  const out: Collapsed[] = [];
-  const recent = new Map<string, number>();
-  for (const line of lines) {
-    const key = frameKey(line.text);
-    const at = key.length > 3 ? recent.get(key) : undefined;
-    if (at !== undefined && out.length - at <= 8 && /\d/.test(line.text)) {
-      out[at] = { ...line, frames: (out[at]!.frames ?? 1) + 1 };
-      continue;
-    }
-    if (key.length > 3) recent.set(key, out.length);
-    out.push(line);
-  }
-  return out;
 }
 
 interface Table { head: string[]; rows: string[][] }
@@ -681,7 +700,7 @@ function CheckStep({ step }: { step: Step }) {
           {step.running ? <span className="ct-blue">running</span> : step.exitCode === null ? <span className="ct-warn">stopped</span> : step.exitCode === 0 ? <span className="ct-ok">✓</span> : <span className="ct-warn">✗ exit {step.exitCode}</span>}
         </span>
       </button>
-      {open && !step.running && <pre className="ct-check-out ct-mono">{step.output || '(no output)'}</pre>}
+      {open && <CommandOutput className="ct-check-out ct-mono" label="Assistant command output" freezeWhilePaused>{step.output || (step.running ? 'Waiting for output…' : '(no output)')}</CommandOutput>}
     </div>
   );
 }
@@ -698,11 +717,18 @@ export function riskLabel(risk: Assessment): string {
  * The live terminal. Text pasted straight into it goes through the paste guard first
  * (`terminal.scan`): a paste with a high finding is held until the person says to paste it.
  */
-function XTerm({ termId, visible, focused }: { termId: string; visible: boolean; focused: boolean }) {
+function XTerm({ termId, runId, visible, focused, onProgress, onAlternate }: { termId: string; runId: string | null; visible: boolean; focused: boolean; onProgress: (progress: RunProgress) => void; onAlternate: (active: boolean) => void }) {
   const host = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
-  const [held, setHeld] = useState<{ text: string; threats: Threat[] } | null>(null);
+  const progressRef = useRef<TerminalProgress | null>(null);
+  const onProgressRef = useRef(onProgress);
+  onProgressRef.current = onProgress;
+  const [held, setHeld] = useState<{ text: string; threats: Threat[]; runId: string | null } | null>(null);
+  const [problem, setProblem] = useState('');
+  const transportRef = useRef<ReturnType<typeof connectTerminal> | null>(null);
+  const view = useRef({ visible, focused });
+  view.current = { visible, focused };
   const client = useRuntime().client;
 
   useEffect(() => {
@@ -714,6 +740,7 @@ function XTerm({ termId, visible, focused }: { termId: string; visible: boolean;
       lineHeight: 1.2,
       cursorBlink: true,
       cursorStyle: 'block',
+      macOptionIsMeta: true,
       allowProposedApi: true,
       scrollback: 5_000,
       theme: palette(),
@@ -723,6 +750,15 @@ function XTerm({ termId, visible, focused }: { termId: string; visible: boolean;
     term.open(element);
     termRef.current = term;
     fitRef.current = fit;
+    const progress = new TerminalProgress(term, (value) => onProgressRef.current(value));
+    progressRef.current = progress;
+    progress.setRun(live.states.get(termId)?.running?.id ?? null);
+    const offProgress = client.on('terminal.output', (_topic, data) => {
+      const event = data as { term_id?: string; data?: string };
+      if (event?.term_id !== termId || typeof event.data !== 'string') return;
+      progress.setRun(live.states.get(termId)?.running?.id ?? null);
+      progress.observe(Uint8Array.from(atob(event.data), (char) => char.charCodeAt(0)));
+    });
     try {
       const webgl = new WebglAddon();
       webgl.onContextLoss(() => webgl.dispose());
@@ -730,54 +766,42 @@ function XTerm({ termId, visible, focused }: { termId: string; visible: boolean;
     } catch {
       // DOM renderer.
     }
-    let lastSize = '';
     const resize = () => {
       if (!element.offsetWidth || !element.offsetHeight) return;
-      try {
-        fit.fit();
-      } catch {
-        return;
-      }
-      const sizeKey = `${term.cols}x${term.rows}`;
-      if (sizeKey === lastSize) return;
-      lastSize = sizeKey;
-      void client.call('terminal.resize', { term_id: termId, cols: term.cols, rows: term.rows }).catch(() => undefined);
+      try { fit.fit(); } catch { /* The pane has not been laid out yet. */ }
     };
-    let attached = false;
-    const queued: Uint8Array[] = [];
-    const offOutput = client.on('terminal.output', (_topic, data) => {
-      const event = data as { term_id?: string; data?: string };
-      if (event?.term_id !== termId || typeof event.data !== 'string') return;
-      const bytes = decodeBase64(event.data);
-      if (attached) term.write(bytes);
-      else queued.push(bytes);
+    const bufferChange = term.buffer.onBufferChange((buffer) => onAlternate(buffer.type === 'alternate'));
+    const transport = connectTerminal(client, term, termId, {
+      onReady: () => {
+        setProblem('');
+        resize();
+        if (view.current.visible && view.current.focused) term.focus();
+      },
+      onError: (message) => setProblem(message),
     });
-    client.call<TermSnapshot>('terminal.snapshot', { term_id: termId })
-      .then((snapshot) => {
-        if (snapshot?.text) {
-          term.write(snapshot.text.replace(/\n/g, '\r\n'));
-          term.write(`\x1b[${snapshot.cursor_row + 1};${snapshot.cursor_col + 1}H`);
-        }
-      })
-      .catch(() => undefined)
-      .finally(() => {
-        attached = true;
-        for (const bytes of queued.splice(0)) term.write(bytes);
-      });
-    const input = term.onData((data) => void client.call('terminal.write', { term_id: termId, data }).catch(() => undefined));
+    transportRef.current = transport;
+    let alive = true;
     // Before xterm sees a paste: scan it, and hold it when the scan finds something grave.
     const onPaste = (event: ClipboardEvent) => {
       const text = event.clipboardData?.getData('text/plain') ?? '';
       if (!text) return;
       event.preventDefault();
       event.stopImmediatePropagation();
+      const runId = live.states.get(termId)?.running?.id ?? null;
       client.call<{ threats: Threat[] }>('terminal.scan', { text, pasted: true })
         .then((result) => {
+          if (!alive) return;
+          if ((live.states.get(termId)?.running?.id ?? null) !== runId) {
+            setProblem('Paste cancelled because the program changed. Paste again into the current screen.');
+            return;
+          }
           const high = (result?.threats ?? []).filter((threat) => threat.severity === 'high');
-          if (high.length) setHeld({ text, threats: high });
+          if (high.length) setHeld({ text, threats: high, runId });
           else term.paste(text);
         })
-        .catch(() => term.paste(text));
+        .catch(() => {
+          if (alive && (live.states.get(termId)?.running?.id ?? null) === runId) term.paste(text);
+        });
     };
     element.addEventListener('paste', onPaste, true);
     const observer = new ResizeObserver(() => resize());
@@ -789,16 +813,23 @@ function XTerm({ termId, visible, focused }: { termId: string; visible: boolean;
     };
     const offTheme = subscribeTheme(restyle);
     return () => {
-      offOutput();
-      input.dispose();
+      alive = false;
+      transport.dispose();
+      bufferChange.dispose();
+      transportRef.current = null;
       element.removeEventListener('paste', onPaste, true);
       observer.disconnect();
       offTheme();
+      offProgress();
+      progress.dispose();
+      progressRef.current = null;
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
     };
-  }, [termId, client]);
+  }, [termId, client, onAlternate]);
+
+  useEffect(() => { progressRef.current?.setRun(runId); }, [runId]);
 
   // Shown: fit to the pane and take the keyboard.
   useEffect(() => {
@@ -814,13 +845,15 @@ function XTerm({ termId, visible, focused }: { termId: string; visible: boolean;
   }, [visible, focused]);
 
   const pasteAnyway = () => {
-    if (held) termRef.current?.paste(held.text);
+    if (held && (live.states.get(termId)?.running?.id ?? null) === held.runId) termRef.current?.paste(held.text);
+    else if (held) setProblem('Paste cancelled because the program changed. Paste again into the current screen.');
     setHeld(null);
     termRef.current?.focus();
   };
 
   return (
     <>
+      {problem && visible && <p className="ct-hint ct-warn" role="status">Terminal: {problem} <button type="button" className="ct-act" onClick={() => transportRef.current?.refresh()}>retry</button></p>}
       {held && visible && (
         <div className="ct-asks" onKeyDown={(event) => { if (event.key === 'Escape') { event.preventDefault(); setHeld(null); termRef.current?.focus(); } }}>
           <div className="ct-asks-head">

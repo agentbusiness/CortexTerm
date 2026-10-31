@@ -2,13 +2,13 @@
 .ct-side-toolbar{display:flex;align-items:center;flex-wrap:wrap;column-gap:18px;row-gap:10px;flex:0 0 auto;}
 #cc .ct-side-toolbar .ct-side-tabs{padding:0;gap:16px;}
 .ct-computer-controls{display:flex;align-items:center;gap:6px;min-width:0;max-width:100%;}
-.ct-computer-picker{position:relative;display:flex;align-items:center;gap:7px;min-width:0;border:1px solid var(--rule-2);background:var(--ground);padding:0 8px;height:28px;transition:border-color 140ms ease;}
-.ct-computer-picker:hover{border-color:var(--ink-3);}
-.ct-computer-picker:focus-within{outline:1px solid var(--counter);outline-offset:2px;}
+.ct-computer-picker{min-width:0;max-width:100%;}
+#cc .ct-computer-trigger{display:flex;align-items:center;gap:7px;min-width:0;max-width:100%;height:28px;padding:0 8px;border:1px solid var(--rule-2);background:var(--ground);color:var(--ink);font:600 9.5px Archivo,sans-serif;letter-spacing:.1em;text-transform:uppercase;cursor:pointer;transition:border-color 140ms ease;}
+#cc .ct-computer-trigger:hover,#cc .ct-computer-trigger[aria-expanded="true"]{border-color:var(--ink-3);}
+#cc .ct-computer-trigger:focus-visible{outline:1px solid var(--counter);outline-offset:2px;}
 .ct-computer-color{display:inline-block;width:7px;height:7px;flex:0 0 7px;background:var(--computer-color,var(--rule-2));}
-.ct-computer-picker select{appearance:none;border:0;outline:0;background:transparent;color:var(--ink);font:600 9.5px Archivo,sans-serif;letter-spacing:.1em;text-transform:uppercase;min-width:0;max-width:180px;height:100%;padding:0 18px 0 0;cursor:pointer;text-overflow:ellipsis;}
-.ct-computer-picker select option{background:var(--ground);color:var(--ink);}
-.ct-computer-picker>.cx-caret,.ct-computer-picker>svg{position:absolute;right:7px;pointer-events:none;color:var(--ink-3);width:9px;}
+.ct-computer-label{min-width:0;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#cc .ct-computer-trigger>svg{margin-left:4px;color:var(--ink-3);width:9px;}
 .ct-cluster-toggle{display:grid;place-items:center;flex:0 0 28px;width:28px;height:28px;padding:0;background:transparent;color:var(--ink-3);border:1px solid var(--rule-2);cursor:pointer;transition:color 140ms ease,border-color 140ms ease;}
 .ct-cluster-toggle:hover{color:var(--ink);border-color:var(--ink-3);}
 .ct-cluster-toggle:focus-visible,.ct-cluster-screen button:focus-visible{outline:1px solid var(--counter);outline-offset:3px;}

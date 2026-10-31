@@ -52,7 +52,7 @@ fn item(value: String, kind: &str, description: impl Into<String>) -> Completion
 }
 
 /// Backslash-escape what the shell would split or expand.
-fn escape(name: &str) -> String {
+pub(crate) fn escape(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for c in name.chars() {
         if " \t'\"\\$`&|;<>()[]*?!#{}~".contains(c) {
@@ -150,6 +150,9 @@ fn commands(prefix: &str, shell: &Shell) -> Vec<Completion> {
         return files(prefix, shell.cwd, false);
     }
     let mut found: BTreeMap<String, Completion> = BTreeMap::new();
+    if "edit".starts_with(prefix) {
+        found.insert("edit".into(), item("edit".into(), "command", "CortexTerm file editor"));
+    }
     for (name, value) in &shell.env.aliases {
         if name.starts_with(prefix) {
             found.insert(name.clone(), item(name.clone(), "command", format!("alias: {value}")));

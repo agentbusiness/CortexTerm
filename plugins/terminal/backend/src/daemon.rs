@@ -31,6 +31,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Notify, mpsc};
 
 use crate::lock;
+use crate::screen::ScreenState;
 
 /// Output arriving within this window goes into one message.
 const COALESCE: Duration = Duration::from_millis(16);
@@ -78,6 +79,8 @@ impl Client {
 #[derive(Default)]
 struct Flow {
     pending: Vec<u8>,
+    /// Exclusive offset of the last byte queued, including bytes discarded with no owner.
+    offset: u64,
     /// The first `replay` bytes of `pending` were produced while no owner was attached.
     replay: usize,
     in_flight: usize,
@@ -102,7 +105,7 @@ struct Term {
     meta: Mutex<Value>,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     input: Mutex<Option<std::sync::mpsc::Sender<Vec<u8>>>>,
-    parser: Mutex<vt100::Parser>,
+    parser: Mutex<ScreenState>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     flow: Mutex<Flow>,
     room: Condvar,
@@ -155,6 +158,7 @@ impl Term {
     /// whether the sender is done (the terminal was closed).
     fn flush(self: &Arc<Self>) -> bool {
         let engine = base64::engine::general_purpose::STANDARD;
+        let tty = self.tty_flags();
         let mut flow = lock(&self.flow);
         let closed = flow.closed;
         let Some(owner) = flow.owner.clone() else { return closed };
@@ -164,11 +168,16 @@ impl Term {
             let replay = flow.replay.min(bytes.len());
             flow.replay = 0;
             flow.in_flight += bytes.len();
+            let mut offset = flow.offset - bytes.len() as u64;
             for (part, is_replay) in [(&bytes[..replay], true), (&bytes[replay..], false)] {
                 if part.is_empty() {
                     continue;
                 }
-                let message = Message::Output { term_id: self.id.clone(), data: engine.encode(part), replay: is_replay };
+                offset += part.len() as u64;
+                let message = Message::Output {
+                    term_id: self.id.clone(), data: engine.encode(part), replay: is_replay,
+                    offset: Some(offset), tty: Some(tty.clone()),
+                };
                 if let Ok(line) = serde_json::to_string(&message) {
                     let _ = owner.tx.send(Outgoing { line, credit: Some((self.clone(), generation, part.len())) });
                 }
@@ -206,7 +215,7 @@ impl Term {
 
     /// The PTY's echo and line-mode flags (the slave's, read through the master) and the program
     /// in the foreground.
-    fn tty(&self) -> Tty {
+    fn tty_flags(&self) -> Tty {
         let master = lock(&self.master);
         let Some(master) = master.as_ref() else { return Tty::default() };
         let mut tty = Tty::default();
@@ -215,12 +224,22 @@ impl Term {
             unsafe {
                 let mut termios: libc::termios = std::mem::zeroed();
                 if libc::tcgetattr(fd, &mut termios) == 0 {
+                    tty.valid = true;
                     tty.echo = termios.c_lflag & libc::ECHO != 0;
                     tty.canonical = termios.c_lflag & libc::ICANON != 0;
                 }
             }
         }
-        if let Some(group) = master.process_group_leader() {
+        tty.foreground = master.process_group_leader().is_some_and(|group| group > 0 && group as u32 != self.pid);
+        tty
+    }
+
+    fn tty(&self) -> Tty {
+        let mut tty = self.tty_flags();
+        // Only prompt recognition needs a name; don't enumerate all processes for every frame.
+        if tty.valid && tty.canonical && !tty.echo
+            && let Some(group) = lock(&self.master).as_ref().and_then(|master| master.process_group_leader())
+        {
             tty.program = newest_in_group(group);
         }
         tty
@@ -430,7 +449,7 @@ impl Daemon {
             meta: Mutex::new(spawn.meta),
             master: Mutex::new(Some(pair.master)),
             input: Mutex::new(Some(input_tx)),
-            parser: Mutex::new(vt100::Parser::new(spawn.rows, spawn.cols, 0)),
+            parser: Mutex::new(ScreenState::new(spawn.rows, spawn.cols)),
             killer: Mutex::new(killer),
             flow: Mutex::new(Flow { owner, ..Flow::default() }),
             room: Condvar::new(),
@@ -450,9 +469,12 @@ impl Daemon {
                             let bytes = &buffer[..n];
                             // The emulator sees bytes before they are sent, so a snapshot taken
                             // after an output message always reflects that output.
-                            lock(&reading.parser).process(bytes);
+                            let mut parser = lock(&reading.parser);
+                            parser.process(bytes);
                             let mut flow = lock(&reading.flow);
+                            flow.offset = parser.offset;
                             flow.pending.extend_from_slice(bytes);
+                            drop(parser);
                             if flow.owner.is_none() && flow.pending.len() > HIGH {
                                 let cut = flow.pending.len() - HIGH;
                                 flow.pending.drain(..cut);
@@ -523,18 +545,21 @@ impl Daemon {
     fn resize(&self, term_id: &str, cols: u16, rows: u16) -> Result<Record, String> {
         check_size(cols, rows)?;
         let term = self.get(term_id)?;
+        // SIGWINCH can trigger a redraw immediately. Hold the parser until its size is updated.
+        let mut parser = lock(&term.parser);
         {
             let master = lock(&term.master);
             let master = master.as_ref().ok_or("terminal is closed")?;
             // TIOCSWINSZ on the master; the kernel delivers SIGWINCH to the foreground group.
             master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).map_err(|e| format!("resize failed: {e}"))?;
         }
-        lock(&term.parser).screen_mut().set_size(rows, cols);
+        parser.set_size(rows, cols);
         *lock(&term.size) = (cols, rows);
+        drop(parser);
         Ok(term.record())
     }
 
-    fn snapshot(&self, term_id: &str) -> Result<Snapshot, String> {
+    fn snapshot(&self, term_id: &str, restore: bool) -> Result<Snapshot, String> {
         let term = self.get(term_id)?;
         let parser = lock(&term.parser);
         let screen = parser.screen();
@@ -549,6 +574,8 @@ impl Daemon {
             rows,
             alive: term.alive(),
             alternate_screen: screen.alternate_screen(),
+            restore: if restore { parser.restore() } else { None },
+            input_base64: true,
         })
     }
 
@@ -625,7 +652,7 @@ impl Daemon {
             Op::Open { spawn } => reply(json(self.open(client, spawn))),
             Op::Write { term_id, data } => reply(self.write(&term_id, &data).map(|()| Value::Null)),
             Op::Resize { term_id, cols, rows } => reply(json(self.resize(&term_id, cols, rows))),
-            Op::Snapshot { term_id } => reply(json(self.snapshot(&term_id))),
+            Op::Snapshot { term_id, restore } => reply(json(self.snapshot(&term_id, restore))),
             Op::Tty { term_id } => reply(json(self.get(&term_id).map(|term| term.tty()))),
             Op::Meta { term_id, meta } => reply(self.get(&term_id).map(|term| {
                 *lock(&term.meta) = meta;

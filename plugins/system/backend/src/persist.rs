@@ -111,14 +111,21 @@ pub fn known(key: &str) -> bool {
     lock_baseline().as_ref().is_some_and(|b| b.items.contains_key(key))
 }
 
-pub fn checks() -> Part {
+pub fn checks(discovery: crate::filesystem::Shared) -> Part {
     let mut part = Part::default();
     if !cfg!(target_os = "macos") {
         part.skipped.push("persistence baseline: not a Mac".into());
         return part;
     }
     let now = now_ms();
-    let items = snapshot(&mut part);
+    let found = discovery.get();
+    if discovery.is_cancelled() {
+        part.skipped.push("filesystem checks: cancelled before completion".into());
+        return part;
+    }
+    let discovery = found;
+    discovery.report(&mut part);
+    let items = snapshot(&mut part, discovery);
     let mut slot = lock_baseline();
     let keeps = slot.is_some() && graph::machine().is_some();
     let mut scratch = Baseline::default();
@@ -242,7 +249,7 @@ fn entries(dir: &Path) -> Vec<PathBuf> {
     list
 }
 
-fn snapshot(part: &mut Part) -> BTreeMap<String, Item> {
+fn snapshot(part: &mut Part, discovery: &crate::filesystem::Discovery) -> BTreeMap<String, Item> {
     let mut items = BTreeMap::new();
     let file = |items: &mut BTreeMap<String, Item>, kind: &str, path: &Path, target: String| {
         if std::fs::symlink_metadata(path).is_ok() {
@@ -258,14 +265,11 @@ fn snapshot(part: &mut Part) -> BTreeMap<String, Item> {
     }
 
     // Login items and helpers inside apps.
-    for apps in [PathBuf::from("/Applications"), home().join("Applications")] {
-        for app in entries(&apps).into_iter().filter(|p| p.extension().is_some_and(|e| e == "app")) {
-            for sub in ["Contents/Library/LoginItems", "Contents/Library/LaunchServices"] {
-                for inner in entries(&app.join(sub)) {
-                    let target = if inner.extension().is_some_and(|e| e == "app") { inner.display().to_string() } else { String::new() };
-                    let target = if target.is_empty() && inner.is_file() { inner.display().to_string() } else { target };
-                    file(&mut items, "login item inside an app", &inner, target);
-                }
+    for app in &discovery.apps {
+        for sub in ["Contents/Library/LoginItems", "Contents/Library/LaunchServices"] {
+            for inner in entries(&app.join(sub)) {
+                let target = if inner.extension().is_some_and(|e| e == "app") || inner.is_file() { inner.display().to_string() } else { String::new() };
+                file(&mut items, "login item inside an app", &inner, target);
             }
         }
     }
@@ -322,7 +326,7 @@ fn snapshot(part: &mut Part) -> BTreeMap<String, Item> {
             items.insert("npm:registry".into(), Item { what: format!("npm registry setting ({})", registries.join(", ")), value: registries.join("\n"), target: String::new() });
         }
     }
-    for repo in malware::repos() {
+    for repo in &discovery.projects {
         for editor in [".vscode", ".cursor"] {
             let tasks = repo.join(editor).join("tasks.json");
             if std::fs::read_to_string(&tasks).is_ok_and(|t| t.contains("folderOpen")) {

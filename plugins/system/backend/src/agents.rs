@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // Each source names one kind of finding; the terminal flow looks its explanation notes up by it.
 const SOURCE_SETTINGS: &str = "agent settings";
@@ -216,16 +216,22 @@ pub fn watch(snapshot: &Snapshot, seen: &mut HashSet<(u32, u64)>) -> Vec<Candida
 // ---------------------------------------------------------------------------------------------
 // The sweep part.
 
-/// Every agent check, within the sweep's time limit. Runs blocking (it may wait on the frame for
+/// Every agent check over the filesystem discovery. Runs blocking (it may wait on the frame for
 /// `terminal.scan`), so the sweep calls it through `spawn_blocking`.
-pub fn checks() -> Part {
-    let started = Instant::now();
+pub fn checks(discovery: crate::filesystem::Shared) -> Part {
     let mut part = Part::default();
-    let repos = known_repos(&mut part);
-    let servers = config_checks(&mut part, &repos);
+    let found = discovery.get();
+    if discovery.is_cancelled() {
+        part.skipped.push("filesystem checks: cancelled before completion".into());
+        return part;
+    }
+    let discovery = found;
+    discovery.report(&mut part);
+    let repos = known_repos(&mut part, discovery);
+    let servers = config_checks(&mut part, &repos, discovery);
     pin_checks(&mut part, &servers);
-    hidden_text_checks(&mut part, &repos);
-    skill_checks(&mut part, &repos, started);
+    hidden_text_checks(&mut part, &repos, discovery);
+    skill_checks(&mut part, discovery);
     part
 }
 
@@ -240,52 +246,20 @@ fn ask(method: &str, params: Value, limit: Duration) -> Result<Value, String> {
     }
 }
 
-/// The repositories the person works in: CortexTerm's places that are git folders, else the git
-/// folders up to three levels under ~/DEV, ~/dev, ~/code, ~/projects and ~/src.
-fn known_repos(part: &mut Part) -> Vec<PathBuf> {
-    let mut repos: Vec<PathBuf> = match ask(terminal_methods::PLACES, json!({"limit": 300}), Duration::from_secs(10))
+/// Remembered places supplement filesystem discovery; they never restrict it.
+fn known_repos(part: &mut Part, discovery: &crate::filesystem::Discovery) -> Vec<PathBuf> {
+    let mut repos: Vec<PathBuf> = discovery.projects.iter().cloned().collect();
+    match ask(terminal_methods::PLACES, json!({"limit": 300}), Duration::from_secs(10))
         .and_then(|v| serde_json::from_value::<PlaceList>(v).map_err(|e| e.to_string()))
     {
-        Ok(list) => list.places.into_iter().filter(|p| p.git).map(|p| PathBuf::from(p.path)).filter(|p| p.is_dir()).collect(),
-        Err(error) => {
-            part.skipped.push(format!("CortexTerm's places: {error}; looked in ~/DEV, ~/code, ~/projects and ~/src instead"));
-            Vec::new()
-        }
-    };
-    if repos.is_empty() {
-        for root in ["DEV", "dev", "code", "projects", "src"] {
-            find_repos(&home().join(root), 0, &mut repos);
-        }
+        Ok(list) => repos.extend(list.places.into_iter().map(|p| PathBuf::from(p.path)).filter(|p| p.is_dir())),
+        Err(error) => part.skipped.push(format!("CortexTerm's places: {error}; filesystem discovery still included")),
     }
-    // ~/DEV and ~/dev are one folder on a case-insensitive disk.
     let mut repos: Vec<PathBuf> = repos.into_iter().filter_map(|r| r.canonicalize().ok()).collect();
     repos.sort();
     repos.dedup();
-    repos.truncate(500);
+    repos.sort_by_key(|path| !path.starts_with(home()));
     repos
-}
-
-fn find_repos(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-    if out.len() >= 500 {
-        return;
-    }
-    if dir.join(".git").exists() {
-        out.push(dir.to_path_buf());
-        return;
-    }
-    if depth >= 3 {
-        return;
-    }
-    let Ok(read) = std::fs::read_dir(dir) else { return };
-    for entry in read.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') || matches!(name.as_str(), "node_modules" | "target" | "build" | "dist" | "vendor") {
-            continue;
-        }
-        if entry.file_type().is_ok_and(|t| t.is_dir()) {
-            find_repos(&entry.path(), depth + 1, out);
-        }
-    }
 }
 
 // --- 70. Agent and MCP configs.
@@ -299,12 +273,28 @@ struct Server {
     entry: Value,
 }
 
-fn read_text(path: &Path) -> Option<String> {
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() > 8 * 1024 * 1024 {
+fn read_text(path: &Path, part: &mut Part) -> Option<String> {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                part.skipped.push(format!("agent file {}: {error}", tilde(path)));
+            }
+            return None;
+        }
+    };
+    if !meta.is_file() { return None; }
+    if meta.len() > 8 * 1024 * 1024 {
+        part.skipped.push(format!("agent file {}: larger than 8 MiB", tilde(path)));
         return None;
     }
-    std::fs::read_to_string(path).ok()
+    match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(error) => {
+            part.skipped.push(format!("agent file {}: {error}", tilde(path)));
+            None
+        }
+    }
 }
 
 /// JSON with comments and trailing commas (VS Code's settings) made plain.
@@ -539,7 +529,7 @@ fn bypass_settings(value: &Value, path: &mut Vec<String>, out: &mut Vec<String>)
 }
 
 /// Read every agent config; findings for what is risky in them; the MCP servers they define.
-fn config_checks(part: &mut Part, repos: &[PathBuf]) -> Vec<Server> {
+fn config_checks(part: &mut Part, repos: &[PathBuf], discovery: &crate::filesystem::Discovery) -> Vec<Server> {
     let h = home();
     let app_support = h.join("Library/Application Support");
     let files: Vec<PathBuf> = vec![
@@ -561,10 +551,14 @@ fn config_checks(part: &mut Part, repos: &[PathBuf]) -> Vec<Server> {
             project_files.push(repo.join(name));
         }
     }
+    let mut all: Vec<PathBuf> = files.into_iter().chain(project_files).chain(discovery.agent_configs.iter().cloned()).collect();
+    all.sort();
+    all.dedup();
+    all.sort_by_key(|path| !path.starts_with(home()));
     let mut servers = Vec::new();
     let mut read = 0;
-    for path in files.iter().chain(project_files.iter()) {
-        let Some(text) = read_text(path) else { continue };
+    for path in &all {
+        let Some(text) = read_text(path, part) else { continue };
         let shown = tilde(path);
         let value = if path.extension().is_some_and(|e| e == "toml") { Some(parse_codex(&text)) } else { parse_jsonc(&text) };
         let Some(value) = value else {
@@ -867,15 +861,19 @@ fn hidden_in(text: &str) -> Hidden {
     found
 }
 
-fn hidden_text_checks(part: &mut Part, repos: &[PathBuf]) {
-    let files = instruction_files(repos);
+fn hidden_text_checks(part: &mut Part, repos: &[PathBuf], discovery: &crate::filesystem::Discovery) {
+    let mut files = instruction_files(repos);
+    files.extend(discovery.instructions.iter().cloned());
+    files.sort();
+    files.dedup();
+    files.sort_by_key(|path| !path.starts_with(home()));
     if files.is_empty() {
         part.skipped.push("hidden text in agent instructions: no CLAUDE.md, AGENTS.md, GEMINI.md or rules files found".into());
         return;
     }
     part.checked.push(format!("hidden text in agent instructions ({})", plural(files.len(), "file", "files")));
     for path in files {
-        let Some(text) = read_text(&path) else { continue };
+        let Some(text) = read_text(&path, part) else { continue };
         let h = hidden_in(&text);
         let mut what = Vec::new();
         if h.tags > 0 {
@@ -920,47 +918,6 @@ fn shell_quote(path: &str) -> String {
 
 // --- 73. Skills through the paste guard.
 
-fn skill_files(repos: &[PathBuf]) -> Vec<PathBuf> {
-    let h = home();
-    let mut roots = vec![
-        h.join(".claude/skills"),
-        h.join(".claude/plugins"),
-        h.join(".codex/skills"),
-        h.join(".cursor/skills"),
-        h.join(".gemini/skills"),
-        h.join(".agents/skills"),
-        h.join(".openclaw/skills"),
-        h.join(".openclaw/workspace/skills"),
-        h.join(".clawhub"),
-    ];
-    for entry in std::fs::read_dir(crate::util::cortex_home().join("live/plugins")).into_iter().flatten().flatten() {
-        roots.push(entry.path().join("data/skills"));
-    }
-    roots.extend(repos.iter().map(|repo| repo.join(".claude/skills")));
-    let mut files = Vec::new();
-    for root in roots {
-        collect_md(&root, 0, &mut files);
-    }
-    files.truncate(3000);
-    files
-}
-
-fn collect_md(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-    if depth > 6 || out.len() >= 3000 {
-        return;
-    }
-    let Ok(read) = std::fs::read_dir(dir) else { return };
-    for entry in read.flatten() {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        match entry.file_type() {
-            Ok(t) if t.is_dir() && !name.starts_with('.') && name != "node_modules" => collect_md(&path, depth + 1, out),
-            Ok(t) if t.is_file() && (name.ends_with(".md") || name.ends_with(".mdc")) => out.push(path),
-            _ => {}
-        }
-    }
-}
-
 /// The shell a skill tells its reader to run: its shell code blocks, and lines that pipe a
 /// download into a shell anywhere in the text.
 fn shell_of(text: &str) -> String {
@@ -1004,8 +961,9 @@ fn local_scan(text: &str) -> Vec<(String, String, String)> {
         .collect()
 }
 
-fn skill_checks(part: &mut Part, repos: &[PathBuf], started: Instant) {
-    let files = skill_files(repos);
+fn skill_checks(part: &mut Part, discovery: &crate::filesystem::Discovery) {
+    let mut files: Vec<PathBuf> = discovery.skills.iter().cloned().collect();
+    files.sort_by_key(|path| !path.starts_with(home()));
     if files.is_empty() {
         part.skipped.push("agent skills: no skill files found".into());
         return;
@@ -1013,11 +971,7 @@ fn skill_checks(part: &mut Part, repos: &[PathBuf], started: Instant) {
     let mut guard = true;
     let mut scanned = 0;
     for path in &files {
-        if started.elapsed() > crate::sweep::LIMIT {
-            part.skipped.push(format!("agent skills: stopped after {} of {} files (time limit)", scanned, files.len()));
-            break;
-        }
-        let Some(text) = read_text(path) else { continue };
+        let Some(text) = read_text(path, part) else { continue };
         let shell = shell_of(&text);
         scanned += 1;
         if graph::machine().is_some() {

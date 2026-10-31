@@ -250,6 +250,10 @@ export function Desk() {
 
   const focused = desk?.panes.find((pane) => pane.id === desk.focus && desk.stage.includes(pane.id)) ?? desk?.panes.find((pane) => desk.stage.includes(pane.id));
   const focusedTerm = focused?.kind === 'term' ? focused : desk?.panes.find((pane) => pane.kind === 'term' && desk.stage.includes(pane.id));
+  const [terminalInput, setTerminalInput] = useState<string | null>(null);
+  const onTerminalKeyboard = useCallback((termId: string, active: boolean) => {
+    setTerminalInput((current) => active ? termId : current === termId ? null : current);
+  }, []);
 
   // A manual selection lasts until session focus changes. Deriving the target synchronously
   // prevents a render (and RPC) against the previous computer when switching sessions.
@@ -291,6 +295,11 @@ export function Desk() {
   const nodeOfTerm = useCallback((termId: string) => doc.desks.flatMap((entry) => entry.panes).find((pane) => pane.termId === termId || pane.workers?.includes(termId))?.node, [doc.desks]);
 
   const runIn = useCallback((termId: string, command: string, node = nodeOfTerm(termId)) => {
+    const state = live.states.get(termId);
+    if (state && !state.at_prompt && (state.running || state.interactive || state.alternate_screen)) {
+      host.notify('The program has this terminal. Finish it or open another shell to run that command.');
+      return;
+    }
     const data = command.includes('\n') ? `\x15\x1b[200~${command}\x1b[201~\r` : `\x15${command}\r`;
     void clientOf(node).call('terminal.write', { term_id: termId, data }).catch((cause) => host.notify(`Not sent: ${errorMessage(cause)}`));
   }, [host, nodeOfTerm]);
@@ -334,20 +343,41 @@ export function Desk() {
     void client.call('notify.send', { kind: run.exit_code === 0 ? 'done' : 'failed', title: `${command} ${outcome}`, body: '' }).catch(() => undefined);
   }), [client, host]);
 
+  // Listen at the Desk level: shelved panes and the raw terminal need help too. Only fresh
+  // failures trigger an answer; loading the Run ledger must never replay old failures.
+  useEffect(() => live.onFinished((run, node) => {
+    if (!run.ended || run.exit_code == null || run.exit_code === 0 || run.exit_code === 130) return;
+    if (run.author !== 'user') return;
+    const owner = doc.desks.find((entry) => entry.panes.some((pane) => pane.kind === 'term'
+      && (pane.node ?? null) === node && (pane.termId === run.term_id || pane.workers?.includes(run.term_id))));
+    if (!owner) return;
+    const pane = owner.panes.find((entry) => entry.termId === run.term_id || entry.workers?.includes(run.term_id));
+    if (!pane?.termId) return;
+    void (async () => {
+      const sessionId = await sessionOn(node ?? undefined, owner);
+      if (!sessionId) throw new Error('No conversation is available for this shell.');
+      await clientOf(node).call('chatflow-terminal.turn', {
+        session_id: sessionId,
+        text: `\`${run.command}\` failed with exit code ${run.exit_code} in ${run.cwd}. Explain the error from this Run's output and offer a fix.`,
+        intent: 'fix', term_id: pane.termId, run_id: run.id, automatic: true,
+      });
+    })().catch((cause) => host.notify(`Could not explain the failed command: ${errorMessage(cause)}`));
+  }), [doc.desks, projectId, update, host]);
+
   /** The Desk's `terminal` session on a computer (none: this one), made on first use there. */
-  const sessionOn = async (node: string | undefined): Promise<string | undefined> => {
-    if (!desk) return undefined;
+  const sessionOn = async (node: string | undefined, owner = desk): Promise<string | undefined> => {
+    if (!owner) return undefined;
     if (!node) {
-      if (desk.sessionId || !projectId) return desk.sessionId;
-      const sessionId = await newSession(projectId, desk.name);
-      if (sessionId) update(desk.id, (entry) => ({ ...entry, sessionId }));
+      if (owner.sessionId || !projectId) return owner.sessionId;
+      const sessionId = await newSession(projectId, owner.name);
+      if (sessionId) update(owner.id, (entry) => ({ ...entry, sessionId }));
       return sessionId;
     }
-    if (desk.sessions?.[node]) return desk.sessions[node];
+    if (owner.sessions?.[node]) return owner.sessions[node];
     const remote = clientOf(node);
     const project = await homeProject(remote).catch(() => null);
-    const session = project ? await remote.call<{ id: string }>('frame.session.create', { project_id: project.id, title: desk.name, flow: 'terminal' }).catch(() => null) : null;
-    if (session?.id) update(desk.id, (entry) => ({ ...entry, sessions: { ...entry.sessions, [node]: session.id } }));
+    const session = project ? await remote.call<{ id: string }>('frame.session.create', { project_id: project.id, title: owner.name, flow: 'terminal' }).catch(() => null) : null;
+    if (session?.id) update(owner.id, (entry) => ({ ...entry, sessions: { ...entry.sessions, [node]: session.id } }));
     return session?.id;
   };
 
@@ -374,21 +404,12 @@ export function Desk() {
     columns.openSide();
   }, [setSideView, columns]);
 
-  const onNative = useCallback((view: string, target: string | null | undefined) => {
+  const onEdit = useCallback((target: string) => {
     const cwd = focusedCwd() || home;
-    if (view === 'editor' && target) {
-      const node = focusedTerm?.node;
-      addPane({ id: newId('pane'), kind: 'editor', title: target.split('/').pop() || target, cwd, path: target, ...(node ? { node } : {}) });
-      return true;
-    }
-    if (view === 'process') {
-      selectSideNode(focusedTerm?.node ?? '');
-      openTool('process');
-      return true;
-    }
-    return false;
+    const node = focusedTerm?.node;
+    addPane({ id: newId('pane'), kind: 'editor', title: target.split('/').pop() || target, cwd, path: target, ...(node ? { node } : {}) });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [addPane, openTool, home, desk, selectSideNode, focusedTerm]);
+  }, [addPane, home, desk, focusedTerm]);
 
   /** Side-pane actions always target the selected computer, including a manual override. */
   const onSideAsk = useCallback((text: string, intent: 'ask' | 'explain' | 'fix', runId?: string) => {
@@ -482,11 +503,38 @@ export function Desk() {
     });
   }, [doc.desks, setDoc]);
 
+  // A command submitted while another Run is busy starts in a helper. If that helper turns
+  // interactive (including an editor launched indirectly), give it an actual visible pane and
+  // stop treating it as an auto-closing background worker.
+  useEffect(() => live.subscribe(() => {
+    for (const termId of helpers.current) {
+      const state = live.states.get(termId);
+      if (!state?.interactive && !state?.alternate_screen) continue;
+      const owner = doc.desks.find((entry) => entry.panes.some((pane) => pane.workers?.includes(termId)));
+      const parent = owner?.panes.find((pane) => pane.workers?.includes(termId));
+      if (!owner || !parent) continue;
+      helpers.current.delete(termId);
+      const pane: PaneRec = {
+        id: newId('pane'), kind: 'term', termId, cwd: state.cwd || parent.cwd,
+        title: state.running?.command.split(/\s+/)[0] || 'shell', ...(parent.node ? { node: parent.node } : {}),
+      };
+      setDoc((current) => ({ ...current, desks: current.desks.map((entry) => entry.id !== owner.id ? entry : {
+        ...entry,
+        panes: [...entry.panes.map((item) => item.id === parent.id ? { ...item, workers: item.workers?.filter((id) => id !== termId) } : item), pane],
+        stage: [pane.id], focus: pane.id,
+      }) }));
+    }
+  }), [doc.desks, setDoc]);
+
   // --- keys ------------------------------------------------------------------------------------
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (clusterOpen) return;
-      const meta = event.metaKey || event.ctrlKey;
+      const inTerminal = event.target instanceof Element && Boolean(event.target.closest('.xterm'));
+      // Ctrl and Alt belong to the terminal application on every platform. On macOS the Desk
+      // keeps Command shortcuts; elsewhere use the pointer to leave the terminal.
+      if (inTerminal && (event.ctrlKey || event.altKey || !event.metaKey)) return;
+      const meta = event.metaKey || (!inTerminal && event.ctrlKey);
       if (event.key === 'Escape' && overlay) { event.preventDefault(); setOverlay(null); return; }
       if (!meta) return;
       const key = event.key.toLowerCase();
@@ -515,7 +563,8 @@ export function Desk() {
   if (!desk) return <div className="ct-desk"><p className="ct-hint ct-boot">Starting your shells…</p></div>;
 
   const stagePanes = desk.stage.map((id) => desk.panes.find((pane) => pane.id === id)).filter(Boolean) as PaneRec[];
-  const fullscreen = focusedTerm?.termId ? live.states.get(focusedTerm.termId)?.alternate_screen : false;
+  const inputState = focusedTerm?.termId ? live.states.get(focusedTerm.termId) : undefined;
+  const fullscreen = Boolean(inputState?.interactive || inputState?.alternate_screen || (focusedTerm?.termId && terminalInput === focusedTerm.termId));
   const sideFrame = (kind: PaneRec['kind'], runId?: string) => ({
     pane: { id: `side-${kind}`, kind, title: kind, cwd: sideHome, runId, ...(sideNode ? { node: sideNode } : {}) },
     focused: false, bare: true, onFocus: () => undefined, onShelf: () => undefined, onClose: () => setSideView('machine'),
@@ -526,7 +575,7 @@ export function Desk() {
     const isFocused = pane.id === (focused?.id ?? '');
     const common = { focused: isFocused, onFocus: () => focusPane(pane.id), onShelf: () => toShelf(pane.id), onClose: () => closePane(pane.id) };
     switch (pane.kind) {
-      case 'term': return <TermPane pane={pane} sessionId={pane.node ? desk.sessions?.[pane.node] : desk.sessionId} computer={nameOf(pane.node)} home={home} slot={slot} actions={actions} {...common} />;
+      case 'term': return <TermPane pane={pane} sessionId={pane.node ? desk.sessions?.[pane.node] : desk.sessionId} computer={nameOf(pane.node)} home={home} slot={slot} actions={actions} onKeyboard={onTerminalKeyboard} {...common} />;
       case 'editor': return <EditorPane pane={pane} home={home} onAsk={onAsk} onRunReal={(command) => void onShell(command, 'pane')} {...common} />;
       case 'run': return <RunPane pane={pane} home={home} onAsk={onAsk} {...common} />;
       case 'process': return <ProcessPane pane={pane} onAsk={onAsk} onSignal={onSignal} onInvestigate={onInvestigate} {...common} />;
@@ -616,8 +665,8 @@ export function Desk() {
             {stagePanes.map((pane, index) => <div key={pane.id} className="ct-cell">{renderPane(pane, index)}</div>)}
           </div>
           <ComputerScope node={focusedTerm?.node ?? null}>
-            <Line ref={line} termId={focusedTerm?.termId} home={home} onShell={(command, how) => void onShell(command, how)} onAsk={(text, intent) => void onAsk(text, intent)} onNative={onNative}
-              disabled={fullscreen ? 'A full-screen program has the keyboard: click into it, or quit it to use the Line.' : null} />
+            <Line ref={line} termId={focusedTerm?.termId} sessionId={focusedTerm?.node ? desk.sessions?.[focusedTerm.node] : desk.sessionId} home={home} onShell={(command, how) => void onShell(command, how)} onAsk={(text, intent) => void onAsk(text, intent)} onEdit={onEdit}
+              disabled={fullscreen ? 'The terminal has the keyboard. Return to blocks or finish the program to use the Line.' : null} />
           </ComputerScope>
         </main>
         <Divider name="ct-side" label="Machine width" onMove={columns.moveSide} onEnd={columns.endSide} onReset={columns.resetSide} className={columns.sideOpen ? '' : 'ct-hidden'} />

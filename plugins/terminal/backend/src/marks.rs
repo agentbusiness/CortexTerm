@@ -66,6 +66,10 @@ pub struct Saved {
     #[serde(default)]
     pub integrated: bool,
     #[serde(default)]
+    pub alternate_screen: bool,
+    #[serde(default)]
+    pub interactive: bool,
+    #[serde(default)]
     pub last_exit: Option<i32>,
     /// The Run in progress: its id, and the Run as it started (so the next instance continues it
     /// without asking the graph).
@@ -175,6 +179,8 @@ impl Tracker {
     pub fn resume(term_id: &str, saved: Saved, store: Option<Arc<Store>>, running: Option<Run>) -> Self {
         let mut tracker = Self::new(term_id, &saved.cwd, saved.nonce, store);
         tracker.state.integrated = saved.integrated;
+        tracker.state.alternate_screen = saved.alternate_screen;
+        tracker.state.interactive = saved.interactive;
         tracker.state.last_exit = saved.last_exit;
         tracker.env = saved.env;
         tracker.session = saved.session;
@@ -193,6 +199,8 @@ impl Tracker {
             nonce: self.nonce.clone(),
             cwd: self.state.cwd.clone(),
             integrated: self.state.integrated,
+            alternate_screen: self.state.alternate_screen,
+            interactive: self.state.interactive,
             last_exit: self.state.last_exit,
             running: self.recorder.as_ref().map(|r| r.run.id.clone()),
             run: self.recorder.as_ref().map(|r| r.run.clone()),
@@ -204,12 +212,14 @@ impl Tracker {
     /// Changes whenever [`Tracker::saved`] would.
     pub fn saved_key(&self) -> String {
         format!(
-            "{}|{}|{:?}|{:?}|{}",
+            "{}|{}|{:?}|{:?}|{}|{}|{}",
             self.state.cwd,
             self.state.integrated,
             self.state.last_exit,
             self.recorder.as_ref().map(|r| &r.run.id),
-            self.env_generation
+            self.env_generation,
+            self.state.alternate_screen,
+            self.state.interactive
         )
     }
 
@@ -250,7 +260,7 @@ impl Tracker {
     /// echoing (a password).
     fn ask(&self, now: u64) -> Option<Ask> {
         let recorder = self.recorder.as_ref()?;
-        if self.state.alternate_screen || self.answered {
+        if self.state.interactive || self.state.alternate_screen || self.answered {
             return None;
         }
         let quiet = now.saturating_sub(self.last_output);
@@ -265,9 +275,9 @@ impl Tracker {
         };
         let lower = text.to_lowercase();
         let secret = match &self.tty {
-            Some(tty) => !tty.echo && tty.canonical,
+            Some(tty) if tty.valid => !tty.echo && tty.canonical,
             // An older daemon cannot say: the words decide.
-            None => text.ends_with(':') && ["password", "passphrase", "passcode"].iter().any(|word| lower.contains(word)),
+            _ => text.ends_with(':') && ["password", "passphrase", "passcode"].iter().any(|word| lower.contains(word)),
         };
         if secret {
             let key = format!("{program} · {}", if text.is_empty() { "password" } else { &text });
@@ -296,11 +306,31 @@ impl Tracker {
 
     /// The running command is quiet: is its terminal's echo worth reading now?
     pub fn wants_tty(&self, now: u64) -> bool {
-        self.recorder.is_some() && !self.state.alternate_screen && !self.answered && self.tty.is_none() && now.saturating_sub(self.last_output) >= ASK_QUIET_MS
+        // Keep polling an interactive job: suspension and raw-to-line transitions can be silent.
+        self.state.interactive || (self.recorder.is_some() && now.saturating_sub(self.last_output) >= ASK_QUIET_MS)
     }
 
     pub fn set_tty(&mut self, tty: Tty) {
+        let shell_read = self.recorder.is_some() && !self.state.at_prompt
+            && now_ms().saturating_sub(self.last_output) >= ASK_QUIET_MS;
+        if tty.valid && !tty.canonical && (tty.foreground || shell_read) {
+            self.take_keyboard();
+        } else if tty.valid && !tty.foreground && self.state.at_prompt {
+            self.state.interactive = false;
+        }
         self.tty = Some(tty);
+    }
+
+    fn take_keyboard(&mut self) {
+        if !self.state.interactive {
+            self.clear_line();
+            self.overwritten.clear();
+            self.overwritten_ansi.clear();
+        }
+        self.state.interactive = true;
+        if let Some(recorder) = &mut self.recorder {
+            recorder.run.fullscreen = true;
+        }
     }
 
     pub fn set_reads_tty(&mut self, reads: bool) {
@@ -372,6 +402,8 @@ impl Tracker {
             self.finish(None, now_ms());
         }
         self.state.at_prompt = false;
+        self.state.interactive = false;
+        self.state.alternate_screen = false;
         self.publish_state();
         std::mem::take(&mut self.out)
     }
@@ -466,7 +498,7 @@ impl Tracker {
     }
 
     fn recording(&self) -> bool {
-        self.recorder.is_some() && !self.state.alternate_screen
+        self.recorder.is_some() && !self.state.alternate_screen && !self.state.interactive
     }
 
     fn text(&mut self, byte: u8, now: u64) {
@@ -562,6 +594,9 @@ impl Tracker {
                 }
             }
             self.state.alternate_screen = on;
+            if on { self.take_keyboard(); }
+            // Stay in the terminal until the shell returns: an app can leave the alternate
+            // buffer to ask a question, launch a subprocess, or suspend.
             self.clear_line();
         }
     }
@@ -600,7 +635,15 @@ impl Tracker {
         let kind = parts.next().unwrap_or("");
         self.state.integrated = true;
         match kind {
-            "A" | "B" if self.recorder.is_none() => self.state.at_prompt = true,
+            "A" | "B" if self.recorder.is_none() => {
+                self.state.at_prompt = true;
+                // This chunk can contain an older prompt followed by a job's first frame.
+                // The kernel's current foreground job wins over that earlier prompt mark.
+                if !self.tty.as_ref().is_some_and(|tty| tty.valid && tty.foreground && !tty.canonical) {
+                    self.state.interactive = false;
+                    self.state.alternate_screen = false;
+                }
+            },
             "C" if self.recorder.is_none() => self.start(now),
             "D" if self.recorder.is_some() => {
                 let code = parts.next().and_then(|c| c.trim().parse::<i32>().ok());
@@ -634,7 +677,7 @@ impl Tracker {
             started: now,
             format: "raw".into(),
             author: "user".into(),
-            fullscreen: self.state.alternate_screen,
+            fullscreen: self.state.interactive || self.state.alternate_screen,
             usual_ms,
             ..Run::default()
         };
@@ -731,7 +774,7 @@ impl Tracker {
     fn publish_state(&mut self) {
         let state = self.state();
         let key = format!(
-            "{}|{}|{}|{:?}|{:?}|{}|{}|{:?}|{:?}|{:?}",
+            "{}|{}|{}|{:?}|{:?}|{}|{}|{:?}|{:?}|{:?}|{}",
             state.cwd,
             state.integrated,
             state.at_prompt,
@@ -741,7 +784,8 @@ impl Tracker {
             state.attention,
             state.git_branch,
             state.ask,
-            state.keychain
+            state.keychain,
+            state.interactive
         );
         if self.published.as_deref() != Some(key.as_str()) {
             self.published = Some(key);

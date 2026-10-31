@@ -1,7 +1,6 @@
 /**
- * The native views CortexTerm opens instead of a full-screen tool: the editor (`nano`, `vi`,
- * `edit`), a Run's log view (histogram, levels, filter), the process view (`top`, `htop`) and
- * alerts with the security sweep. Every one has a key to the real program (`!` in the Line).
+ * CortexTerm's built-in views: the explicit `edit` editor, a Run's log, the process view and
+ * alerts with the security sweep. Standard shell tools keep their own terminal interfaces.
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -17,6 +16,7 @@ import { quote, seconds, shortPath, size } from './api';
 import { Processes } from './Sidebar';
 import type { PaneRec } from './store';
 import { useMachineAlerts } from './machine-data';
+import { SecurityProtection } from './SecurityProtection';
 
 const languageSlot = new Compartment();
 
@@ -132,10 +132,10 @@ export function EditorPane({ pane, focused, bare, home, onFocus, onShelf, onClos
     <PaneFrame pane={pane} focused={focused} bare={bare} onFocus={onFocus} onShelf={onShelf} onClose={onClose} title={`EDIT · ${name.toUpperCase()}`} status={status}
       tools={<>
         <span className="ct-label ct-faint ct-clip" title={file?.path}>{file ? shortPath(file.path, home) : ''}{file && !file.writable ? ' · READ ONLY' : ''}</span>
-        <button type="button" className="detent sm" onClick={() => onRunReal(`nano ${pane.path ?? ''}`)}>REAL NANO</button>
+        <button type="button" className="detent sm" onClick={() => onRunReal(`nano ${quote(pane.path ?? '')}`)}>OPEN IN NANO</button>
       </>}>
-      {problem && <p className="ct-hint ct-warn">{problem}{/needs admin/i.test(problem) ? ' Use the real editor with sudo: `!sudo nano …`.' : ''}</p>}
-      {file?.too_large && <p className="ct-hint">This file is too large or not text for the editor ({size(file.bytes)}). Open it with the real tool: `!less {pane.path}`.</p>}
+      {problem && <p className="ct-hint ct-warn">{problem}{/needs admin/i.test(problem) ? ' Use sudo nano to edit a file that needs admin rights.' : ''}</p>}
+      {file?.too_large && <p className="ct-hint">This file is too large or not text for the editor ({size(file.bytes)}). View it with less {quote(pane.path ?? '')}.</p>}
       <div className="ct-editor-body">
         <div className="ct-editor" ref={host} />
         <aside className="ct-editor-side">
@@ -379,6 +379,7 @@ export function AlertsPane({ pane, focused, bare, onFocus, onShelf, onClose, onA
   return (
     <PaneFrame pane={pane} focused={focused} bare={bare} onFocus={onFocus} onShelf={onShelf} onClose={onClose} title="ALERTS & SECURITY">
       <div className="ct-alerts">
+        <SecurityProtection />
         <section className="ct-asec">
           <header className="ct-asec-head"><span className="ct-label">ALERTS</span><span className="ct-label ct-faint">{machineAlerts.loading ? 'LOADING…' : machineAlerts.problem ? 'UNAVAILABLE' : alerts.length ? `${alerts.length} OPEN` : 'ALL QUIET'}</span></header>
           {machineAlerts.problem && <p className="ct-asec-note ct-warn" role="status">{machineAlerts.problem} <button type="button" className="detent sm" onClick={() => void machineAlerts.reload()}>RETRY</button></p>}

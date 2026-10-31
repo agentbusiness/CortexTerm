@@ -1,24 +1,15 @@
-Docker and containers: what runs, logs, ports, a container that exits, disk used by images, compose.
+Inspect Docker or Podman containers, failures, logs, ports and disk use before changes.
 
-## Look first (with `run`)
+## Inspect
 
-- Is the daemon up: `docker info --format '{{.ServerVersion}}'`. "Cannot connect to the Docker daemon": Docker Desktop (or colima, OrbStack) is not running.
-- Containers: `docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}\t{{.Image}}'`.
-- Why one stopped: `docker inspect -f '{{.State.ExitCode}} {{.State.Error}} OOM={{.State.OOMKilled}}' <name>`, then `docker logs --tail 50 <name>`. Exit 137 with OOM=true: it ran out of memory.
-- Never `docker logs -f` or `docker compose logs -f`: they never end. Use `--tail 50` or `--since 10m`.
-- Resource use: `docker stats --no-stream`.
-- Disk: `docker system df`.
-- Compose: `docker compose ps` and `docker compose config --services` in the project folder.
-- Inside a container (read only): `docker exec <name> cat /etc/os-release`, `docker exec <name> env`.
+Establish engine, context and target. `docker version` and `docker info --format '{{.ServerVersion}}'` can reveal daemon access. A connection failure may involve a stopped service, wrong context, socket or permissions; do not assume Docker Desktop exists on Linux.
 
-## Common causes
+Use `docker ps -a --format 'table {{.Names}}	{{.Status}}	{{.Ports}}	{{.Image}}'`. For one failed container: `docker inspect -f '{{.State.ExitCode}} {{.State.Error}} OOM={{.State.OOMKilled}}' <name>` and `docker logs --tail 40 <name>`. Exit 137 means SIGKILL; OOM evidence is needed before naming memory as the cause.
 
-- "port is already allocated": another container or program holds it (`docker ps --format '{{.Names}} {{.Ports}}'`, `lsof -nP -iTCP:<port> -sTCP:LISTEN`).
-- A container that restarts over and over: read the first error in `docker logs --tail 100`.
-- localhost inside a container is the container itself. The Mac from inside: `host.docker.internal`.
-- A volume mount that looks empty: the path is relative to where compose runs, or Docker Desktop has no access to that folder.
+Use `docker stats --no-stream` or `docker system df` when relevant. Never follow logs indefinitely. Do not dump every environment variable or full inspect result: secrets can appear there. Commands inside a container are not automatically read-only.
 
-## Changes (theirs to run)
+## Propose and verify
 
-- Restart one: `docker restart <name>`. Rebuild with compose: `docker compose up -d --build`.
-- Free space: `docker system prune` removes stopped containers, unused networks and dangling images. Add `-a` only if they agree to lose every unused image (they download again). `--volumes` deletes data: say so plainly.
+Restart, recreate, rebuild and prune are user-run changes. Explain persistent volumes and stopped-container writable data before cleanup. `--volumes` can remove data. Do not use it as a generic space fix.
+
+After a change, inspect health, recent logs and the original application operation. Running is not readiness. Use the focused Compose or container skill for multi-service setup.

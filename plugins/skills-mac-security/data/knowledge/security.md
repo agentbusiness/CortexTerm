@@ -10,7 +10,7 @@ is copied from another source.
 
 ## clickfix, malicious-paste
 ATT&CK: T1204.004 (malicious copy and paste)
-A web page, fake CAPTCHA, fake "fix" or fake installer tells the person to paste a command into the terminal. The command is usually short on screen and encoded, and it downloads a stealer. One of the most common ways Macs got infected in 2025 and 2026. A real website never needs you to paste a command to prove you are human.
+A web page, fake CAPTCHA, fake "fix" or fake installer tells the person to paste a command into the terminal. The command is usually short on screen and encoded, and it downloads a stealer. A web page asking for a terminal command to prove someone is human is a strong warning sign; do not run that command.
 
 ## amos, stealer
 ATT&CK: T1555.001 (keychain), T1555.003 (browser passwords), T1539 (session cookies), T1041 (exfiltration)
@@ -22,11 +22,11 @@ Downloads a script and runs it in the same step, so nobody reads it first. Real 
 
 ## base64-to-shell, decode-to-shell, encoded-command
 ATT&CK: T1027 (obfuscation), T1140 (decoding), T1059.004 (Unix shell)
-Decodes hidden text (base64, hex, gzip) and runs it as a command. Legitimate tools almost never hide their commands this way; stealer droppers nearly always do.
+Decodes hidden text (base64, hex, gzip) and runs it as a command. Encoding can have legitimate uses. A decoded command being executed deserves inspection, especially when it came from an untrusted page.
 
 ## fake-password-prompt, osascript-password
 ATT&CK: T1056.002 (fake password dialog), T1059.002 (AppleScript)
-Uses `osascript` to show a dialog with a hidden answer field that looks like a macOS password prompt. Real macOS password prompts come from the system, not from a script run in a terminal. Stealers use the password to open the keychain.
+Uses `osascript` to show a dialog with a hidden answer field that looks like a macOS password prompt. A script-generated password dialog is not proof of system authentication. Stealers can use a captured login password to access protected data.
 
 ## password-check, dscl-authonly
 ATT&CK: T1056.002 (fake password dialog)
@@ -46,7 +46,7 @@ Mounts a disk image or runs a program from /tmp or another folder any program ca
 
 ## secret-to-network, exfiltration
 ATT&CK: T1552.001 (credentials in files), T1041 (exfiltration), T1567 (exfiltration to a web service)
-Reads a secret file (.env, SSH keys, cloud credentials, keychain) and sends it over the network in the same command. Reading a secret alone is fine; sending it somewhere is the danger.
+Reads a secret file (.env, SSH keys, cloud credentials, keychain) and sends it over the network in the same command. Reading a secret exposes it to that process; sending it elsewhere adds a disclosure risk. Establish the caller and destination.
 
 ## hidden-text, hidden-unicode, invisible-text, agent instructions
 ATT&CK: T1036.002 (right-to-left override), T1027 (obfuscation); ATLAS: AML.T0051 (prompt injection)
@@ -66,7 +66,7 @@ An MCP server started with `npx -y`, `bunx` or `uvx` and no fixed version downlo
 
 ## mcp-secret, plaintext-token, mcp secrets
 ATT&CK: T1552.001 (credentials in files)
-API keys and tokens written in plain text in an agent's config file. Any program or package that can read the file can use them. Environment variables or the macOS Keychain keep them out of the file.
+API keys and tokens written in plain text in an agent's config file. Any program or package that can read the file can use them. Environment references keep literal secrets out of that config, but processes may still expose them. Prefer the supported credential store; never print values during inspection.
 
 ## mcp-remote, remote mcp servers
 A remote MCP server: what the agent sends it (file contents, command output) leaves this Mac. Plain http also lets the network read it.
@@ -83,7 +83,7 @@ Agent skills are instructions an AI tool follows. In early 2026 hundreds of skil
 A known vulnerability in an installed version. Updating to the fixed version closes it. How urgent depends on whether the program faces the network or opens files from others, and on whether it is already being exploited (see kev).
 
 ## kev, cisa-kev, cvss, epss, severity
-CVSS rates how bad a vulnerability is from 0 to 10: 9 or more is critical, 7 to 8.9 high, 4 to 6.9 medium, below 4 low. CISA's KEV list holds the ones attackers are known to be using now: update those first, today. EPSS is the estimated chance it is exploited in the next 30 days. None of them says whether this Mac is affected; the installed version does.
+CVSS rates how bad a vulnerability is from 0 to 10: 9 or more is critical, 7 to 8.9 high, 4 to 6.9 medium, below 4 low. CISA's KEV list holds the ones attackers are known to be using now: update those first, today. EPSS estimates whether the CVE will be exploited in the wild in the next 30 days, not this Mac’s compromise probability. Applicability also depends on the installed build, configuration and advisory scope.
 
 ## outdated, brew outdated, app versions, vendor versions
 Not a known vulnerability, just old. Staying current keeps the window for the next one short.
@@ -98,7 +98,7 @@ An SSH private key opens servers. A key without a passphrase works for whoever c
 
 ## persistence, launch-agent, launch-daemon, login-item, launch agents, persistence baseline, btm
 ATT&CK: T1543.001 (launch agent), T1543.004 (launch daemon), T1547.015 (login items)
-Programs set to start on their own at login or boot. Almost all Mac malware installs one to survive a restart. An unsigned or quarantined program started this way deserves a look.
+Programs set to start on their own at login or boot. Malware may install one to survive a restart, but legitimate applications do this too. An unsigned or quarantined program started this way deserves a look.
 
 ## unsigned, codesign
 ATT&CK: T1553 (subvert trust controls)
@@ -106,11 +106,11 @@ A program without a signature Apple can check. Many developer tools are unsigned
 
 ## filevault-off, filevault, fdesetup
 ATT&CK: T1005 (data from local system)
-FileVault encrypts the disk. Without it, anyone with the Mac in hand can read every file.
+FileVault protects startup-volume data by tying access to authorized user credentials. Hardware encryption and FileVault state differ by Mac model; an off finding does not prove someone read the files.
 
 ## firewall-off, firewall
 ATT&CK: T1562.004 (firewall turned off)
-The macOS firewall blocks incoming connections to apps that should not accept them. Off, every listening program is open to the local network.
+The macOS firewall blocks incoming connections to apps that should not accept them. When off, this firewall does not filter those incoming connections. Actual reachability also depends on bind addresses, routing and other controls.
 
 ## sip-off, sip, csrutil
 ATT&CK: T1562.001 (security tools turned off)
@@ -118,7 +118,7 @@ System Integrity Protection keeps even admin processes from changing macOS itsel
 
 ## gatekeeper-off, gatekeeper, spctl
 ATT&CK: T1553.001 (Gatekeeper bypass)
-Gatekeeper checks downloaded apps for a valid signature and notarization. Off, any downloaded app runs unchecked.
+Gatekeeper checks downloaded apps for a valid signature and notarization. When disabled, its protection is reduced. Other execution controls may still apply; this finding does not prove malware ran.
 
 ## screen-lock, auto-login, sysadminctl, loginwindow
 Without a password after sleep, or with automatic login, anyone who opens the Mac is the user.
@@ -133,7 +133,7 @@ A configuration profile can install certificates, proxies and settings. One the 
 
 ## root-cert, root-certificate, trust settings
 ATT&CK: T1553.004 (root certificate)
-An extra trusted root certificate lets its owner read encrypted web traffic on this Mac.
+An added trusted root can enable interception when traffic is routed through a party holding a matching signing key. The certificate alone does not prove interception occurred.
 
 ## passwordless-sudo, sudo
 ATT&CK: T1548.003 (sudo)
@@ -166,7 +166,7 @@ ATT&CK: T1567 (exfiltration to a web service)
 Stealers upload what they took to file hosts, paste sites, Telegram or Discord bots. A connection there from a command-line program is a strong sign.
 
 ## malware, yara, yara-x, campaigns
-A malware signature matched a file. A match on a known family is strong evidence: move the file to the Trash, then check what it may already have taken (see amos).
+A detection rule matched a file. Review the rule, confidence and context; preserve needed evidence before the supplied remediation. A named-family signature may be strong evidence, but a generic match needs corroboration (see amos).
 
 ## posture, hosts, resolver, scutil, softwareupdate, outbound firewall
 A Mac setting that weakens its defences: updates turned off or waiting, DNS or proxy redirected, the hosts file changed, or no outbound firewall. Each is one setting to put back; the finding's fix is the command.
@@ -185,7 +185,7 @@ A file named like a document or picture that is really a program or script. Open
 
 ## quarantine
 ATT&CK: T1553.001 (Gatekeeper bypass)
-macOS marks downloaded files so Gatekeeper checks them. A downloaded program without the mark had it removed, which is what paste-in-the-terminal attacks do so the program runs unchecked.
+macOS marks downloaded files so Gatekeeper checks them. A missing mark has several possible causes, including how the file was downloaded or copied. Deliberate removal is one possible cause; absence alone does not prove an attack.
 
 ## otool, dylib-hijack
 ATT&CK: T1574.004 (dylib hijacking)

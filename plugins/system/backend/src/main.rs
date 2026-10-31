@@ -17,6 +17,7 @@ mod deep;
 mod docs;
 mod feeds;
 mod findings;
+mod filesystem;
 mod graph;
 mod host;
 mod intrusion;
@@ -36,9 +37,12 @@ mod persist;
 mod ports;
 mod privacy;
 mod posture;
+mod protection;
+mod protection_sensors;
 mod procs;
 mod sampler;
 mod schedule;
+mod security_investigator;
 mod ssh;
 mod shares;
 mod sweep;
@@ -72,6 +76,8 @@ struct MemPoint {
 }
 
 struct Shared {
+    protection: Mutex<protection::Store>,
+    protection_actions: tokio::sync::Mutex<()>,
     data_dir: PathBuf,
     ctx: OnceLock<Ctx>,
     /// Loading from the graph has started (once).
@@ -110,6 +116,8 @@ impl Shared {
     fn new() -> Self {
         let data_dir = util::data_dir();
         Shared {
+            protection: Mutex::new(protection::Store::default()),
+            protection_actions: tokio::sync::Mutex::new(()),
             alerts: Mutex::new(AlertStore::default()),
             findings: Mutex::new(findings::Store::default()),
             memory_log: Mutex::new(Default::default()),
@@ -249,9 +257,21 @@ impl Shared {
 
     /// Offer a candidate; when it fires, publish it and hand it to the notify plugin. True when
     /// it fired.
-    fn fire(&self, candidate: Candidate) -> bool {
+    fn fire(&self, mut candidate: Candidate) -> bool {
+        let about = about_of(&candidate.key);
+        if protection::security_kind(&candidate.alert.kind) {
+            let event = protection::from_alert(&candidate.key, &candidate.alert, &self.snapshot());
+            if !lock(&self.protection).loaded {
+                protection::observe(event);
+                // Existing alerts remain available while incident memory is starting.
+            } else {
+                let Some(incident) = lock(&self.protection).record(event, &self.snapshot()) else { return false };
+                candidate.key = format!("incident:{}:{}", incident.id, incident.severity);
+                candidate.alert.text = incident.title;
+                candidate.alert.severity = incident.severity;
+            }
+        }
         let key = candidate.key.clone();
-        let about = about_of(&key);
         let Some(alert) = lock(&self.alerts).offer(candidate, about) else { return false };
         let Some(ctx) = self.ctx.get().cloned() else { return true };
         ctx.publish(topics::ALERT, serde_json::to_value(&alert).unwrap_or(Value::Null));
@@ -281,6 +301,32 @@ impl Shared {
         lock(&self.snapshot).clone()
     }
 
+    fn record_protection(&self, observations: Vec<cc_protocol::contracts::system::SecurityObservation>) {
+        let snapshot = self.snapshot();
+        for event in observations.into_iter().take(4096) {
+            let notice = lock(&self.protection).record(event, &snapshot);
+            if let Some(incident) = notice {
+                // Already correlated: do not turn the incident notification into another fact.
+                self.fire(Candidate {
+                    key: format!("incident:{}:{}", incident.id, incident.severity),
+                    alert: Alert { kind: "security-incident".into(), severity: incident.severity, text: incident.title, at: incident.last_at, actions: vec!["show".into()], ..Default::default() },
+                });
+            }
+        }
+    }
+
+    fn record_sweep(&self, report: &SweepReport) {
+        let observations = report.findings.iter().filter(|f| protection::security_kind(&f.kind)).take(200).map(|f| {
+            cc_protocol::contracts::system::SecurityObservation {
+                at: report.at, source: "security sweep".into(), kind: f.kind.clone(), severity: f.severity.clone(),
+                summary: protection::scrub(&f.text, 600), rule: f.source.clone(), subject: format!("finding:{}", protection::digest(&f.key)),
+                path: f.about.as_ref().filter(|(label, key)| label == "Binary" && key.starts_with('/')).map(|(_, key)| key.clone()),
+                count: 1, ..Default::default()
+            }
+        }).collect();
+        self.record_protection(observations);
+    }
+
     /// Run the sweep (one at a time) and store its report (in the graph, with what it saw).
     async fn run_sweep(self: &Arc<Self>) -> SweepReport {
         let _guard = self.sweep_lock.lock().await;
@@ -295,7 +341,9 @@ impl Shared {
         }
         let ignored = store.ignored();
         drop(store);
-        sweep::mark(report, &ignored)
+        let marked = sweep::mark(report, &ignored);
+        self.record_sweep(&marked);
+        marked
     }
 
     /// The report with the ignored findings marked (older reports get their keys here).
@@ -365,6 +413,7 @@ impl Shared {
         let servers = agents::load().await?;
         let notes = netwatch::load_digest().await?;
         let ports = sampler::load_ports().await?;
+        let protection = protection::Store::load().await?;
         let summary = format!(
             "last sweep {} ({} findings), {} alerts, {} schedules, {} live traces, {feeds} feeds, {items} start items, {networks} networks, {servers} MCP servers, {notes} network notes, {ports} ports",
             findings.last.at,
@@ -377,6 +426,7 @@ impl Shared {
         lock(&self.alerts).replace(alerts);
         *lock(&self.schedules) = schedules;
         lock(&self.tracer).restore(recordings);
+        *lock(&self.protection) = protection;
         Ok(summary)
     }
 
@@ -586,6 +636,54 @@ fn start(shared: &Arc<Shared>) {
     }
     sampler::spawn_power(shared.power.clone());
 
+    // One collector owns child processes/cursors. Disabled sensors never escalate privileges.
+    let s = shared.clone();
+    tokio::spawn(async move {
+        let mut collector = protection_sensors::Collector::new();
+        let mut every = tokio::time::interval(Duration::from_secs(5));
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            every.tick().await;
+            if !graph::ready() { continue; }
+            let config = lock(&s.protection).config.clone();
+            let snapshot = s.snapshot();
+            let work = tokio::task::spawn_blocking(move || {
+                let collection = collector.collect(&config, &snapshot);
+                (collector, collection)
+            }).await;
+            match work {
+                Ok((returned, collection)) => {
+                    collector = returned;
+                    protection::health("collector", "Protection collector loop", "active", "Collector loop is responding; individual sensor health and permission gaps are listed separately.");
+                    lock(&s.protection).set_sensors(collection.sensors);
+                    s.record_protection(collection.observations);
+                    s.record_protection(protection::drain());
+                }
+                Err(_) => {
+                    protection::health("collector", "Protection collectors", "unavailable", "The collector stopped unexpectedly; restarting. Activity during the gap may be missing.");
+                    collector = protection_sensors::Collector::new();
+                }
+            }
+        }
+    });
+
+    // A single event-driven investigator borrows the active Gemma/Qwen at background priority.
+    let s = shared.clone();
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(Duration::from_secs(10));
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            every.tick().await;
+            if !graph::ready() { continue; }
+            let incident = lock(&s.protection).next_investigation();
+            let Some(incident) = incident else { continue };
+            let Some(ctx) = s.ctx.get().cloned() else { continue };
+            let snapshot = s.snapshot();
+            let result = security_investigator::investigate(&ctx, &incident, &snapshot).await;
+            lock(&s.protection).finish_investigation(&incident.id, incident.revision, result);
+        }
+    });
+
     // AI tools started with their permission prompts off, from the sampler's process snapshot.
     if let Some(ctx) = shared.ctx.get() {
         agents::connect(ctx);
@@ -765,8 +863,91 @@ struct ActParams {
     action: String,
 }
 
+/// A user confirmation must still name the same live process, not a PID recycled since the
+/// incident. Refresh immediately before TERM; never use the sampler's cached identity here.
+fn stop_incident_process(pid: u32, started: u64, started_us: Option<u64>, executable: &str) -> Result<Value, RpcError> {
+    if pid <= 1 || pid == std::process::id() || started == 0 { return Err(RpcError::invalid_params("This process cannot be stopped from an incident.")); }
+    let mut sys = sysinfo::System::new();
+    let id = sysinfo::Pid::from_u32(pid);
+    sys.refresh_processes_specifics(sysinfo::ProcessesToUpdate::Some(&[id]), true,
+        sysinfo::ProcessRefreshKind::nothing().with_exe(sysinfo::UpdateKind::Always).with_user(sysinfo::UpdateKind::Always));
+    let process = sys.process(id).ok_or_else(|| RpcError::not_found("The process has already exited."))?;
+    if process.start_time() != started || process.exe().is_none_or(|p| p.to_str() != Some(executable)) {
+        return Err(RpcError::invalid_params("The process identity changed. No signal was sent."));
+    }
+    let entry = procs::Entry {
+        proc: cc_protocol::contracts::system::Proc { pid, started, name: process.name().to_string_lossy().into_owned(), ..Default::default() },
+        exe: executable.to_owned(), uid: process.user_id().map(|u| **u).unwrap_or(u32::MAX),
+    };
+    #[cfg(target_os = "macos")]
+    if let Some(expected) = started_us {
+        use libproc::libproc::bsd_info::BSDInfo;
+        use libproc::libproc::proc_pid::pidinfo;
+        let info = pidinfo::<BSDInfo>(pid as i32, 0).map_err(|_| RpcError::not_found("The native process identity is no longer readable."))?;
+        let actual = info.pbi_start_tvsec.saturating_mul(1_000_000).saturating_add(info.pbi_start_tvusec);
+        if actual != expected { return Err(RpcError::invalid_params("The native process start identity changed. No signal was sent.")); }
+    }
+    #[cfg(not(target_os = "macos"))]
+    if started_us.is_some() { return Err(RpcError::invalid_params("Native macOS process precision cannot be verified on this machine.")); }
+    procs::signal(&Snapshot { at: util::now_ms(), entries: vec![entry] }, &SignalParams { pid, signal: "TERM".into() })
+}
+
+async fn protection_status(shared: Arc<Shared>) -> Result<Value, RpcError> {
+    tokio::task::spawn_blocking(move || {
+        let mut status = lock(&shared.protection).status();
+        // Signature/provisioning checks may block on macOS; never hold the incident lock while
+        // they run, or collection and alerting would wait behind a UI status request.
+        status.deep_capture_command = protection_sensors::deep_capture_command();
+        status.deep_install_command = protection_sensors::deep_install_command();
+        to_value(&status)
+    })
+        .await.map_err(|_| RpcError::internal("Cannot read protection status."))?
+}
+
 async fn dispatch(shared: Arc<Shared>, method: &str, params: Value) -> Result<Value, RpcError> {
     match method {
+        methods::PROTECTION_STATUS => protection_status(shared.clone()).await,
+        methods::PROTECTION_CONFIGURE => {
+            let config: cc_protocol::contracts::system::ProtectionConfig = parse_params(params)?;
+            let _serial = shared.protection_actions.lock().await;
+            let memory_before = (graph::refused(), graph::dropped());
+            lock(&shared.protection).configure(config).map_err(RpcError::invalid_params)?;
+            if !graph::flush(Duration::from_secs(5)).await || memory_before != (graph::refused(), graph::dropped()) {
+                return Err(RpcError::new("unavailable", "Settings changed in this session, but local memory has not acknowledged them yet. Check protection status before restarting."));
+            }
+            protection_status(shared.clone()).await
+        }
+        methods::INCIDENT_GET => {
+            let IdParams { id } = parse_params(params)?;
+            let incident = lock(&shared.protection).incident(&id).ok_or_else(|| RpcError::not_found("That incident is no longer retained."))?;
+            to_value(&incident)
+        }
+        methods::INCIDENT_ACT => {
+            let action: cc_protocol::contracts::system::ProtectionAction = parse_params(params)?;
+            let _serial = shared.protection_actions.lock().await;
+            let memory_before = (graph::refused(), graph::dropped());
+            if action.action == "stop_process" {
+                if !action.confirm { return Err(RpcError::invalid_params("Confirm stopping the exact process shown in the incident.")); }
+                let incident = lock(&shared.protection).incident(&action.id).ok_or_else(|| RpcError::not_found("That incident is no longer retained."))?;
+                if action.expected_revision != Some(incident.revision) { return Err(RpcError::invalid_params("The incident changed. Review it and confirm again.")); }
+                let (Some(pid), Some(started), Some(executable)) = (action.expected_pid, action.expected_process_started, action.expected_executable.clone()) else {
+                    return Err(RpcError::invalid_params("The confirmation must include process ID, start time and executable."));
+                };
+                if !incident.observations.iter().any(|e| !e.source.starts_with("import:") && e.pid == Some(pid) && e.process_started == Some(started) && e.executable.as_ref() == Some(&executable) && e.process_started_us == action.expected_process_started_us && e.process_version == action.expected_process_version) {
+                    return Err(RpcError::invalid_params("That process identity is not supported by local incident evidence."));
+                }
+                let started_us = action.expected_process_started_us;
+                tokio::task::spawn_blocking(move || stop_incident_process(pid, started, started_us, &executable)).await.map_err(|_| RpcError::internal("The process check failed."))??;
+                let event = cc_protocol::contracts::system::SecurityObservation { at: util::now_ms(), source: "user action".into(), kind: "response".into(), severity: "info".into(), summary: "The user requested TERM for the confirmed process. This does not prove it exited or that the incident is resolved.".into(), subject: incident.key, pid: Some(pid), process_started: Some(started), process_started_us: action.expected_process_started_us, process_version: action.expected_process_version, executable: action.expected_executable, count: 1, ..Default::default() };
+                lock(&shared.protection).record(event, &shared.snapshot());
+            } else {
+                lock(&shared.protection).action(&action).map_err(RpcError::invalid_params)?;
+            }
+            if !graph::flush(Duration::from_secs(5)).await || memory_before != (graph::refused(), graph::dropped()) {
+                return Err(RpcError::new("unavailable", "The action completed in this session, but local memory has not acknowledged the update yet."));
+            }
+            protection_status(shared.clone()).await
+        }
         methods::METRICS => to_value(&*lock(&shared.metrics)),
         methods::PROCESSES => {
             let params: ProcessesParams = if params.is_null() { ProcessesParams::default() } else { parse_params(params)? };
@@ -814,8 +995,14 @@ async fn dispatch(shared: Arc<Shared>, method: &str, params: Value) -> Result<Va
         methods::CHECK => to_value(&shared.check(parse_params(params)?).await?),
         methods::KEYS_SET => {
             let KeysSetParams { name, value } = parse_params(params)?;
-            tokio::task::spawn_blocking(move || keys::set(&name, &value)).await.map_err(|e| RpcError::internal(e.to_string()))?.map_err(RpcError::invalid_params)?;
-            to_value(&keys::status())
+            tokio::task::spawn_blocking(move || {
+                keys::set(&name, &value)?;
+                malware::reset_lookup(&name);
+                Ok::<(), String>(())
+            }).await.map_err(|e| RpcError::internal(e.to_string()))?.map_err(RpcError::invalid_params)?;
+            let status = tokio::task::spawn_blocking(keys::status).await.map_err(|_| RpcError::internal("Cannot read key status."))?;
+            protection::keys_changed(&status);
+            to_value(&status)
         }
         methods::KEYS_STATUS => to_value(&tokio::task::spawn_blocking(keys::status).await.map_err(|e| RpcError::internal(e.to_string()))?),
         methods::CVE => {
@@ -1101,11 +1288,19 @@ impl Plugin for SystemPlugin {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--security-events") {
+        if let Err(error) = protection_sensors::endpoint_capture() {
+            eprintln!("CortexTerm event capture: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("CORTEX_LOG").unwrap_or_else(|_| "warn".into()))
         .with_writer(std::io::stderr)
         .init();
     keys::import_files();
+    protection::keys_changed(&keys::status());
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -1116,6 +1311,10 @@ fn main() {
     let code = runtime.block_on(async {
         let mut hello = Hello::new("cc-system", env!("CARGO_PKG_VERSION"), "system", "system@1");
         hello.provides = [
+            methods::PROTECTION_STATUS,
+            methods::PROTECTION_CONFIGURE,
+            methods::INCIDENT_GET,
+            methods::INCIDENT_ACT,
             methods::METRICS,
             methods::PROCESSES,
             methods::PROCESS,

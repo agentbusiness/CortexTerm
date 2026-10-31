@@ -1,8 +1,7 @@
 # Mac security skills (`skills-mac-security`)
 
 Security know-how for CortexTerm's model as one `skills@1` plugin (the `skills` family), macOS
-only: `security-check`, `security-explain`, `cve-check` and `security-incident`. The terminal flow
-lists the summaries before each message and the model reads one with its `skill` tool. The skills
+only: `security-check`, `security-explain`, `cve-check` and `security-incident`. Terminal flow 0.1.15 shortlists relevant summaries and attaches a clear match; the model can read another with `skill`. The skills
 send the model to one script, `macsec`, which runs the system plugin's checks; the code finds, the
 model explains what the check printed and never gives an all-clear of its own.
 
@@ -36,6 +35,22 @@ for the findings:
 - `macsec cve <ID>`: whether this Mac is affected by a CVE or GHSA, with CVSS, CISA KEV and EPSS.
 - `macsec areas`, `macsec help`.
 
+Filesystem discovery starts at the user's home folder, then continues from `/` through other
+users' folders, system folders and mounted volumes. Hidden/nested projects and directory symlink
+targets are included; directory identity prevents loops and duplicate traversal. Apps, project
+lockfiles/venvs, `.env` files, agent configs/instructions/skills and persistence checks use this
+discovery. Malware checks stream regular files in the same home-first order, without the old
+age, depth, file-count, file-size or total-scan-time cutoffs. A YARA file still has a 5 s timeout;
+errors name the file. Devices/process pseudo-filesystems and the scanner's own records/rules are
+excluded, and inaccessible locations are reported under `Not checked`.
+
+A full sweep waits for filesystem discovery and project dependency lookups. Short chat checks
+retain their explicit deadline and report cached/missing areas; cancellation stops their filesystem
+walks. Use `macsec check all --full` inside CortexTerm for a fresh full check. Discovery does not
+grant access: protected files still need the operating system's permissions. Dependency files over
+30 MiB and agent text files over 8 MiB remain explicitly reported as not checked. All Docker
+images are attempted, and all Sparkle app feeds are queried in batches of at most 20.
+
 Every fix the checks print is offered, never run.
 
 The terminal's risk engine (`plugins/terminal/backend/src/assess.rs`) lets the model run it on its
@@ -60,3 +75,7 @@ cortex-pack build plugins/skills-mac-security   # -> plugins/skills-mac-security
 The frame runs it once installed (`cortex-pack build plugins/skills-mac-security --install`). The
 probe runs `describe` (at least one skill), reads every skill back through `skill` (line 1 is the
 summary `describe` gave, a body follows) and asks for an unknown skill (`not_found`).
+
+## Skill wording 0.1.4
+
+The four cards use compact output-grounded instructions. No-findings results name their checked scope; incomplete checks remain visible. EPSS is not the chance that this particular Mac will be compromised. Security knowledge avoids unconditional exposure or compromise claims from a setting alone. This wording change has source review only; no fresh security sweep, build or model session was run. See [terminal skill release notes](../../docs/terminal-skills/README.md).

@@ -41,6 +41,7 @@ static OUTBOX: Mutex<VecDeque<Op>> = Mutex::new(VecDeque::new());
 static SENDING: AtomicBool = AtomicBool::new(false);
 /// Writes memory refused (and that were dropped).
 static REFUSED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DROPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
 static READY_SIGNAL: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
@@ -245,7 +246,11 @@ fn enqueue(op: Op) {
         let mut outbox = lock(&OUTBOX);
         outbox.push_back(op);
         while outbox.len() > BACKLOG {
-            outbox.pop_front();
+            // Never remove the write whose response the writer is awaiting. Otherwise its
+            // acknowledgement could pop a different, unsent write from the queue.
+            let index = usize::from(SENDING.load(Ordering::SeqCst));
+            outbox.remove(index);
+            DROPPED.fetch_add(1, Ordering::SeqCst);
             tracing::warn!("memory has been away too long: the oldest graph write was dropped");
         }
     }
@@ -296,6 +301,9 @@ pub fn refused() -> usize {
     REFUSED.load(Ordering::SeqCst)
 }
 
+/// Actual outbox overflows, visible to protection health instead of only the session log.
+pub fn dropped() -> usize { DROPPED.load(Ordering::SeqCst) }
+
 /// Writes waiting for memory.
 pub fn pending() -> usize {
     lock(&OUTBOX).len()
@@ -314,13 +322,15 @@ async fn writer(ctx: Ctx) {
     loop {
         let next = {
             let outbox = lock(&OUTBOX);
-            outbox.front().map(Op::call)
+            outbox.front().map(|op| {
+                SENDING.store(true, Ordering::SeqCst);
+                op.call()
+            })
         };
         let Some((method, params)) = next else {
             let _ = tokio::time::timeout(Duration::from_secs(5), WAKE.notified()).await;
             continue;
         };
-        SENDING.store(true, Ordering::SeqCst);
         let outcome = tokio::time::timeout(CALL_LIMIT, ctx.call(method, params)).await;
         let done = match outcome {
             Ok(Ok(_)) => true,
@@ -340,7 +350,8 @@ async fn writer(ctx: Ctx) {
         };
         if done {
             failures = 0;
-            lock(&OUTBOX).pop_front();
+            let mut outbox = lock(&OUTBOX);
+            outbox.pop_front();
             SENDING.store(false, Ordering::SeqCst);
         } else {
             failures += 1;

@@ -42,6 +42,23 @@ fn age_ms(feed: &Feed) -> Option<u64> {
     docs::fetched(feed.file).map(|at| now_ms().saturating_sub(at))
 }
 
+/// Cached threat coverage is visible even offline; an old or missing feed is never called clean.
+pub fn protection_health() -> Vec<cc_protocol::contracts::system::ProtectionSensor> {
+    THREATS.iter().map(|feed| {
+        let fetched = docs::fetched(feed.file);
+        let fresh = fetched.is_some_and(|at| now_ms().saturating_sub(at) <= feed.days * DAY * 2);
+        cc_protocol::contracts::system::ProtectionSensor {
+            id: format!("feed:{}", feed.file), label: feed.name.into(),
+            state: if fresh { "active" } else if fetched.is_some() { "degraded" } else { "unavailable" }.into(),
+            detail: match fetched {
+                Some(at) => format!("Cached threat list fetched {} hours ago. {}", now_ms().saturating_sub(at) / 3_600_000, if fresh { "Used for destination matches; a match does not identify the person behind an address." } else { "Refresh is overdue; matches may be incomplete." }),
+                None => "No cached threat list is available; this source provides no coverage yet.".into(),
+            },
+            last_at: fetched.unwrap_or(0), dropped: 0,
+        }
+    }).collect()
+}
+
 /// The list's address, by document name.
 pub fn url_of(name: &str) -> Option<&'static str> {
     THREATS.iter().chain([&ASN, &OUI]).find(|f| f.file == name).map(|f| f.url)

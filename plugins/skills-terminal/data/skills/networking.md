@@ -1,26 +1,15 @@
-Network trouble: no internet, DNS, a host or port not reachable, Wi-Fi, IP addresses, proxies, VPN.
+Triage internet, DNS or service connectivity by separating interface, route, DNS, TCP and TLS.
 
-Go from the bottom up and stop at the first layer that fails. Each step with `run`:
+## Inspect
 
-1. Interface and address: `ifconfig | grep -E '^[a-z]|inet '` (macOS) or `ip -brief addr` (Linux). A `169.254.x.x` address means no DHCP answer.
-2. Router: `route -n get default | grep gateway` (macOS) or `ip route | grep default`, then `ping -c 3 <gateway>`.
-3. Internet by number: `ping -c 3 1.1.1.1`.
-4. DNS: `dig +short example.com` (or `nslookup example.com`). Fails while step 3 works: a DNS problem. Which resolver: `scutil --dns | grep nameserver | sort -u` (macOS), `resolvectl status` (Linux).
-5. The service: `nc -vz -G 5 <host> <port>` (macOS; `-w 5` on Linux). `curl -sS -o /dev/null -w '%{http_code} %{time_total}s\n' https://<host>` for HTTP.
-6. TLS: `curl -vI https://<host> 2>&1 | grep -iE 'expire|subject|issuer|SSL'`.
+Establish the affected target, destination and service. On macOS inspect the relevant `ifconfig` interface and `route -n get <address>`; on Linux use supported `ip` address and route queries. Do not assume the Wi-Fi interface is en0 or that every Linux utility is GNU.
 
-Always give `ping` a count (`-c 3`) and `nc` or `curl` a time limit: `run` stops after 20 seconds.
+Use the intended protocol with a deadline. A counted ping can provide evidence, but missing ICMP replies do not prove the internet or a server is down. Try the relevant TCP or HTTP connection before drawing that conclusion.
 
-## Other facts
+Check DNS separately with an installed resolver tool, using bounded retries. Compare system, VPN and container resolver context when results differ. For HTTP use curl connection and total deadlines; keep credentials out of verbose output. A network command refused by `run` becomes a user-run proposal, not a reason to bypass the risk engine.
 
-- Public address: `curl -s https://ifconfig.me`.
-- Wi-Fi network: `networksetup -getairportnetwork en0` (the interface may be `en1`).
-- Proxy: `scutil --proxy`, and `env | grep -i proxy` for the shell.
-- VPN: an extra `utun` interface in `ifconfig`, routes in `netstat -rn -f inet`.
-- Who listens here: `lsof -nP -iTCP -sTCP:LISTEN`.
-- `/etc/hosts` overrides DNS: `grep -v '^#' /etc/hosts`.
+## Interpret and continue
 
-## Fixes (theirs to run)
+Name the layer whose check failed and what remains unknown. An open port does not prove application health. IPv4, IPv6, proxies and VPNs can take different paths.
 
-- Flush the DNS cache on macOS: `sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder`.
-- Renew DHCP: `sudo ipconfig set en0 DHCP`.
+Propose one observed correction through the active configuration owner. Preserve remote access before network changes. Verify the original operation afterward; use the focused DNS, TLS, firewall or address skill for that branch.

@@ -1,7 +1,7 @@
 //! Intrusion evidence: a digest of the unified log (fixed queries, each time-limited: XProtect,
 //! Gatekeeper, privacy grants, sudo, SSH and screen-sharing logins, new background items), the
-//! optional deep watch with Apple's `eslogger` (root, so only offered as a command; its output is
-//! read by the next sweep), and the incident timeline that puts what code can gather in time order.
+//! legacy finished eslogger recordings (import only), and the incident timeline. New deep
+//! collection uses the native, sanitized protection sensor; no raw eslogger command is offered.
 
 use crate::procs::Snapshot;
 use crate::sweep::Part;
@@ -167,27 +167,12 @@ fn digest(part: &mut Part, rows: &[LogRow]) {
     }
 }
 
-// --- 45. The deep watch with eslogger.
-
-const ES_EVENTS: &str = "exec btm_launch_item_add xp_malware_detected xp_malware_remediated tcc_modify gatekeeper_user_override openssh_login screensharing_attach od_create_user";
+// --- Import finished legacy recordings; the supported producer lives in protection_sensors.
 
 fn eslogger(part: &mut Part) {
-    let file = deep::dir().join("eslogger.jsonl");
-    // eslogger needs root and stops with the shell; the background job ends itself after an hour.
-    let command = format!(
-        "mkdir -p {dir} && sudo sh -c 'eslogger {ES_EVENTS} > \"{out}\" & pid=$!; sleep 3600; kill $pid'",
-        dir = malware::quote(&deep::dir()),
-        out = file.display()
-    );
     let recording = deep::eslogger(flag_events);
     let Some((at, events, notes)) = recording.filter(|(at, _, _)| now_ms().saturating_sub(*at) < 7 * DAY_MS) else {
-        part.add(
-            "info",
-            "intrusion",
-            "For a closer look, Apple's eslogger can record every program start, new background item, XProtect detection and permission change for an hour. It needs an administrator; run the command in a terminal (it needs Full Disk Access for that terminal) and the next sweep reads what it saw.".into(),
-            Some(command),
-            "eslogger",
-        );
+        part.skipped.push("Native endpoint coverage is shown in Alerts & Security > Protection. Enable deep monitoring and explicitly install/start the signed sensor there. No raw eslogger capture is started or offered.".into());
         return;
     };
     for (severity, text) in notes {

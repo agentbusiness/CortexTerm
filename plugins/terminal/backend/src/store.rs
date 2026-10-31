@@ -292,29 +292,72 @@ struct Outbox {
 /// The history, in memory, for what must answer at once.
 #[derive(Default)]
 struct History {
-    ids: HashSet<String>,
-    /// The last time each command ran in each folder.
-    last: HashMap<(String, String), u64>,
+    /// Whether a Run has already contributed its finished outcome.
+    ids: HashMap<String, bool>,
+    commands: HashMap<(String, String), CommandHistory>,
+    previous: HashMap<String, Run>,
     /// The latest finished durations per command and folder: (started, duration).
     durations: HashMap<(String, String), Vec<(u64, u64)>>,
     shapes: HashSet<String>,
 }
 
+#[derive(Default)]
+struct CommandHistory {
+    last: u64,
+    runs: u32,
+    successes: u32,
+    failures: u32,
+    last_exit: Option<i32>,
+    /// Commands observed immediately before this one, with their outcome (failed or not).
+    follows: HashMap<(String, Option<bool>), u32>,
+}
+
 impl History {
-    fn add(&mut self, id: &str, command: &str, cwd: &str, started: u64, finished: Option<u64>) {
+    fn add(&mut self, run: &Run) {
+        let Run { id, command, cwd, started, .. } = run;
         if command.is_empty() {
             return;
         }
+        let known = self.ids.get(id).copied();
+        let first = known.is_none();
+        let finished = run.ended.is_some() && !known.unwrap_or(false);
+        self.ids.insert(id.clone(), run.ended.is_some() || known.unwrap_or(false));
         let key = (command.to_owned(), cwd.to_owned());
-        let last = self.last.entry(key.clone()).or_default();
-        *last = (*last).max(started);
-        if self.ids.insert(id.to_owned()) {
+        if first {
             self.shapes.extend(crate::habits::shapes(command));
         }
-        if let Some(duration) = finished {
+        // Background checks are not the user's habits, even when they run often.
+        if run.author != "agent" && run.term_id != "service" {
+            let stats = self.commands.entry(key.clone()).or_default();
+            if first {
+                stats.runs = stats.runs.saturating_add(1);
+                if let Some(previous) = self.previous.get(&run.term_id)
+                    && previous.cwd == *cwd && previous.command != *command
+                    && *started > previous.started && started.saturating_sub(previous.ended.unwrap_or(previous.started)) <= 30 * 60 * 1000
+                {
+                    let count = stats.follows.entry((previous.command.clone(), previous.exit_code.map(|code| code != 0))).or_default();
+                    *count = count.saturating_add(1);
+                }
+            }
+            if finished {
+                if run.exit_code == Some(0) {
+                    stats.successes = stats.successes.saturating_add(1);
+                } else if run.exit_code.is_some() {
+                    stats.failures = stats.failures.saturating_add(1);
+                }
+            }
+            if *started >= stats.last {
+                stats.last = *started;
+                stats.last_exit = run.exit_code;
+            }
+            if !run.term_id.is_empty() && self.previous.get(&run.term_id).is_none_or(|previous| *started >= previous.started) {
+                self.previous.insert(run.term_id.clone(), run.clone());
+            }
+        }
+        if run.ended.is_some() {
             let list = self.durations.entry(key).or_default();
-            if !list.iter().any(|(at, _)| *at == started) {
-                list.push((started, duration));
+            if !list.iter().any(|(at, _)| at == started) {
+                list.push((*started, run.duration_ms));
                 if list.len() > USUAL_KEEP {
                     list.sort_unstable();
                     list.remove(0);
@@ -381,7 +424,7 @@ impl Store {
 
     /// A Run started; `path` is its shell's PATH.
     pub fn started(&self, run: &Run, path: Option<String>) {
-        crate::lock(&self.history).add(&run.id, &run.command, &run.cwd, run.started, None);
+        crate::lock(&self.history).add(run);
         let mut outbox = crate::lock(&self.outbox);
         // A shell opened by this process has no Run before its first one; for any other the
         // writer asks the graph.
@@ -396,7 +439,7 @@ impl Store {
 
     /// A Run finished.
     pub fn finished(&self, run: &Run) {
-        crate::lock(&self.history).add(&run.id, &run.command, &run.cwd, run.started, run.ended.map(|_| run.duration_ms));
+        crate::lock(&self.history).add(run);
         let mut outbox = crate::lock(&self.outbox);
         outbox.seq += 1;
         let seq = outbox.seq;
@@ -746,7 +789,9 @@ impl Store {
             let rows = self
                 .query(
                     "MATCH (r:CommandRun) WHERE r.command <> '' OPTIONAL MATCH (r)-[:IN]->(f:Folder) \
-                     RETURN r.key, r.command, f.key, r.started_ms, r.finished_ms, r.duration_ms ORDER BY r.started_ms DESC SKIP $skip LIMIT $limit",
+                     OPTIONAL MATCH (r)-[:IN_SHELL]->(s:Shell) \
+                     RETURN r.key, r.command, f.key, r.started_ms, r.finished_ms, r.duration_ms, s.key, r.exit_code, r.author \
+                     ORDER BY r.started_ms DESC SKIP $skip LIMIT $limit",
                     json!({"skip": skip, "limit": PAGE}),
                 )
                 .await?;
@@ -758,11 +803,25 @@ impl Store {
             skip += n;
         }
         let mut history = crate::lock(&self.history);
+        // Reconstruct historical sequences in time order even if a live Run arrived while
+        // the graph was loading; afterwards keep the newer live predecessor for each shell.
+        let live_previous = std::mem::take(&mut history.previous);
         for row in rows_all.iter().rev() {
             let s = |i: usize| row.get(i).and_then(Value::as_str).unwrap_or("");
             let started = row.get(3).and_then(Value::as_u64).unwrap_or(0);
-            let finished = row.get(4).and_then(Value::as_u64).map(|_| row.get(5).and_then(Value::as_u64).unwrap_or(0));
-            history.add(s(0), s(1), s(2), started, finished);
+            history.add(&Run {
+                id: s(0).into(), command: s(1).into(), cwd: s(2).into(), started,
+                ended: row.get(4).and_then(Value::as_u64),
+                duration_ms: row.get(5).and_then(Value::as_u64).unwrap_or(0),
+                term_id: s(6).into(), exit_code: row.get(7).and_then(Value::as_i64).map(|code| code as i32),
+                author: s(8).into(),
+                ..Run::default()
+            });
+        }
+        for (term, run) in live_previous {
+            if history.previous.get(&term).is_none_or(|previous| run.started >= previous.started) {
+                history.previous.insert(term, run);
+            }
         }
         Ok(())
     }
@@ -784,14 +843,41 @@ impl Store {
         history.durations.get(&(command.to_owned(), cwd.to_owned())).map_or(0, |list| median(list.iter().map(|(_, d)| *d).collect()))
     }
 
-    /// The newest command that starts with `line` (and is longer), from `cwd` first.
-    pub fn suggestion(&self, line: &str, cwd: &str) -> Option<String> {
+    /// Rank actual commands by place, learned sequences, successful use and recency.
+    pub fn suggestion(&self, line: &str, cwd: &str, term_id: &str) -> Option<String> {
+        if line.trim().len() < 2 || line.chars().any(char::is_control) {
+            return None;
+        }
         let history = crate::lock(&self.history);
+        let now = crate::marks::now_ms();
+        let folders = crate::habits::scope(cwd);
+        let previous = history.previous.get(term_id).filter(|run| now.saturating_sub(run.ended.unwrap_or(run.started)) <= 30 * 60 * 1000);
+        let previous_key = previous.map(|run| (run.command.clone(), run.exit_code.map(|code| code != 0)));
+        let rank = |folder: &str, stats: &CommandHistory| {
+            let place = folders.iter().position(|f| f == folder).map_or(0, |depth| {
+                if depth == 0 { 120 } else { 70i64.saturating_sub(depth as i64 * 10).max(10) }
+            });
+            let sequence = previous.filter(|run| run.cwd == folder)
+                .and_then(|_| previous_key.as_ref().and_then(|key| stats.follows.get(key)))
+                .copied().unwrap_or(0).min(5) as i64 * 20;
+            let frequency = stats.runs.max(1).ilog2().min(6) as i64 * 6;
+            let reliability = (stats.successes as i64 * 30) / (stats.successes as i64 + stats.failures as i64).max(1);
+            let age_hours = now.saturating_sub(stats.last) / 3_600_000;
+            let recency = 40 / (1 + age_hours.min(40) as i64);
+            let failed = if stats.last_exit.is_some_and(|code| code != 0) { 45 } else { 0 };
+            (place + sequence + frequency + reliability + recency - failed, stats.last)
+        };
         history
-            .last
+            .commands
             .iter()
-            .filter(|((command, _), _)| command.starts_with(line) && command != line)
-            .max_by_key(|((_, folder), at)| (folder == cwd, **at))
+            .filter(|((command, _), stats)| {
+                command.starts_with(line) && command != line && command.len() <= 2048
+                    && !command.chars().any(char::is_control)
+                    && !(stats.successes == 0 && stats.failures > 0)
+            })
+            .max_by(|((a_command, a_folder), a), ((b_command, b_folder), b)| {
+                rank(a_folder, a).cmp(&rank(b_folder, b)).then_with(|| b_command.cmp(a_command))
+            })
             .map(|((command, _), _)| command.clone())
     }
 

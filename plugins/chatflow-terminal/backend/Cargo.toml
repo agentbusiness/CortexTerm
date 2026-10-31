@@ -15,10 +15,10 @@ name = "cc-chatflow-terminal"
 path = "src/main.rs"
 
 [dependencies]
-cc-protocol = { path = "../../../protocol", features = ["chatflow", "mesh", "model", "terminal", "system", "service", "skills"] }
+cc-protocol = { path = "../../../protocol", features = ["chatflow", "memory", "mesh", "model", "terminal", "system", "service", "skills"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process", "io-util"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 uuid = { version = "1.23", features = ["v4"] }
 tracing = "0.1.44"

@@ -341,3 +341,7 @@ decisions, facts with the user's first, concepts by how much code they bind, ope
 line each, the longest prefix within `budget_tokens` as the model counts them, bytes without a
 model). `memory.knowledge.changed` is published after every write. `tests/knowledge.rs` covers it
 on the real engine.
+
+## Terminal query skill 0.1.13
+
+The shipped query card now uses the terminal graph contract (`memory.graph.query`) and schema inspection. It does not assume CortexCode project variables, code-graph layers or a `read` URI tool. The terminal flow discovers this existing memory skill carrier on demand. Only the card and its consumer change; no memory wire contract, graph storage or sharing rule changes. Source review only: no build or live graph query was performed for this skill update.

@@ -383,6 +383,8 @@ pub struct Watch {
     /// (trust key, remote) -> when new connections to it began (Unix ms).
     starts: HashMap<(String, IpAddr), VecDeque<u64>>,
     procs: HashMap<u32, ProcInfo>,
+    /// Last sample's PID/start/executable, required before interpreting a counter delta.
+    incarnations: HashMap<u32, (u64, String)>,
     /// pid -> (the terminal command it belongs to, last seen).
     runs: HashMap<u32, (String, u64)>,
     /// Gone from the first sample: flows already open then are not "new".
@@ -399,6 +401,7 @@ impl Watch {
             bytes: HashMap::new(),
             starts: HashMap::new(),
             procs: HashMap::new(),
+            incarnations: HashMap::new(),
             runs: HashMap::new(),
             first: true,
         })
@@ -480,25 +483,30 @@ impl Watch {
             Ok(sample) => sample,
             Err(error) => {
                 tracing::info!("network watcher: {error}");
+                crate::protection::health("connections", "App connections", "unavailable", "The connection sample failed; network activity during this interval may be missing.");
                 return Vec::new();
             }
         };
+        crate::protection::health("connections", "App connections", "active", "Connection metadata sampled every 15 seconds. Short-lived connections can be missed; this is not packet capture.");
         let tables = feeds::tables();
         let by_pid: HashMap<u32, &crate::procs::Entry> = snapshot.entries.iter().map(|e| (e.proc.pid, e)).collect();
+        let incarnations: HashMap<u32, (u64, String)> = snapshot.entries.iter().filter(|e| e.proc.started > 0 && !e.exe.is_empty()).map(|e| (e.proc.pid, (e.proc.started, e.exe.clone()))).collect();
         let parents: HashMap<u32, u32> = snapshot.entries.iter().map(|e| (e.proc.pid, e.proc.ppid)).collect();
-        self.procs.retain(|pid, _| sample.contains_key(pid));
+        self.procs.retain(|pid, _| sample.contains_key(pid) && self.incarnations.get(pid) == incarnations.get(pid));
         let learning = self.learning();
         let hour = now / HOUR;
         let mut found = Vec::new();
         let mut flows_now = HashMap::new();
+        let mut evidence_count = 0usize;
 
         for (pid, (name, flows)) in &sample {
+            let same_incarnation = incarnations.contains_key(pid) && self.incarnations.get(pid) == incarnations.get(pid);
             let online: Vec<&Flow> = flows.iter().filter(|f| public(f.remote)).collect();
             // Bytes sent to the internet since the last sample (a new flow counts whole).
             let mut uploaded = 0;
             for f in flows.iter().filter(|f| f.counted) {
                 let key = (*pid, f.proto.clone(), f.local_port, f.remote, f.remote_port);
-                let before = self.flows.get(&key).copied();
+                let before = same_incarnation.then(|| self.flows.get(&key).copied()).flatten();
                 flows_now.insert(key, f.bytes_out);
                 if public(f.remote) {
                     uploaded += match before {
@@ -594,6 +602,33 @@ impl Watch {
                 let owner = tables.owner(flow.remote);
                 let to = format!("{} on port {}, {}", flow.remote, flow.remote_port, owner.label());
                 let new_flow = !self.first && !self.flows.contains_key(&(*pid, flow.proto.clone(), flow.local_port, flow.remote, flow.remote_port));
+
+                if flow.counted && same_incarnation && evidence_count < 256 {
+                    let previous = self.flows.get(&(*pid, flow.proto.clone(), flow.local_port, flow.remote, flow.remote_port)).copied();
+                    if let Some(delta) = previous.and_then(|before| flow.bytes_out.checked_sub(before)).filter(|delta| *delta > 0) {
+                        if let Some(entry) = by_pid.get(pid) {
+                            crate::protection::observe(cc_protocol::contracts::system::SecurityObservation {
+                                at: now, source: "connection watcher".into(), kind: "outbound".into(), severity: "info".into(),
+                                summary: format!("{} sent {delta} bytes to {} on port {} between two samples of the same process and flow. Payload, purpose and connection initiation were not observed.", info.app, flow.remote, flow.remote_port),
+                                rule: "network.sent_bytes".into(), subject: format!("process:{}:{}", pid, entry.proc.started),
+                                pid: Some(*pid), process_started: Some(entry.proc.started), parent_pid: Some(entry.proc.ppid), executable: Some(info.exe.clone()), remote: Some(flow.remote.to_string()), port: Some(flow.remote_port), count: 1, ..Default::default()
+                            });
+                            evidence_count += 1;
+                        }
+                    }
+                }
+
+                if (new_flow || self.first) && evidence_count < 256 {
+                    if let Some(entry) = by_pid.get(pid).filter(|e| e.proc.started > 0 && !info.exe.is_empty()) {
+                        crate::protection::observe(cc_protocol::contracts::system::SecurityObservation {
+                            at: now, source: "connection watcher".into(), kind: "connection".into(), severity: "info".into(),
+                            summary: format!("{} has a {} connection with {} on port {}. Observed byte counters: {} received, {} sent; connection initiation and payload are not observed.", info.app, flow.proto, flow.remote, flow.remote_port, flow.bytes_in, flow.bytes_out),
+                            subject: format!("process:{}:{}", pid, entry.proc.started), pid: Some(*pid), process_started: Some(entry.proc.started),
+                            parent_pid: Some(entry.proc.ppid), executable: Some(info.exe.clone()), remote: Some(flow.remote.to_string()), port: Some(flow.remote_port), count: 1, ..Default::default()
+                        });
+                        evidence_count += 1;
+                    }
+                }
 
                 if let Some(list) = tables.threat(flow.remote) {
                     // Cloud addresses change hands, so a listed one there is noted, not alerted.
@@ -693,6 +728,7 @@ impl Watch {
         }
 
         self.flows = flows_now;
+        self.incarnations = incarnations;
         self.bytes = sample
             .iter()
             .flat_map(|(pid, (_, flows))| flows.iter().map(move |f| ((*pid, f.proto.clone(), f.local_port, f.remote, f.remote_port), (f.bytes_out, f.bytes_in))))
