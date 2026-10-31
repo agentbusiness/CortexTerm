@@ -50,9 +50,11 @@ struct Live {
     written: bool,
     /// Ended: flushed one last time, then dropped.
     done: bool,
-    /// A job this plugin started: it ends with [`Tracer::finish`] (which brings its output), not
-    /// when its processes are gone.
+    /// Its asker ends it with [`Tracer::finish`] (which brings its output), not when its
+    /// processes are gone.
     held: bool,
+    /// When a held trace's processes were first seen gone.
+    gone_at: Option<u64>,
 }
 
 pub struct Tracer {
@@ -144,6 +146,7 @@ impl Tracer {
                 written: true,
                 done: false,
                 held: false,
+                gone_at: None,
             });
         }
         self.restored = false;
@@ -211,6 +214,7 @@ impl Tracer {
             written: true,
             done: false,
             held: false,
+            gone_at: None,
         };
         self.live.insert(info.id.clone(), live);
         self.save();
@@ -246,39 +250,12 @@ impl Tracer {
             written: false,
             done: false,
             held: false,
+            gone_at: None,
         };
         self.live.insert(info.id, live);
     }
 
-    /// A command this plugin (or a service caller) starts itself: its process and children are
-    /// recorded from now; [`Tracer::finish`] ends it with the output and exit code. `info` names
-    /// the pid, label, command, folder, source, who asked and the Run or schedule it belongs to.
-    pub fn start_job(&mut self, mut info: TraceInfo) -> TraceInfo {
-        info.id = new_id(info.pid);
-        info.label = info.label.chars().take(200).collect();
-        if info.asked_by.is_empty() {
-            info.asked_by = "cortexterm".into();
-        }
-        info.started = now_ms();
-        let pid = info.pid;
-        let live = Live {
-            info: info.clone(),
-            root: pid,
-            with_root: true,
-            since: 0,
-            root_started: 0,
-            tree: HashMap::new(),
-            open: HashMap::new(),
-            pending: Vec::new(),
-            written: true,
-            done: false,
-            held: true,
-        };
-        self.live.insert(info.id.clone(), live);
-        info
-    }
-
-    /// A job started with [`Tracer::start_job`] ended: its output lines (`(at, text)`) and exit code.
+    /// A held trace ([`Tracer::hold`]) ended: its output lines (`(at, text)`) and exit code.
     pub fn finish(&mut self, id: &str, ended: u64, exit_code: Option<i32>, output: Vec<(u64, String)>) {
         let Some(live) = self.live.get_mut(id) else { return };
         live.pending.extend(output.into_iter().map(|(at, text)| TraceRecord { at, kind: "output".into(), text, ..Default::default() }));
@@ -330,6 +307,14 @@ impl Tracer {
         Some(info)
     }
 
+    /// A trace started with [`Tracer::start`] that its asker ends ([`Tracer::finish`]).
+    pub fn hold(&mut self, id: &str) {
+        if let Some(live) = self.live.get_mut(id) {
+            live.held = true;
+            live.info.limits.retain(|limit| !limit.starts_with("Its output"));
+        }
+    }
+
     pub fn is_live(&self, id: &str) -> bool {
         self.live.get(id).is_some_and(|live| !live.done)
     }
@@ -355,6 +340,12 @@ impl Tracer {
         for live in self.live.values_mut().filter(|live| !live.done) {
             // A scan taken before the trace began may not have its process yet.
             let gone = !by_pid.contains_key(&live.root) && at > live.info.started;
+            // A held trace whose asker never ends it (it stopped) ends a minute after its processes.
+            if gone && live.held && at.saturating_sub(*live.gone_at.get_or_insert(at)) > 60_000 {
+                live.info.limits.push("The app that ran it did not say how it ended.".into());
+                end(live, at);
+                continue;
+            }
             if gone && live.held {
                 for (pid, name) in live.tree.drain() {
                     live.pending.push(TraceRecord { at, kind: "end".into(), pid, name, ..Default::default() });
@@ -505,6 +496,7 @@ impl Tracer {
             written: true,
             done: true,
             held: false,
+            gone_at: None,
         });
         records.append(&mut live.pending);
         if records.len() > BACKLOG {

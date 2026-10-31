@@ -102,7 +102,7 @@ pub async fn run() -> Moved {
     if let Some(keys) = read::<Vec<String>>(&path) {
         let mut n = 0;
         for key in &keys {
-            if store.ignore(key, true).is_ok() {
+            if store.ignore(key).is_ok() {
                 n += 1;
             }
         }

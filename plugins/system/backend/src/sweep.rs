@@ -32,7 +32,7 @@ impl Part {
     pub fn add(&mut self, severity: &str, kind: &str, text: String, fix: Option<String>, source: &str) {
         let key = format!("{kind}:{text}");
         self.at_check.push(self.checked.len());
-        self.findings.push(Finding { severity: severity.into(), kind: kind.into(), text, fix, source: source.into(), key, ignored: false, about: None });
+        self.findings.push(Finding { severity: severity.into(), kind: kind.into(), text, fix, source: source.into(), key, ..Default::default() });
     }
 
     /// The last finding added is about this node (which `graph` or the graph already holds).
@@ -310,6 +310,11 @@ pub async fn run_areas(areas: &[Area], within: Option<Duration>, last: &SweepRep
     }
     all.skipped.sort();
     all.skipped.dedup();
+    for finding in &mut all.findings {
+        if finding.group.is_empty() {
+            finding.group = group_of(finding);
+        }
+    }
     all.findings.sort_by_key(|f| rank(&f.severity));
     let report = SweepReport {
         at: now_ms(),
@@ -317,6 +322,7 @@ pub async fn run_areas(areas: &[Area], within: Option<Duration>, last: &SweepRep
         findings: all.findings,
         checked: all.checked,
         skipped: all.skipped,
+        ..Default::default()
     };
     (report, all.graph)
 }
@@ -327,15 +333,29 @@ fn merged((a, b): (Part, Part)) -> Part {
     part
 }
 
-/// The report with the findings in `ignored` marked (older reports get their keys here).
-pub fn mark(mut report: SweepReport, ignored: &[String]) -> SweepReport {
-    for finding in &mut report.findings {
-        if finding.key.is_empty() {
-            finding.key = format!("{}:{}", finding.kind, finding.text);
-        }
-        finding.ignored = ignored.contains(&finding.key);
+/// What a finding is about, the same for every finding on one thing: the node it is about (a
+/// file by the app or bundle that holds it), else the check that found it.
+pub fn group_of(finding: &Finding) -> String {
+    match &finding.about {
+        Some((_, key)) if key.starts_with('/') => bundle_of(key),
+        Some((_, key)) => key.clone(),
+        None => finding.source.clone(),
     }
-    report
+}
+
+/// The outermost bundle a path is in (`/Applications/Zoom.app`), else the path, home as `~`.
+fn bundle_of(path: &str) -> String {
+    const BUNDLES: [&str; 8] = [".app", ".bundle", ".framework", ".kext", ".plugin", ".appex", ".xpc", ".pkg"];
+    let mut end = path.len();
+    let mut at = 0;
+    for part in path.split('/') {
+        at += part.len() + 1;
+        if BUNDLES.iter().any(|ext| part.ends_with(ext)) {
+            end = (at - 1).min(path.len());
+            break;
+        }
+    }
+    tilde(Path::new(&path[..end]))
 }
 
 /// Homebrew (vulns and outdated), and the global npm, pipx and cargo tools in OSV.

@@ -197,9 +197,14 @@ pub mod methods {
     pub const SWEEP: &str = "system.sweep";
     /// `{}` -> [`super::SweepReport`]: run the sweep now.
     pub const SWEEP_RUN: &str = "system.sweep.run";
-    /// [`super::IgnoreParams`] -> [`super::SweepReport`]: stop (or resume) worrying about one
-    /// finding. Remembered across sweeps and restarts, keyed by [`super::Finding::key`].
-    pub const FINDING_IGNORE: &str = "system.finding.ignore";
+    /// [`super::DecideParams`] -> [`super::SweepReport`]: decide about a group of findings, or
+    /// take the decision back. Kept in the graph across sweeps and restarts.
+    pub const FINDING_DECIDE: &str = "system.finding.decide";
+    /// [`super::VerifyParams`] -> [`super::Verified`]: after a fix ran, check the finding's area
+    /// again; gone closes it, still there records the command as tried.
+    pub const FINDING_VERIFY: &str = "system.finding.verify";
+    /// [`super::HistoryParams`] -> [`super::History`]: what came up over the last days, bucketed.
+    pub const SECURITY_HISTORY: &str = "system.security.history";
     /// [`super::CheckParams`] -> [`super::SweepReport`]: run the sweep's checks for some areas
     /// only (`settings`, `updates`, `apps`, `packages`, `malware`, `persistence`, `privacy`,
     /// `intrusion`, `network`, `agents`, `ssh`, `secrets`, or `all`). It never replaces the stored
@@ -256,12 +261,13 @@ pub mod methods {
     /// [`super::TraceStartParams`] -> `memory::TraceInfo`: start recording a process and its
     /// children. Every Run a terminal starts is traced without asking (once it is seen running).
     pub const TRACE_RUN: &str = "system.trace.run";
-    /// `{id}` -> `memory::TraceInfo`: stop recording.
+    /// [`super::TraceStopParams`] -> `memory::TraceInfo`: stop recording.
     pub const TRACE_STOP: &str = "system.trace.stop";
     /// `memory::TraceListParams` -> `memory::TraceList`: the traces kept, newest first.
     pub const TRACE_LIST: &str = "system.trace.list";
     /// [`super::TraceReadParams`] -> by `size`: `line` `{line}`; `summary` `memory::TraceSummary`
-    /// (without its series); `series` `{from, to, series}`; `records` `memory::TraceWindow`.
+    /// (without its series); `series` `{from, to, series}`; `records` `memory::TraceWindow`; with
+    /// `at`, `service::Moment`.
     pub const TRACE_READ: &str = "system.trace.read";
     /// `{id}` -> `memory::TraceGraph`.
     pub const TRACE_GRAPH_GET: &str = "system.trace.graph.get";
@@ -274,7 +280,7 @@ pub mod topics {
     pub const SAMPLE: &str = "system.sample";
     /// [`super::Alert`]: a watcher fired.
     pub const ALERT: &str = "system.alert";
-    /// [`super::ScheduleRun`]: a scheduled job finished.
+    /// `service::ScheduleDone`: a scheduled job finished.
     pub const SCHEDULE_DONE: &str = "system.schedule.done";
 }
 
@@ -691,24 +697,96 @@ pub struct Finding {
     /// Stable identity across sweeps (`kind:text`); what an ignore is remembered by.
     #[serde(default)]
     pub key: String,
-    /// The user said not to worry about it: listed apart, never alerted or counted.
+    /// A decision covers it: listed apart, never alerted or counted.
     #[serde(default)]
     pub ignored: bool,
+    /// What it is about, the same for every finding on one thing (`openssl@3`, an app's bundle
+    /// path): findings are grouped and decided by it.
+    #[serde(default)]
+    pub group: String,
+    /// The verdict of the decision covering it (see [`Decision`]); empty when open.
+    #[serde(default)]
+    pub decision: String,
+    /// A command that ran to fix it and did not: a fresh check still found it.
+    #[serde(default)]
+    pub tried: Option<String>,
     /// The graph node it is about, as (label, key): the plugin's own record, never sent.
     #[serde(skip)]
     pub about: Option<(String, String)>,
 }
 
+/// The person's decision about a group of findings. It hides them from the open list; the checks
+/// keep running, and a finding worse than `severity` (or, with `keys`, any other finding) shows again.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct IgnoreParams {
-    pub key: String,
-    /// false takes the ignore back.
-    #[serde(default = "yes")]
-    pub ignore: bool,
+pub struct Decision {
+    /// expected | false_alarm | accepted | vendor
+    pub verdict: String,
+    pub group: String,
+    /// Only these findings (their keys); empty: the whole group.
+    #[serde(default)]
+    pub keys: Vec<String>,
+    /// The worst severity it covers.
+    pub severity: String,
+    /// Unix milliseconds.
+    pub at: u64,
+    /// Unix milliseconds it ends; 0: no end.
+    #[serde(default)]
+    pub until: u64,
 }
 
-fn yes() -> bool {
-    true
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct DecideParams {
+    pub group: String,
+    /// A [`Decision`] verdict; `fixed` checks again and closes what is gone; empty takes the
+    /// group's decision back.
+    #[serde(default)]
+    pub verdict: String,
+    #[serde(default)]
+    pub keys: Vec<String>,
+    /// How long it holds; 0: no end.
+    #[serde(default)]
+    pub days: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct VerifyParams {
+    pub key: String,
+    /// The command that ran to fix it.
+    #[serde(default)]
+    pub command: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Verified {
+    /// A fresh check of the finding's area no longer finds it.
+    pub gone: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct HistoryParams {
+    /// 1, 7 or 30.
+    #[serde(default)]
+    pub days: u32,
+}
+
+/// New findings, incident facts and alerts over time, for the chart.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct History {
+    pub since: u64,
+    pub bucket_ms: u64,
+    /// Per bucket, oldest first: how many high, medium, low and info.
+    pub series: Vec<[u32; 4]>,
+    /// Per group (a finding's group, an incident or alert id): the buckets it had any in.
+    pub hits: std::collections::BTreeMap<String, Vec<u32>>,
+    /// What changed on the computer meanwhile (`macOS 26.1`, `3 apps updated`), oldest first.
+    #[serde(default)]
+    pub markers: Vec<Marker>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Marker {
+    pub at: u64,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -757,6 +835,23 @@ pub struct SweepReport {
     /// Checks that could not run, with why (`brew is not installed`).
     #[serde(default)]
     pub skipped: Vec<String>,
+    /// The person's decisions in force.
+    #[serde(default)]
+    pub decisions: Vec<Decision>,
+    /// The latest checks after a fix ran, newest first.
+    #[serde(default)]
+    pub fixes: Vec<FixCheck>,
+}
+
+/// A finding checked again after a command ran to fix it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct FixCheck {
+    pub at: u64,
+    pub group: String,
+    pub text: String,
+    /// Empty when the person only asked for a fresh check.
+    pub command: String,
+    pub gone: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -1029,6 +1124,19 @@ pub struct Schedule {
     pub next: u64,
     #[serde(default)]
     pub last: Option<ScheduleRun>,
+    /// The app that created it through the mesh (its stamped caller): only that app may change,
+    /// run or delete it; the person may in CortexTerm. None for one made here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<crate::contracts::service::Caller>,
+    /// Run in the write sandbox (writes only in `cwd`, temp, package caches and `writable`).
+    #[serde(default)]
+    pub sandboxed: bool,
+    #[serde(default)]
+    pub writable: Vec<String>,
+    /// The person approved it in the asking app's window (as a run's `approved`); one made in
+    /// CortexTerm is the person's own.
+    #[serde(default)]
+    pub approved: bool,
 }
 
 fn enabled() -> bool {
@@ -1068,6 +1176,22 @@ pub struct TraceStartParams {
     /// Who asked, for a member's request (`cortexcode on Mac mini`); empty for this app.
     #[serde(default)]
     pub asked_by: String,
+    /// The asking plugin ends it with `system.trace.stop` (bringing the exit code and output), not
+    /// when its processes are gone. Not for a call through the mesh.
+    #[serde(default)]
+    pub held: bool,
+}
+
+/// `system.trace.stop`: the app that ran the traced command may hand over how it ended and its
+/// output, so the trace keeps them as a schedule run's does.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TraceStopParams {
+    pub id: String,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    /// Output lines `[at, text]` (the first 20,000 are kept).
+    #[serde(default)]
+    pub output: Vec<(u64, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -1086,6 +1210,10 @@ pub struct TraceReadParams {
     pub kinds: Vec<String>,
     #[serde(default)]
     pub limit: u32,
+    /// Unix milliseconds: the tree at that moment (`crate::contracts::service::Moment`) instead
+    /// of a size.
+    #[serde(default)]
+    pub at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

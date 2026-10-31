@@ -55,3 +55,11 @@ updater do not leave gaps after the settings gear. The model readout can shorten
 
 The built-in editor fills its pane. The per-line explanation sidebar is removed at the user's
 request; line numbers, syntax highlighting, search, and the Nano-style shortcut footer remain.
+
+## Alerts & Security, grouped (0.1.24)
+
+One list grouped by what findings are about, a priority chart, a Decide sheet with a verdict, reach
+and end, and an ASK box that goes to the selected computer's assistant. Only broken sensors show;
+the rest is under COVERAGE. The pane works on the computer chosen in the side view or the pane's
+own computer. See [docs/PROTECTION.md](../../docs/PROTECTION.md). Not built or compared with the
+boards in the running app.

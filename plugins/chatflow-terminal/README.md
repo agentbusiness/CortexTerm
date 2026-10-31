@@ -92,3 +92,10 @@ the pipes continue draining after the bound. Stdout precedes stderr as before. C
 the 20-second deadline terminate the process group and retain output already captured. No model
 prompt or tool contract changes. The UI uses the same 320px scroll area as shell Runs.
 Source inspection is complete; building and live streaming verification remain unperformed.
+
+## Security fixes are checked (0.1.16)
+
+When a command proposed for a sweep finding ends with exit 0, the flow asks the system plugin to
+check the finding again (`system.finding.verify`) and tells the model in one sentence whether it is
+gone. A finding's evidence now names what it is about, the person's decision and a fix already
+tried, which is not proposed again. Prompts are unchanged. Not built or run with Gemma or Qwen.

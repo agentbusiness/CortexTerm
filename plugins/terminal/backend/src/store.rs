@@ -327,7 +327,7 @@ impl History {
             self.shapes.extend(crate::habits::shapes(command));
         }
         // Background checks are not the user's habits, even when they run often.
-        if run.author != "agent" && run.term_id != "service" {
+        if run.author != "agent" && !run.term_id.starts_with("service") {
             let stats = self.commands.entry(key.clone()).or_default();
             if first {
                 stats.runs = stats.runs.saturating_add(1);
@@ -684,6 +684,12 @@ impl Store {
             }
         }
         batch
+    }
+
+    /// Properties of a Run that are not the Run's own (a command job's state), written at once.
+    pub(crate) async fn put_props(&self, id: &str, props: Map<String, Value>) -> Result<(), RpcError> {
+        let batch = Batch { nodes: vec![node("CommandRun", id, props)], ..Batch::default() };
+        self.put(&batch).await
     }
 
     pub(crate) async fn put(&self, batch: &Batch) -> Result<(), RpcError> {

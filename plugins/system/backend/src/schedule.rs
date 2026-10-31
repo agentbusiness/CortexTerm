@@ -1,28 +1,25 @@
 //! Scheduled jobs, run in-app while the plugin runs: a shell command or the security sweep, at
 //! `daily HH:MM`, `hourly`, `every N min` or `weekly <day> HH:MM` (local time). They live in the
-//! graph: `(:Schedule {key: id, name, kind, command, cwd, when, enabled, alert_on, next, last_…})
-//! -[:ON]->(:Machine)`, `-[:RUNS {at}]->` each `(:Sweep)` it ran, or the `(:CommandRun)` of each
-//! command it ran (`key: schedule:<id>:<at>`, `-[:IN]->` its folder). A deleted schedule is retired.
-//! A run missed while the app was closed runs once a minute after start. The first start seeds
-//! the daily security sweep.
+//! graph: `(:Schedule {key: id, name, kind, command, cwd, when, enabled, alert_on, next, owner_…,
+//! sandboxed, writable, approved, last_…})-[:ON]->(:Machine)`, `-[:RUNS {at}]->` each `(:Sweep)`
+//! it ran, or the `(:CommandRun)` of each command it ran (the terminal's Run: a command runs
+//! through `terminal.command`, with its risk engine and sandbox, traced). A deleted schedule is
+//! retired. A run missed while the app was closed runs once a minute after start. The first start
+//! seeds the daily security sweep.
 
 use crate::graph::{self, Batch, Props, r};
-use crate::util::{home, now_ms, shorten};
+use crate::util::{home, now_ms};
 use cc_protocol::RpcError;
+use cc_protocol::contracts::service::Caller;
 use cc_protocol::contracts::system::{Schedule, ScheduleList, ScheduleRun};
 use serde_json::json;
-use std::collections::{HashSet, VecDeque};
-use std::io::{BufRead, BufReader};
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub const SWEEP_ID: &str = "security-sweep";
 /// A command gets ten minutes.
 pub const TIMEOUT: Duration = Duration::from_secs(600);
-const TAIL: usize = 40;
 const DAYS: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -126,7 +123,8 @@ impl Store {
     pub async fn load() -> Result<Self, String> {
         let rows = graph::query_all(
             "MATCH (s:Schedule) RETURN s.key, s.name, s.kind, s.command, s.cwd, s.when, s.enabled, s.alert_on, s.next, \
-             s.last_at, s.last_duration_ms, s.last_exit_code, s.last_tail, s.last_alerted, s.last_trace, s.state ORDER BY s.key",
+             s.last_at, s.last_duration_ms, s.last_exit_code, s.last_tail, s.last_alerted, s.last_trace, s.state, \
+             s.owner_app, s.owner_node, s.owner_name, s.owner_session, s.owner_by, s.sandboxed, s.writable, s.approved ORDER BY s.key",
             json!({}),
         )
         .await?;
@@ -156,6 +154,18 @@ impl Store {
                 enabled: row[6].as_bool().unwrap_or(true),
                 alert_on: graph::text(&row[7]),
                 next: graph::number(&row[8]),
+                owner: (!graph::text(&row[17]).is_empty()).then(|| Caller {
+                    app: graph::text(&row[16]),
+                    node: graph::text(&row[17]),
+                    name: graph::text(&row[18]),
+                    local: true,
+                    session_id: graph::text(&row[19]),
+                    by: graph::text(&row[20]),
+                }),
+                sandboxed: row[21].as_bool().unwrap_or(false),
+                writable: graph::texts(&row[22]),
+                // One made before schedules had owners was made by the person, here.
+                approved: row[23].as_bool().unwrap_or(true),
             });
         }
         Ok(Self::start(list, fresh))
@@ -236,6 +246,8 @@ impl Store {
                 .find(|s| s.id == input.id)
                 .ok_or_else(|| RpcError::not_found(format!("no schedule {}; leave id empty to create one", input.id)))?;
             input.last = existing.last.take();
+            // Who owns it never changes.
+            input.owner = existing.owner.clone();
             *existing = input.clone();
         }
         write(&input, None);
@@ -271,8 +283,8 @@ impl Store {
         Ok(schedule)
     }
 
-    /// Record a finished run and set the next one. `sweep_at`: the sweep it ran (a sweep job).
-    pub fn finish(&mut self, run: ScheduleRun, sweep_at: Option<u64>) {
+    /// Record a finished run and set the next one: the sweep it ran, or the command's Run.
+    pub fn finish(&mut self, run: ScheduleRun, ran: Ran) {
         self.running.remove(&run.id);
         let now = now_ms();
         if let Some(schedule) = self.list.schedules.iter_mut().find(|s| s.id == run.id) {
@@ -280,14 +292,34 @@ impl Store {
                 schedule.next = when.next_after(now);
             }
             schedule.last = Some(run);
-            write(schedule, Some(sweep_at));
+            write(schedule, Some(ran));
         }
     }
 }
 
-/// A schedule's node as it is now; with `ran`, also the run it just finished: `Some(Some(at))`
-/// for the sweep stored at `at`, `Some(None)` for a command.
-fn write(schedule: &Schedule, ran: Option<Option<u64>>) {
+/// What a run left in the graph.
+pub enum Ran {
+    /// The sweep stored at this time (none when memory was not ready).
+    Sweep(Option<u64>),
+    /// The terminal's Run of the command.
+    Command(String),
+    /// The command did not start.
+    Nothing,
+}
+
+/// The trace ids of a schedule's command runs (every schedule's when `id` is empty).
+pub async fn run_traces(id: &str) -> Vec<String> {
+    let rows = graph::query_all(
+        "MATCH (s:Schedule)-[:RUNS]->(c:CommandRun) WHERE $id = '' OR s.key = $id RETURN c.trace",
+        json!({"id": id}),
+    )
+    .await
+    .unwrap_or_default();
+    rows.iter().map(|row| graph::text(&row[0])).filter_map(|t| t.strip_prefix("trace://").map(str::to_owned)).collect()
+}
+
+/// A schedule's node as it is now; with `ran`, also the run it just finished.
+fn write(schedule: &Schedule, ran: Option<Ran>) {
     let Some(machine) = graph::machine() else { return };
     let mut batch = Batch::new();
     let unit = batch.unit();
@@ -300,7 +332,17 @@ fn write(schedule: &Schedule, ran: Option<Option<u64>>) {
         .p("when", schedule.when.clone())
         .p("enabled", schedule.enabled)
         .p("alert_on", schedule.alert_on.clone())
-        .p("next", schedule.next);
+        .p("next", schedule.next)
+        .p("sandboxed", schedule.sandboxed)
+        .pl("writable", schedule.writable.clone())
+        .p("approved", schedule.approved);
+    if let Some(owner) = &schedule.owner {
+        node.p("owner_app", owner.app.clone())
+            .p("owner_node", owner.node.clone())
+            .p("owner_name", owner.name.clone())
+            .p("owner_session", owner.session_id.clone())
+            .p("owner_by", owner.by.clone());
+    }
     if let Some(last) = &schedule.last {
         node.p("last_at", last.at)
             .p("last_duration_ms", last.duration_ms)
@@ -311,23 +353,11 @@ fn write(schedule: &Schedule, ran: Option<Option<u64>>) {
     }
     unit.edge(me.clone(), "ON", machine);
     match (ran, &schedule.last) {
-        (Some(Some(sweep_at)), Some(last)) => {
+        (Some(Ran::Sweep(Some(sweep_at))), Some(last)) => {
             unit.edge(me, "RUNS", r("Sweep", sweep_at.to_string())).p("at", last.at);
         }
-        (Some(None), Some(last)) => {
-            let key = format!("schedule:{}:{}", schedule.id, last.at);
-            let cwd = if schedule.cwd.is_empty() { home() } else { expand(&schedule.cwd) };
-            let folder = graph::folder(unit, &cwd);
-            unit.node("CommandRun", key.clone())
-                .p("command", schedule.command.clone())
-                .p("started_ms", last.at)
-                .p("finished_ms", last.at + last.duration_ms)
-                .p("exit_code", last.exit_code)
-                .p("duration_ms", last.duration_ms)
-                .p("author", "schedule")
-                .p("trace", last.trace.clone().map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
-            unit.edge(r("CommandRun", key.clone()), "IN", folder);
-            unit.edge(me, "RUNS", r("CommandRun", key)).p("at", last.at);
+        (Some(Ran::Command(run_id)), Some(last)) => {
+            unit.edge(me, "RUNS", r("CommandRun", run_id)).p("at", last.at);
         }
         _ => {}
     }
@@ -339,114 +369,4 @@ fn expand(path: &str) -> PathBuf {
         "~" => home(),
         _ => path.strip_prefix("~/").map(|rest| home().join(rest)).unwrap_or_else(|| PathBuf::from(path)),
     }
-}
-
-/// What a command run left behind.
-pub struct Outcome {
-    pub exit_code: i32,
-    pub tail: Vec<String>,
-    /// The output contained `alert_on`.
-    pub matched: bool,
-    pub timed_out: bool,
-    /// Every output line with the time it came (the first [`LINES`]), for the run's trace.
-    pub lines: Vec<(u64, String)>,
-}
-
-/// What a run printed so far: the last lines, whether `alert_on` showed, every line with its time.
-#[derive(Default)]
-struct Seen {
-    tail: VecDeque<String>,
-    matched: bool,
-    lines: Vec<(u64, String)>,
-}
-
-/// Output lines kept for a run's trace.
-const LINES: usize = 20_000;
-
-/// Run a command schedule: the user's shell as a login shell (`-lc`), no terminal, in its
-/// folder (home by default), stdout and stderr together, at most ten minutes (blocking).
-pub fn run_command(schedule: &Schedule, started: impl FnOnce(u32)) -> Outcome {
-    let failed = |line: String| Outcome { exit_code: -1, tail: vec![line], matched: false, timed_out: false, lines: Vec::new() };
-    let shell = std::env::var("SHELL").ok().filter(|s| s.starts_with('/') && std::path::Path::new(s).is_file());
-    let shell = shell.unwrap_or_else(|| if cfg!(target_os = "macos") { "/bin/zsh".into() } else { "/bin/sh".into() });
-    let cwd = if schedule.cwd.is_empty() { home() } else { expand(&schedule.cwd) };
-    let (reader, writer) = match std::io::pipe() {
-        Ok(pair) => pair,
-        Err(error) => return failed(format!("cannot open a pipe: {error}")),
-    };
-    let child = writer.try_clone().map(|second| {
-        Command::new(&shell)
-            .arg("-lc")
-            .arg(&schedule.command)
-            .current_dir(&cwd)
-            .env_remove("CORTEX_FRAME_SOCKET")
-            .env_remove("CORTEX_PLUGIN_INSTANCE")
-            .stdin(Stdio::null())
-            .stdout(writer)
-            .stderr(second)
-            .process_group(0)
-            .spawn()
-    });
-    // The Command (and its copies of the pipe's write end) is gone here, so the reader ends
-    // when the job's processes close their output.
-    let mut child = match child {
-        Ok(Ok(child)) => child,
-        Ok(Err(error)) | Err(error) => return failed(format!("cannot start {shell}: {error}")),
-    };
-
-    started(child.id());
-    let needle = schedule.alert_on.to_lowercase();
-    let seen: Arc<Mutex<Seen>> = Arc::default();
-    let (done_tx, done_rx) = mpsc::channel::<()>();
-    let collect = seen.clone();
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(reader);
-        let mut line = Vec::new();
-        while reader.read_until(b'\n', &mut line).unwrap_or(0) > 0 {
-            let text = String::from_utf8_lossy(&line).trim_end().to_owned();
-            line.clear();
-            let mut seen = collect.lock().unwrap_or_else(|p| p.into_inner());
-            seen.matched |= !needle.is_empty() && text.to_lowercase().contains(&needle);
-            if seen.lines.len() < LINES {
-                seen.lines.push((now_ms(), shorten(&text, 2000)));
-            }
-            seen.tail.push_back(shorten(&text, 400));
-            if seen.tail.len() > TAIL {
-                seen.tail.pop_front();
-            }
-        }
-        let _ = done_tx.send(());
-    });
-
-    let deadline = Instant::now() + TIMEOUT;
-    let pgid = child.id() as i32;
-    let (status, timed_out) = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break (Some(status), false),
-            Ok(None) if Instant::now() >= deadline => {
-                // SAFETY: the job runs in its own process group, created for it above.
-                unsafe { libc::killpg(pgid, libc::SIGKILL) };
-                break (child.wait().ok(), true);
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-            Err(_) => break (None, false),
-        }
-    };
-    // Something it left running in the background may hold the output open: wait a little.
-    let _ = done_rx.recv_timeout(Duration::from_secs(2));
-    let (mut tail, matched, lines) = {
-        let mut seen = seen.lock().unwrap_or_else(|p| p.into_inner());
-        (seen.tail.iter().cloned().collect::<Vec<_>>(), seen.matched, std::mem::take(&mut seen.lines))
-    };
-    if timed_out {
-        tail.push(format!("(stopped after {} minutes)", TIMEOUT.as_secs() / 60));
-        if tail.len() > TAIL {
-            tail.remove(0);
-        }
-    }
-    let exit_code = match status {
-        Some(status) => status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
-        None => -1,
-    };
-    Outcome { exit_code, tail, matched, timed_out, lines }
 }

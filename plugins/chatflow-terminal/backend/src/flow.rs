@@ -342,9 +342,14 @@ impl Flow {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             let outcome = run.exit_code.map(|code| format!("exit {code}")).unwrap_or_else(|| "exit status unavailable".into());
+            // A fix for a sweep finding is judged by checking the finding again, not by its exit code.
+            let recheck = match security::subject_of(&pending.question) {
+                Some(security::Subject::Finding(text)) if run.exit_code == Some(0) => flow.recheck(&text, &run.command).await,
+                _ => None,
+            };
             let input = TurnInput {
                 session_id: pending.session,
-                text: format!("I ran `{}` ({outcome}). My original request: {}\n\nRead this Run's recorded output, explain the result, and continue the discussion. Use inline code for quoted output. Only put a NEW command for me to run in a ```sh block; do not suggest the completed command again.", run.command, pending.question),
+                text: format!("I ran `{}` ({outcome}). My original request: {}\n\n{}Read this Run's recorded output, explain the result, and continue the discussion. Use inline code for quoted output. Only put a NEW command for me to run in a ```sh block; do not suggest the completed command again.", run.command, pending.question, recheck.map(|line| format!("{line}\n\n")).unwrap_or_default()),
                 intent: if run.exit_code.is_some_and(|code| code != 0) { "fix" } else { "ask" }.into(),
                 term_id: Some(run.term_id),
                 run_id: Some(run.id),
@@ -857,7 +862,19 @@ impl Flow {
                         source = field(found, "source");
                         evidence.lines.push(format!("A security sweep finding, severity {}, kind {kind}, from {}.", field(found, "severity"), field(found, "source")));
                         evidence.lines.push(format!("It says: {text}"));
-                        evidence.fix = found.get("fix").and_then(Value::as_str).filter(|fix| !fix.trim().is_empty()).map(str::to_owned);
+                        let group = field(found, "group");
+                        if !group.is_empty() && group != source {
+                            evidence.lines.push(format!("It is about: {group}."));
+                        }
+                        let tried = field(found, "tried");
+                        evidence.fix = found.get("fix").and_then(Value::as_str).filter(|fix| !fix.trim().is_empty() && fix.trim() != tried.trim()).map(str::to_owned);
+                        if !tried.is_empty() {
+                            evidence.lines.push(format!("Already tried: `{tried}` ran and a fresh check still found it. Do not offer it again."));
+                        }
+                        let decision = field(found, "decision");
+                        if !decision.is_empty() {
+                            evidence.lines.push(format!("The user decided: {}.", decision.replace('_', " ")));
+                        }
                         let same = findings.iter().filter(|f| field(f, "kind") == kind && f.get("ignored").and_then(Value::as_bool) == Some(true) && field(f, "text") != *text).count();
                         if same > 0 {
                             evidence.lines.push(format!("Past choices: the user marked {same} other {kind} finding{} as nothing to worry about.", if same == 1 { "" } else { "s" }));
@@ -1387,6 +1404,20 @@ impl Flow {
     }
 
     /// One read through the frame, best effort: a plugin that is missing or slow leaves its fact out.
+    /// After a fix for a sweep finding ran: the system plugin checks the finding's area again.
+    /// One sentence for the model, or None when it could not be checked.
+    async fn recheck(&self, text: &str, command: &str) -> Option<String> {
+        let report = self.fact("system.sweep", json!({})).await?;
+        let key = report["findings"].as_array()?.iter().find(|f| f["text"].as_str().is_some_and(|t| t.trim() == text.trim()))?["key"].as_str()?.to_owned();
+        let ctx = self.ctx.get()?;
+        let verified = tokio::time::timeout(Duration::from_secs(150), ctx.call("system.finding.verify", json!({"key": key, "command": command}))).await.ok()?.ok()?;
+        Some(if verified["gone"].as_bool() == Some(true) {
+            "Checked again after the command: the finding is gone. It is fixed.".to_owned()
+        } else {
+            "Checked again after the command: the finding is still there. The command did not fix it; do not offer it again. Say why it may not have helped (for example the flaw is in a copy the command does not update, such as one inside an app).".to_owned()
+        })
+    }
+
     async fn fact(&self, method: &str, params: Value) -> Option<Value> {
         let ctx = self.ctx.get()?;
         match tokio::time::timeout(FACT_TIMEOUT, ctx.call(method, params)).await {

@@ -11,12 +11,11 @@ import { search, openSearchPanel, replaceAll, searchKeymap } from '@codemirror/s
 import { LanguageDescription, syntaxHighlighting, defaultHighlightStyle } from '@codemirror/language';
 import { languages } from '@codemirror/language-data';
 import { ago, errorMessage, useRuntime } from '@cortex/sdk';
-import type { Alert, CveReport, FileText, Finding, Histogram, Proc, Run, RunOutput, SweepReport } from './api';
+import type { FileText, Histogram, Proc, Run, RunOutput } from './api';
 import { quote, seconds, shortPath, size } from './api';
 import { Processes } from './Sidebar';
 import type { PaneRec } from './store';
-import { useMachineAlerts } from './machine-data';
-import { SecurityProtection } from './SecurityProtection';
+import { SecurityPane } from './SecurityProtection';
 
 const languageSlot = new Compartment();
 
@@ -253,182 +252,12 @@ export function ProcessPane({ pane, focused, bare, onFocus, onShelf, onClose, on
   );
 }
 
-// --- alerts and the security sweep ------------------------------------------------------------
+// --- alerts and security ---------------------------------------------------------------------
 
-/** Most serious first: alerts and sweep findings are listed in this order. */
-const SEVERITY_ORDER: Record<string, number> = { critical: 0, high: 1, medium: 2, warn: 2, low: 3, info: 4 };
-const bySeverity = (a: { severity: string }, b: { severity: string }) => (SEVERITY_ORDER[a.severity] ?? 9) - (SEVERITY_ORDER[b.severity] ?? 9);
-
-/** Open an advisory in the person's own browser (the shell's bridge; a plain link outside the app). */
-function openAdvisory(url: string) {
-  const shell = (window as unknown as { cortexShell?: { openExternal(url: string): Promise<unknown> } }).cortexShell;
-  if (shell) void shell.openExternal(url);
-  else window.open(url, '_blank', 'noopener');
-}
-
-/** One CVE cross-checked against this Mac: the verdict first, then the facts and what matched. */
-function CveCard({ report, onAsk, onRunCommand }: { report: CveReport; onAsk: Ask; onRunCommand: (command: string) => void }) {
-  const severity = { affected: 'high', unknown: 'medium', 'not-found': 'info' }[report.verdict] ?? 'low';
-  const facts = [
-    report.cvss && `CVSS ${report.cvss.score.toFixed(1)} ${report.cvss.severity.toUpperCase()}`,
-    report.kev && `EXPLOITED (CISA KEV${report.kev.ransomware ? ', RANSOMWARE' : ''})`,
-    report.epss && `EPSS ${(report.epss.score * 100).toFixed(1)}%`,
-    report.published && `PUBLISHED ${report.published.slice(0, 10)}`,
-  ].filter(Boolean) as string[];
-  const advisory = report.references[0]?.url;
-  const fixes = [...new Set(report.matches.filter((match) => match.verdict === 'affected' && match.fix).map((match) => match.fix!))];
-  return (
-    <article className={`ct-issue ${severity}`}>
-      <div className="ct-issue-meta"><span className="ct-label sev">{report.verdict.replace('-', ' ').toUpperCase()}</span><span className="ct-label ct-faint">{report.id}{facts.length ? ` · ${facts.join(' · ')}` : ''}</span></div>
-      <p className="ct-issue-text">{report.verdict_text}</p>
-      {report.title && <p className="ct-asec-note">{report.title}</p>}
-      {report.matches.slice(0, 8).map((match, index) => (
-        <div key={index} className="ct-issue-match"><span className={`ct-label ${match.verdict === 'affected' ? 'ct-warn' : 'ct-faint'}`}>{match.verdict.replace('-', ' ').toUpperCase()}</span> {match.what} {match.version}{match.place ? ` · ${match.place}` : ''} — {match.why}</div>
-      ))}
-      <div className="ct-issue-acts">
-        {fixes.slice(0, 3).map((fix) => <button key={fix} type="button" className="detent sm warn" title={fix} onClick={() => onRunCommand(fix)}>FIX…</button>)}
-        <button type="button" className="detent sm" onClick={() => onAsk(`Explain ${report.id} and whether this Mac is affected: ${report.verdict_text}`, 'ask')}>EXPLAIN</button>
-        {advisory && <button type="button" className="detent sm" title={advisory} onClick={() => openAdvisory(advisory)}>ADVISORY ↗</button>}
-      </div>
-    </article>
-  );
-}
-
-/** The hash lookups' keys (`system.keys.*`): kept in the Keychain by the system plugin, which
- *  only says which are set; a value typed here goes there and is not shown again. */
-const LOOKUP_KEYS = [['virustotal', 'VIRUSTOTAL'], ['abusech', 'ABUSE.CH']] as const;
-type KeysStatus = Record<(typeof LOOKUP_KEYS)[number][0], boolean>;
-
-function LookupKeys() {
-  const client = useRuntime().client;
-  const [status, setStatus] = useState<KeysStatus | null>(null);
-  const [values, setValues] = useState<Record<string, string>>({});
-  const [problem, setProblem] = useState<string | null>(null);
-  useEffect(() => {
-    client.call<KeysStatus>('system.keys.status', {}).then(setStatus).catch((cause) => setProblem(errorMessage(cause)));
-  }, [client]);
-  const save = (name: string, value: string) => {
-    setProblem(null);
-    client.call<KeysStatus>('system.keys.set', { name, value }).then((next) => {
-      setStatus(next);
-      setValues((current) => ({ ...current, [name]: '' }));
-    }).catch((cause) => setProblem(errorMessage(cause)));
-  };
-  return (
-    <section className="ct-asec">
-      <header className="ct-asec-head"><span className="ct-label">LOOKUP KEYS</span><span className="ct-label ct-faint">HASH REPUTATION · KEPT IN THE KEYCHAIN</span></header>
-      {LOOKUP_KEYS.map(([name, label]) => (
-        <form key={name} className="ct-find" onSubmit={(event) => { event.preventDefault(); save(name, values[name] ?? ''); }}>
-          <span className="ct-label" style={{ flex: '0 0 84px' }}>{label}</span>
-          <span className={`ct-label ${status?.[name] ? '' : 'ct-faint'}`} style={{ flex: '0 0 60px' }}>{status ? (status[name] ? 'SET' : 'NOT SET') : '…'}</span>
-          <input type="password" value={values[name] ?? ''} placeholder={status?.[name] ? 'replace the key' : 'paste the key'} autoComplete="off" spellCheck={false} onChange={(event) => setValues((current) => ({ ...current, [name]: event.target.value }))} />
-          <button type="submit" className="detent sm" disabled={!(values[name] ?? '').trim()}>SAVE</button>
-          {status?.[name] && <button type="button" className="detent sm" onClick={() => save(name, '')}>REMOVE</button>}
-        </form>
-      ))}
-      {problem && <p className="ct-asec-note ct-warn">{problem}</p>}
-    </section>
-  );
-}
-
-export function AlertsPane({ pane, focused, bare, onFocus, onShelf, onClose, onAsk, onRunCommand }: PaneControls & { pane: PaneRec; onAsk: Ask; onRunCommand: (command: string) => void }) {
-  const { client, node } = useRuntime();
-  const machineAlerts = useMachineAlerts(node);
-  const [report, setReport] = useState<SweepReport | null>(null);
-  const [running, setRunning] = useState(false);
-  const [problem, setProblem] = useState<string | null>(null);
-  const [showIgnored, setShowIgnored] = useState(false);
-  const [cveId, setCveId] = useState('');
-  const [cve, setCve] = useState<{ loading?: boolean; error?: string; report?: CveReport } | null>(null);
-  const checkCve = () => {
-    const id = cveId.trim().toUpperCase();
-    if (!id) return;
-    setCve({ loading: true });
-    client.call<CveReport>('system.cve', { id }).then((report) => setCve({ report })).catch((cause) => setCve({ error: errorMessage(cause) }));
-  };
-  useEffect(() => {
-    client.call<SweepReport>('system.sweep', {}).then(setReport).catch((cause) => setProblem(errorMessage(cause)));
-  }, [client]);
-  const runSweep = () => {
-    setRunning(true);
-    client.call<SweepReport>('system.sweep.run', {}).then(setReport).catch((cause) => setProblem(errorMessage(cause))).finally(() => setRunning(false));
-  };
-  const ignore = (finding: Finding, value: boolean) => {
-    client.call<SweepReport>('system.finding.ignore', { key: finding.key, ignore: value }).then(setReport).catch((cause) => setProblem(errorMessage(cause)));
-  };
-  const act = (alert: Alert, action: string) => {
-    void machineAlerts.act(alert.id, action).catch((cause) => setProblem(errorMessage(cause)));
-  };
-  const alerts = machineAlerts.alerts.filter((alert) => !alert.dismissed).sort(bySeverity);
-  const findings = (report?.findings ?? []).slice().sort(bySeverity);
-  const open = findings.filter((finding) => !finding.ignored);
-  const ignored = findings.filter((finding) => finding.ignored);
-  const checked = report ? `Checked ${report.checked.length} sources${report.skipped.length ? `, skipped ${report.skipped.length}` : ''}` : '';
+export function AlertsPane({ pane, focused, bare, onFocus, onShelf, onClose, onAsk, onCommand }: PaneControls & { pane: PaneRec; onAsk: Ask; onCommand: (command: string) => void }) {
   return (
     <PaneFrame pane={pane} focused={focused} bare={bare} onFocus={onFocus} onShelf={onShelf} onClose={onClose} title="ALERTS & SECURITY">
-      <div className="ct-alerts">
-        <SecurityProtection />
-        <section className="ct-asec">
-          <header className="ct-asec-head"><span className="ct-label">ALERTS</span><span className="ct-label ct-faint">{machineAlerts.loading ? 'LOADING…' : machineAlerts.problem ? 'UNAVAILABLE' : alerts.length ? `${alerts.length} OPEN` : 'ALL QUIET'}</span></header>
-          {machineAlerts.problem && <p className="ct-asec-note ct-warn" role="status">{machineAlerts.problem} <button type="button" className="detent sm" onClick={() => void machineAlerts.reload()}>RETRY</button></p>}
-          {!machineAlerts.loading && !machineAlerts.problem && alerts.length === 0 && <p className="ct-asec-note">Watching CPU, memory, disk, new open ports and new login items.</p>}
-          {alerts.map((alert) => (
-            <article key={alert.id} className={`ct-issue ${alert.severity}`}>
-              <div className="ct-issue-meta"><span className="ct-label sev">{alert.kind.toUpperCase()}</span><span className="ct-label ct-faint">{new Date(alert.at).toLocaleTimeString()}</span></div>
-              <p className="ct-issue-text">{alert.text}</p>
-              <div className="ct-issue-acts">
-                <button type="button" className="detent sm warn" onClick={() => onAsk(`An alert says: "${alert.text}". What should I do?`, 'ask')}>WHAT NOW?</button>
-                <button type="button" className="detent sm" onClick={() => act(alert, 'snooze')}>SNOOZE 1 H</button>
-                <button type="button" className="detent sm" onClick={() => act(alert, 'dismiss')}>IT'S FINE</button>
-                <button type="button" className="detent sm" onClick={() => act(alert, 'ignore_kind')}>NEVER THIS KIND</button>
-              </div>
-            </article>
-          ))}
-        </section>
-        <section className="ct-asec">
-          <header className="ct-asec-head">
-            <span className="ct-label">SECURITY SWEEP</span>
-            <span className="ct-label ct-faint">{report?.at ? `${open.length} OPEN · RAN ${ago(report.at)}` : 'DAILY'}</span>
-            <span className="grow" />
-            <button type="button" className="detent sm" disabled={running} onClick={runSweep}>{running ? 'RUNNING…' : 'RUN NOW'}</button>
-          </header>
-          {problem && <p className="ct-asec-note ct-warn">{problem}</p>}
-          {report && open.length === 0 && <p className="ct-asec-note">Nothing to worry about.</p>}
-          {open.map((finding) => (
-            <article key={finding.key} className={`ct-issue ${finding.severity}`}>
-              <div className="ct-issue-meta"><span className="ct-label sev">{finding.severity.toUpperCase()}</span><span className="ct-label ct-faint">{finding.source.toUpperCase()}</span></div>
-              <p className="ct-issue-text">{finding.text}</p>
-              <div className="ct-issue-acts">
-                {finding.fix && <button type="button" className="detent sm warn" title={finding.fix} onClick={() => onRunCommand(finding.fix!)}>FIX…</button>}
-                <button type="button" className="detent sm" onClick={() => onAsk(`The security sweep says: "${finding.text}" (${finding.source}). Is this a problem, and what should I do?`, 'ask')}>EXPLAIN</button>
-                <button type="button" className="detent sm" title="Stop listing and alerting this; it stays under Ignored" onClick={() => ignore(finding, true)}>DON'T WORRY</button>
-              </div>
-            </article>
-          ))}
-          {ignored.length > 0 && (
-            <button type="button" className="ct-asec-fold" onClick={() => setShowIgnored((value) => !value)}>
-              <span className="ct-label ct-faint">{showIgnored ? '▾' : '▸'} IGNORED · {ignored.length}</span>
-            </button>
-          )}
-          {showIgnored && ignored.map((finding) => (
-            <div key={finding.key} className="ct-issue-ignored">
-              <span className="ct-issue-text">{finding.text}</span>
-              <button type="button" className="detent sm" onClick={() => ignore(finding, false)}>WORRY AGAIN</button>
-            </div>
-          ))}
-          {report && <p className="ct-asec-foot ct-label ct-faint" title={[...report.checked, ...report.skipped.map((entry) => `skipped: ${entry}`)].join('\n')}>{checked} · {seconds(report.duration_ms)}</p>}
-        </section>
-        <section className="ct-asec">
-          <header className="ct-asec-head"><span className="ct-label">CVE CHECK</span><span className="ct-label ct-faint">AGAINST WHAT IS INSTALLED HERE</span></header>
-          <form className="ct-find" onSubmit={(event) => { event.preventDefault(); checkCve(); }}>
-            <input type="text" value={cveId} placeholder="CVE-2024-3094 · GHSA-… · RUSTSEC-…" spellCheck={false} onChange={(event) => setCveId(event.target.value)} />
-            <button type="submit" className="detent sm" disabled={!cveId.trim() || cve?.loading}>{cve?.loading ? 'CHECKING…' : 'CHECK'}</button>
-          </form>
-          {cve?.error && <p className="ct-asec-note ct-warn">{cve.error}</p>}
-          {cve?.report && <CveCard report={cve.report} onAsk={onAsk} onRunCommand={onRunCommand} />}
-        </section>
-        <LookupKeys />
-      </div>
+      <div className="ct-alerts"><SecurityPane onAsk={onAsk} onCommand={onCommand} /></div>
     </PaneFrame>
   );
 }

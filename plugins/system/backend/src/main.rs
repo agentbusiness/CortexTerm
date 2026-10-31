@@ -55,8 +55,9 @@ use cc_protocol::contracts::memory::{self as memory_contract, TraceAppendParams,
 use cc_protocol::contracts::notify::{self, Notification};
 use cc_protocol::contracts::terminal::{self as terminal_contract, Run, RunOutput, ListResult as TermList};
 use cc_protocol::contracts::system::{
-    Alert, AskParams, AskResult, CheckParams, CveParams, KeysSetParams, Metrics, MonitorParams, MonitorReport, PortList, ProcSample, ProcessesParams, Schedule, ScheduleRun, SignalParams, SweepReport, IgnoreParams, ChangesParams, MemoryChanges, AppChange, ScheduleRunsParams, TraceReadParams, TraceStartParams, methods, topics,
+    Alert, AskParams, AskResult, CheckParams, CveParams, KeysSetParams, Metrics, MonitorParams, MonitorReport, PortList, ProcSample, ProcessesParams, Schedule, ScheduleRun, SignalParams, SweepReport, DecideParams, VerifyParams, Verified, HistoryParams, History, Marker, ChangesParams, MemoryChanges, AppChange, ScheduleRunsParams, TraceReadParams, TraceStartParams, TraceStopParams, methods, topics,
 };
+use cc_protocol::contracts::service::{Caller, Job, Moment, MomentFile, MomentProcess, ScheduleChanged, ScheduleDone, topics as service_topics};
 use cc_protocol::{BoxFuture, Call, Ctx, Plugin, RpcError, parse_params, to_value};
 use procs::Snapshot;
 use sampler::{Power, Sampler};
@@ -315,11 +316,12 @@ impl Shared {
         }
     }
 
+    /// Security findings join protection as facts about their group: one incident per group.
     fn record_sweep(&self, report: &SweepReport) {
-        let observations = report.findings.iter().filter(|f| protection::security_kind(&f.kind)).take(200).map(|f| {
+        let observations = report.findings.iter().filter(|f| !f.ignored && protection::security_kind(&f.kind)).take(200).map(|f| {
             cc_protocol::contracts::system::SecurityObservation {
                 at: report.at, source: "security sweep".into(), kind: f.kind.clone(), severity: f.severity.clone(),
-                summary: protection::scrub(&f.text, 600), rule: f.source.clone(), subject: format!("finding:{}", protection::digest(&f.key)),
+                summary: protection::scrub(&f.text, 600), rule: f.source.clone(), subject: protection::group_subject(&f.group),
                 path: f.about.as_ref().filter(|(label, key)| label == "Binary" && key.starts_with('/')).map(|(_, key)| key.clone()),
                 count: 1, ..Default::default()
             }
@@ -339,16 +341,15 @@ impl Shared {
         } else {
             store.last = report.clone();
         }
-        let ignored = store.ignored();
+        let marked = store.mark(report);
         drop(store);
-        let marked = sweep::mark(report, &ignored);
         self.record_sweep(&marked);
         marked
     }
 
-    /// The report with the ignored findings marked (older reports get their keys here).
+    /// The report with its findings' decisions and tried fixes, and the decisions in force.
     fn marked(&self, report: SweepReport) -> SweepReport {
-        sweep::mark(report, &lock(&self.findings).ignored())
+        lock(&self.findings).mark(report)
     }
 
     /// Some areas' checks, apart from the stored sweep (which they fall back on when late). What
@@ -365,12 +366,79 @@ impl Shared {
         Ok(self.marked(report))
     }
 
-    fn ignore(&self, key: String, ignore: bool) -> Result<SweepReport, RpcError> {
-        let mut store = lock(&self.findings);
-        store.ignore(&key, ignore).map_err(RpcError::invalid_params)?;
-        let report = store.last.clone();
-        drop(store);
+    /// Decide about a group; `fixed` checks the group's areas again first and closes what is gone.
+    async fn decide(&self, params: DecideParams) -> Result<SweepReport, RpcError> {
+        if params.group.is_empty() {
+            return Err(RpcError::invalid_params("which group"));
+        }
+        if params.verdict == "fixed" {
+            let keys: Vec<String> = {
+                let store = lock(&self.findings);
+                store.last.findings.iter().filter(|f| f.group == params.group && (params.keys.is_empty() || params.keys.contains(&f.key))).map(|f| f.key.clone()).collect()
+            };
+            if !self.verify(&keys, "").await? {
+                return Err(RpcError::invalid_params("A fresh check still finds it, so it is not fixed."));
+            }
+        } else {
+            lock(&self.findings).decide(&params.group, &params.verdict, params.keys, params.days).map_err(RpcError::invalid_params)?;
+            if !params.verdict.is_empty() {
+                lock(&self.protection).dismiss(&protection::group_subject(&params.group));
+            }
+        }
+        let report = lock(&self.findings).last.clone();
         Ok(self.marked(report))
+    }
+
+    /// Check the areas of these findings again (up to two minutes); true when none is found. The
+    /// command, when given, is kept on the findings still there.
+    async fn verify(&self, keys: &[String], command: &str) -> Result<bool, RpcError> {
+        let areas: Vec<String> = {
+            let store = lock(&self.findings);
+            let mut areas: Vec<String> = store.last.findings.iter().filter(|f| keys.contains(&f.key)).map(|f| sweep::Area::of(f).name().to_owned()).collect();
+            areas.sort();
+            areas.dedup();
+            areas
+        };
+        if areas.is_empty() {
+            return Ok(true);
+        }
+        let fresh = self.check(CheckParams { areas, within_s: Some(120) }).await?;
+        Ok(lock(&self.findings).verified(keys, &fresh, command))
+    }
+
+    /// New findings, incident facts and alerts over `days`, in 84 buckets.
+    async fn history(&self, days: u32) -> History {
+        const BUCKETS: u64 = 84;
+        let days = u64::from(days.clamp(1, 30));
+        let now = util::now_ms();
+        let span = days * 86_400_000;
+        let since = now - span;
+        let bucket_ms = span / BUCKETS;
+        let mut history = History { since, bucket_ms, series: vec![[0; 4]; BUCKETS as usize], hits: Default::default(), ..Default::default() };
+        let mut add = |at: u64, severity: &str, group: &str| {
+            if at < since || at > now {
+                return;
+            }
+            let i = (((at - since) / bucket_ms).min(BUCKETS - 1)) as usize;
+            history.series[i][usize::from(sweep::rank(&protection::normal_severity(severity))).min(3)] += 1;
+            let hits = history.hits.entry(group.to_owned()).or_default();
+            if hits.last() != Some(&(i as u32)) {
+                hits.push(i as u32);
+            }
+        };
+        for entry in graph::stream_read(findings::STREAM, since).await.unwrap_or_default() {
+            add(entry.at_ms, &graph::text(&entry.value["severity"]), &graph::text(&entry.value["group"]));
+        }
+        for incident in lock(&self.protection).incidents() {
+            for event in &incident.observations {
+                add(event.at, &event.severity, &incident.id);
+            }
+        }
+        for alert in lock(&self.alerts).list().alerts.iter().filter(|a| a.kind != "security-incident") {
+            add(alert.at, &alert.severity, &alert.id);
+        }
+        history.markers = Self::markers(since, bucket_ms).await;
+        history
     }
 
     /// Load everything kept from the graph, once memory answers: move the old files in first,
@@ -430,18 +498,77 @@ impl Shared {
         Ok(summary)
     }
 
-    /// Run one schedule now: record the result, publish it, and alert when it failed or its
-    /// output matched `alert_on`.
+    /// What changed since `since`, from the graph's version histories (macOS, apps, Homebrew) and the
+/// apps first seen: one marker per kind and chart bucket, at most twelve.
+async fn markers(since: u64, bucket_ms: u64) -> Vec<Marker> {
+    let changes = |label: &str| format!(
+        "MATCH (n:{label}) HISTORY n.version FROM datetime.fromepochmillis(0) TO datetime.fromepochmillis($now) AS s RETURN n.key, n.name, s.time, s.value ORDER BY n.key, s.time"
+    );
+    let now = util::now_ms();
+    let mut found: Vec<(u64, &str, String)> = Vec::new();
+    for (label, kind) in [("OS", "os"), ("App", "app"), ("Formula", "formula")] {
+        let Ok(rows) = graph::query_all(&changes(label), json!({"now": now})).await else { continue };
+        let mut previous = String::new();
+        for row in rows {
+            let key = graph::text(&row[0]);
+            let at = graph::number(&row[2]) / 1_000_000;
+            // The first sample of a node is when CT first saw it, not a change.
+            let first = previous != key;
+            previous = key.clone();
+            if first || at < since {
+                continue;
+            }
+            let name = Some(graph::text(&row[1])).filter(|n| !n.is_empty()).unwrap_or(key);
+            found.push((at, kind, format!("{name} {}", graph::text(&row[3]))));
+        }
+    }
+    if let Ok(rows) = graph::query_all("MATCH (a:App) WHERE a.first_ms >= $since RETURN a.first_ms, a.name", json!({"since": since})).await {
+        found.extend(rows.iter().map(|row| (graph::number(&row[0]), "new", graph::text(&row[1]))));
+    }
+    found.sort();
+    let mut merged: Vec<(u64, u64, &str, String, usize)> = Vec::new();
+    for (at, kind, text) in found {
+        let bucket = (at - since) / bucket_ms.max(1);
+        match merged.iter_mut().find(|m| m.1 == bucket && m.2 == kind) {
+            Some(m) => m.4 += 1,
+            None => merged.push((at, bucket, kind, text, 1)),
+        }
+    }
+    let mut out: Vec<Marker> = merged
+        .into_iter()
+        .map(|(at, _, kind, text, n)| Marker {
+            at,
+            text: match (kind, n) {
+                ("os", _) => text,
+                (_, 1) if kind == "new" => format!("new app {text}"),
+                (_, 1) => text,
+                ("app", n) => format!("{n} apps updated"),
+                ("formula", n) => format!("{n} Homebrew formulae updated"),
+                (_, n) => format!("{n} new apps"),
+            },
+        })
+        .collect();
+    // macOS first, then the biggest changes, back in time order.
+    out.sort_by_key(|m| (!m.text.starts_with("macOS"), std::cmp::Reverse(m.text.split(' ').next().and_then(|n| n.parse::<u32>().ok()).unwrap_or(1))));
+    out.truncate(12);
+    out.sort_by_key(|m| m.at);
+    out
+}
+
+/// Run one schedule now: record the result, publish it, and alert when it failed or its
+    /// output matched `alert_on`. A command runs through `terminal.command` (one runner: its risk
+    /// engine, the sandbox the schedule asks for, traced), as the app that owns the schedule.
     async fn run_schedule(self: &Arc<Self>, id: &str) -> Result<ScheduleRun, RpcError> {
         let job = lock(&self.schedules).begin(id)?;
         let started = std::time::Instant::now();
         let at = util::now_ms();
         let needle = job.alert_on.to_lowercase();
         let mut trace: Option<String> = None;
-        let mut sweep_at = None;
+        let mut ran = schedule::Ran::Nothing;
+        let mut done = Job { id: job.id.clone(), state: "done".into(), started: at, ..Job::default() };
         let (exit_code, tail, matched, timed_out) = if job.kind == "sweep" {
             let mut report = self.run_sweep().await;
-            sweep_at = graph::ready().then_some(report.at);
+            ran = schedule::Ran::Sweep(graph::ready().then_some(report.at));
             report.findings.retain(|finding| !finding.ignored);
             let mut tail = vec![format!(
                 "{} after checking {}",
@@ -452,39 +579,55 @@ impl Shared {
             tail.extend(report.skipped.iter().map(|s| format!("skipped: {s}")));
             let matched = !needle.is_empty() && tail.iter().any(|line| line.to_lowercase().contains(&needle));
             tail.truncate(40);
+            done.text = tail.first().cloned().unwrap_or_default();
             (0, tail, matched, false)
         } else {
-            // Every run is traced: its processes while it runs, then its whole output.
-            let command = job.clone();
-            let me = self.clone();
-            let slot: Arc<Mutex<Option<String>>> = Arc::default();
-            let started_trace = slot.clone();
-            let outcome = tokio::task::spawn_blocking(move || {
-                schedule::run_command(&command, |pid| {
-                    let seed = TraceInfo {
-                        pid,
-                        label: command.name.clone(),
-                        command: command.command.clone(),
-                        cwd: command.cwd.clone(),
-                        source: "schedule".into(),
-                        run_id: Some(format!("schedule:{}", command.id)),
-                        ..Default::default()
-                    };
-                    let info = lock(&me.tracer).start_job(seed);
-                    *lock(&started_trace) = Some(info.id);
-                })
-            })
-            .await
-            .unwrap_or_else(|e| schedule::Outcome { exit_code: -1, tail: vec![e.to_string()], matched: false, timed_out: false, lines: Vec::new() });
-            trace = lock(&slot).clone();
-            if let Some(id) = &trace {
-                lock(&self.tracer).finish(id, util::now_ms(), Some(outcome.exit_code), outcome.lines);
-                self.flush_traces().await;
+            let cwd = if job.cwd.is_empty() { "~".to_owned() } else { job.cwd.clone() };
+            let mut params = json!({
+                "command": job.command,
+                "cwd": cwd,
+                "timeout_ms": schedule::TIMEOUT.as_millis() as u64,
+                "monitor": true,
+                "sandboxed": job.sandboxed,
+                "writable": job.writable,
+                "approved": job.approved,
+                "purpose": "shell",
+            });
+            if let Some(owner) = &job.owner {
+                params["caller"] = to_value(owner)?;
             }
-            (outcome.exit_code, outcome.tail, outcome.matched, outcome.timed_out)
+            let answer = match self.ctx.get() {
+                Some(ctx) => ctx.call(terminal_contract::methods::COMMAND_RUN, params).await,
+                None => Err(RpcError::new(cc_protocol::codes::UNAVAILABLE, "not connected to the frame yet")),
+            };
+            match answer.and_then(|value| serde_json::from_value::<Job>(value).map_err(|e| RpcError::internal(e.to_string()))) {
+                Ok(job_run) => {
+                    trace = job_run.trace.as_deref().and_then(|t| t.strip_prefix("trace://")).map(str::to_owned);
+                    if job_run.state != "refused" {
+                        ran = schedule::Ran::Command(job_run.id.clone());
+                    }
+                    // `alert_on` looks at the whole output, not only its last lines.
+                    let matched = !needle.is_empty() && job_run.state != "refused" && self.output_contains(&job_run.id, &job.alert_on).await;
+                    let timed_out = job_run.state == "stopped";
+                    let mut tail = job_run.tail.clone();
+                    if let Some(why) = &job_run.needs_approval {
+                        tail.push(format!("refused ({}): {}", why.risk, why.reason));
+                    }
+                    let exit_code = job_run.exit_code.unwrap_or(-1);
+                    done = job_run;
+                    (exit_code, tail, matched, timed_out)
+                }
+                Err(error) => {
+                    done.state = "failed".into();
+                    done.text = format!("failed: it could not start: {}", error.message);
+                    (-1, vec![format!("it could not start: {}", error.message)], false, false)
+                }
+            }
         };
         let text = if timed_out {
             Some(format!("The scheduled job “{}” did not finish within 10 minutes and was stopped.", job.name))
+        } else if done.state == "refused" {
+            Some(format!("The scheduled job “{}” did not run: it needs your approval.", job.name))
         } else if exit_code != 0 {
             Some(format!("The scheduled job “{}” failed with exit code {exit_code}.", job.name))
         } else if matched {
@@ -506,13 +649,33 @@ impl Shared {
             exit_code,
             tail,
             alerted,
-            trace,
+            trace: trace.clone(),
         };
-        lock(&self.schedules).finish(run.clone(), sweep_at);
+        lock(&self.schedules).finish(run.clone(), ran);
+        // The run as the owner reads it: its id is its trace's (`runs.read`).
+        if let Some(trace) = &trace {
+            done.id = trace.clone();
+        }
+        let event = ScheduleDone { schedule_id: job.id.clone(), name: job.name.clone(), owner: job.owner.clone(), run: done };
         if let Some(ctx) = self.ctx.get() {
-            ctx.publish(topics::SCHEDULE_DONE, serde_json::to_value(&run).unwrap_or(Value::Null));
+            ctx.publish(topics::SCHEDULE_DONE, serde_json::to_value(&event).unwrap_or(Value::Null));
         }
         Ok(run)
+    }
+
+    /// Whether a Run's output has a line containing `text` (case as the filter does).
+    async fn output_contains(&self, run_id: &str, text: &str) -> bool {
+        let Some(ctx) = self.ctx.get() else { return false };
+        let answer = ctx.call(terminal_contract::methods::COMMAND_OUTPUT_READ, json!({"run_id": run_id, "filter": text, "count": 1})).await;
+        answer.ok().and_then(|value| value["matched"].as_u64()).is_some_and(|matched| matched > 0)
+    }
+
+    /// A schedule changed: to this app's screens, and to the app that owns it.
+    fn schedule_changed(&self, schedule: &Schedule, change: &str) {
+        let event = ScheduleChanged { schedule_id: schedule.id.clone(), name: schedule.name.clone(), owner: schedule.owner.clone(), change: change.into() };
+        if let Some(ctx) = self.ctx.get() {
+            ctx.publish(service_topics::SCHEDULE_CHANGED, serde_json::to_value(&event).unwrap_or(Value::Null));
+        }
     }
 }
 
@@ -1020,6 +1183,7 @@ async fn dispatch(shared: Arc<Shared>, method: &str, params: Value) -> Result<Va
                     let report = shared.check(CheckParams { areas: names, within_s: within.map(|w| w.as_secs() as u32) }).await?;
                     (ask::check_answer(&areas, &report, notes.as_deref()), 0)
                 }
+                Ok(ask::Request::Weakness(words)) => ask::weakness_text(&words).await,
                 Ok(ask::Request::Cve(id)) => match cve::report(&id).await {
                     Ok(report) => (ask::cve_text(&report), 0),
                     Err(error) => (format!("macsec: {error}\n"), 2),
@@ -1031,9 +1195,14 @@ async fn dispatch(shared: Arc<Shared>, method: &str, params: Value) -> Result<Va
             let ChangesParams { minutes } = parse_params(params)?;
             to_value(&shared.memory_changes(minutes))
         }
-        methods::FINDING_IGNORE => {
-            let IgnoreParams { key, ignore } = parse_params(params)?;
-            to_value(&shared.ignore(key, ignore)?)
+        methods::FINDING_DECIDE => to_value(&shared.decide(parse_params(params)?).await?),
+        methods::FINDING_VERIFY => {
+            let VerifyParams { key, command } = parse_params(params)?;
+            to_value(&Verified { gone: shared.verify(&[key], &command).await? })
+        }
+        methods::SECURITY_HISTORY => {
+            let HistoryParams { days } = if params.is_null() { HistoryParams::default() } else { parse_params(params)? };
+            to_value(&shared.history(if days == 0 { 7 } else { days }).await)
         }
         methods::TIMELINE => {
             let params: cc_protocol::contracts::system::TimelineParams = if params.is_null() { Default::default() } else { parse_params(params)? };
@@ -1062,54 +1231,89 @@ async fn dispatch(shared: Arc<Shared>, method: &str, params: Value) -> Result<Va
             Err(RpcError::new(cc_protocol::codes::UNAVAILABLE, "schedules are kept in memory, which is not reachable yet; try again in a moment").retryable())
         }
         methods::SCHEDULE_CREATE => {
+            let caller = caller(&params);
             let mut schedule: Schedule = parse_params(params)?;
             schedule.id.clear();
-            to_value(&lock(&shared.schedules).put(schedule)?)
+            // Made here, it is the person's own; made by another app, that app owns it and the
+            // person's approval is what the app's window asked (`approved`, stamped by its host).
+            schedule.approved = caller.is_none() || schedule.approved;
+            schedule.owner = caller;
+            let made = lock(&shared.schedules).put(schedule)?;
+            shared.schedule_changed(&made, "created");
+            to_value(&made)
         }
         methods::SCHEDULE_EDIT => {
-            let schedule: Schedule = parse_params(params)?;
+            let caller = caller(&params);
+            let mut schedule: Schedule = parse_params(params)?;
             if schedule.id.is_empty() {
                 return Err(RpcError::invalid_params("which schedule: `id` is needed"));
             }
-            to_value(&lock(&shared.schedules).put(schedule)?)
+            let before = owned(&shared, &schedule.id, caller.as_ref())?;
+            schedule.approved = caller.is_none() || schedule.approved;
+            let changed = lock(&shared.schedules).put(schedule)?;
+            let change = match (before.enabled, changed.enabled) {
+                (true, false) => "paused",
+                (false, true) => "resumed",
+                _ => "edited",
+            };
+            shared.schedule_changed(&changed, change);
+            to_value(&changed)
         }
         methods::SCHEDULE_RUNS_LIST => {
             let p: ScheduleRunsParams = if params.is_null() { ScheduleRunsParams::default() } else { parse_params(params)? };
             let list = shared.ask_memory(memory_contract::methods::TRACE_LIST, json!({"limit": 1000})).await?;
-            let want = if p.id.is_empty() { "schedule:".to_owned() } else { format!("schedule:{}", p.id) };
+            let ours = schedule::run_traces(&p.id).await;
             let limit = if p.limit == 0 { 50 } else { p.limit as usize };
             let runs: Vec<Value> = list["traces"].as_array().into_iter().flatten()
-                .filter(|t| t["run_id"].as_str().is_some_and(|r| if p.id.is_empty() { r.starts_with(&want) } else { r == want }))
+                .filter(|t| scheduled(t, &p.id, &ours))
                 .take(limit).cloned().collect();
             Ok(json!({"traces": runs}))
         }
         methods::SCHEDULE_RUNS_READ => {
             let p: TraceReadParams = parse_params(params)?;
             let info = shared.ask_memory(memory_contract::methods::TRACE_SUMMARY, json!({"id": p.id})).await?;
-            if !info["trace"]["run_id"].as_str().is_some_and(|r| r.starts_with("schedule:")) {
+            if !scheduled(&info["trace"], "", &schedule::run_traces("").await) {
                 return Err(RpcError::not_found(format!("{} is not a scheduled run", p.id)));
             }
             read_trace(&shared, p).await
         }
         methods::SCHEDULE_DELETE => {
+            let caller = caller(&params);
             let IdParams { id } = parse_params(params)?;
+            let gone = owned(&shared, &id, caller.as_ref())?;
             lock(&shared.schedules).delete(&id)?;
+            shared.schedule_changed(&gone, "deleted");
             Ok(json!({"ok": true}))
         }
         methods::SCHEDULE_RUN => {
+            let caller = caller(&params);
             let IdParams { id } = parse_params(params)?;
+            owned(&shared, &id, caller.as_ref())?;
             to_value(&shared.run_schedule(&id).await?)
         }
         methods::TRACE_RUN => {
             let p: TraceStartParams = parse_params(params.clone())?;
             let asked_by = if p.asked_by.is_empty() { caller_of(&params) } else { p.asked_by.clone() };
             let info = lock(&shared.tracer).start(&shared.snapshot(), p.pid, &p.label, &asked_by).map_err(RpcError::not_found)?;
+            // An app on this frame that ends it itself (with the output): not a member's call.
+            if p.held && caller(&params).is_none() {
+                lock(&shared.tracer).hold(&info.id);
+            }
             shared.flush_traces().await;
             to_value(&info)
         }
         methods::TRACE_STOP => {
-            let IdParams { id } = parse_params(params)?;
-            let stopped: Option<TraceInfo> = lock(&shared.tracer).stop(&id);
+            let p: TraceStopParams = parse_params(params)?;
+            let id = p.id;
+            let mut output = p.output;
+            output.truncate(20_000);
+            let stopped: Option<TraceInfo> = if p.exit_code.is_some() || !output.is_empty() {
+                let mut tracer = lock(&shared.tracer);
+                tracer.finish(&id, util::now_ms(), p.exit_code, output);
+                tracer.stop(&id)
+            } else {
+                lock(&shared.tracer).stop(&id)
+            };
             shared.flush_traces().await;
             match stopped {
                 Some(info) => to_value(&info),
@@ -1137,6 +1341,31 @@ async fn dispatch(shared: Arc<Shared>, method: &str, params: Value) -> Result<Va
 }
 
 /// Who asked, from the `caller` the mesh stamps on a shared call: `cortexcode on Mac mini`.
+/// The app that asked, when the call came through the mesh (its `caller`, stamped there).
+fn caller(params: &Value) -> Option<Caller> {
+    params.get("caller").cloned().and_then(|value| serde_json::from_value::<Caller>(value).ok()).filter(|caller| !caller.app.is_empty() || !caller.node.is_empty())
+}
+
+/// The schedule `id`, when `caller` may change or run it: one another app owns is that app's
+/// only (the person may, here).
+fn owned(shared: &Arc<Shared>, id: &str, caller: Option<&Caller>) -> Result<Schedule, RpcError> {
+    let schedule = lock(&shared.schedules).list().schedules.into_iter().find(|s| s.id == id).ok_or_else(|| RpcError::not_found(format!("no schedule {id}")))?;
+    if let (Some(caller), Some(owner)) = (caller, &schedule.owner)
+        && caller.node != owner.node
+    {
+        return Err(RpcError::new(cc_protocol::codes::CONTRACT_VIOLATION, format!("the schedule “{}” belongs to {}; only it may change it", schedule.name, owner.app)));
+    }
+    Ok(schedule)
+}
+
+/// Whether a trace is a scheduled run (of schedule `id`, or of any): one the graph names, or an
+/// older one by its `run_id`.
+fn scheduled(trace: &Value, id: &str, ours: &[String]) -> bool {
+    let traced = trace["id"].as_str().is_some_and(|t| ours.iter().any(|o| o == t));
+    let older = trace["run_id"].as_str().is_some_and(|r| if id.is_empty() { r.starts_with("schedule:") } else { r == format!("schedule:{id}") });
+    traced || older
+}
+
 fn caller_of(params: &Value) -> String {
     let caller = &params["caller"];
     match (caller["app"].as_str(), caller["name"].as_str()) {
@@ -1148,6 +1377,9 @@ fn caller_of(params: &Value) -> String {
 
 /// A trace in the size asked for: one line, the summary, the chart's points, or raw records.
 async fn read_trace(shared: &Arc<Shared>, p: TraceReadParams) -> Result<Value, RpcError> {
+    if let Some(at) = p.at {
+        return to_value(&moment(shared, &p.id, at).await?);
+    }
     if p.size == "records" {
         let params = json!({"id": p.id, "from": p.from.unwrap_or(0), "to": p.to.unwrap_or(u64::MAX >> 1), "kinds": p.kinds, "limit": p.limit});
         return shared.ask_memory(memory_contract::methods::TRACE_WINDOW, params).await;
@@ -1164,6 +1396,121 @@ async fn read_trace(shared: &Arc<Shared>, p: TraceReadParams) -> Result<Value, R
         }
         other => Err(RpcError::invalid_params(format!("size `{other}`: line, summary, series or records"))),
     }
+}
+
+/// The tree at `at`, rebuilt from the trace's records: the processes then (from their starts and
+/// ends) with their last sample, the files and connections open then, the last output lines.
+async fn moment(shared: &Arc<Shared>, id: &str, at: u64) -> Result<Moment, RpcError> {
+    use std::collections::BTreeMap;
+    let window = |from: u64, kinds: &[&str]| shared.ask_memory(memory_contract::methods::TRACE_WINDOW, json!({"id": id, "from": from, "to": at, "kinds": kinds, "limit": 5000}));
+    // Starts, ends, opens and closes from the beginning, a page at a time (at most 40 pages).
+    let mut alive: BTreeMap<u32, String> = BTreeMap::new();
+    let mut open: BTreeMap<(u32, String), String> = BTreeMap::new();
+    let mut from = 0;
+    let mut partial = false;
+    for page in 0.. {
+        let records = window(from, &["start", "end", "open", "close", "connect", "listen"]).await?;
+        let list = records["records"].as_array().cloned().unwrap_or_default();
+        for record in &list {
+            let pid = record["pid"].as_u64().unwrap_or(0) as u32;
+            let text = record["text"].as_str().unwrap_or("").to_owned();
+            match record["kind"].as_str().unwrap_or("") {
+                "start" => {
+                    alive.insert(pid, record["name"].as_str().unwrap_or("").to_owned());
+                }
+                "end" => {
+                    alive.remove(&pid);
+                    open.retain(|(p, _), _| *p != pid);
+                }
+                "open" => {
+                    open.insert((pid, text), record["mode"].as_str().unwrap_or("r").to_owned());
+                }
+                "connect" => {
+                    open.insert((pid, text), "connect".into());
+                }
+                "listen" => {
+                    open.insert((pid, format!("listen {text}")), "listen".into());
+                }
+                "close" => {
+                    // A socket closes by its whole name (`local->remote`); it was opened by the remote.
+                    let remote = text.split_once("->").map(|(_, remote)| remote.to_owned());
+                    open.remove(&(pid, text));
+                    if let Some(remote) = remote {
+                        open.remove(&(pid, remote));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let more = records["more"].as_bool().unwrap_or(false);
+        let last = list.last().and_then(|r| r["at"].as_u64()).unwrap_or(at);
+        if !more || last <= from {
+            break;
+        }
+        if page == 39 {
+            partial = true;
+            break;
+        }
+        from = last;
+    }
+    // The last sample of each process in the 10 s before.
+    let samples = window(at.saturating_sub(10_000), &["sample"]).await?;
+    let mut sampled: HashMap<u32, (f64, u64, String)> = HashMap::new();
+    for record in samples["records"].as_array().into_iter().flatten() {
+        let pid = record["pid"].as_u64().unwrap_or(0) as u32;
+        let name = record["name"].as_str().unwrap_or("").to_owned();
+        sampled.insert(pid, (record["cpu"].as_f64().unwrap_or(0.0), record["memory"].as_u64().unwrap_or(0), name));
+    }
+    for (pid, (_, _, name)) in &sampled {
+        alive.entry(*pid).or_insert_with(|| name.clone());
+    }
+    let mut processes: Vec<MomentProcess> = alive
+        .iter()
+        .map(|(pid, name)| {
+            let (cpu, memory, sample_name) = sampled.get(pid).cloned().unwrap_or_default();
+            MomentProcess { pid: *pid, name: if name.is_empty() { sample_name } else { name.clone() }, cpu, memory }
+        })
+        .collect();
+    processes.sort_by(|a, b| b.cpu.total_cmp(&a.cpu).then(b.memory.cmp(&a.memory)));
+    let memory_total = processes.iter().map(|p| p.memory).sum();
+    let mut connections = Vec::new();
+    let mut files = Vec::new();
+    for ((pid, path), mode) in open {
+        match mode.as_str() {
+            "connect" | "listen" => connections.push(path),
+            _ => files.push(MomentFile { pid, path, mode: match mode.as_str() { "w" => "write".into(), "u" => "rw".into(), _ => "read".into() } }),
+        }
+    }
+    files.truncate(50);
+    connections.truncate(50);
+    let output = window(at.saturating_sub(120_000), &["output"]).await?;
+    let lines: Vec<String> = output["records"].as_array().into_iter().flatten().filter_map(|r| r["text"].as_str().map(str::to_owned)).collect();
+    let last_output = lines[lines.len().saturating_sub(20)..].to_vec();
+    let mut moment = Moment { at, processes, memory_total, open: files, connections, last_output, text: String::new() };
+    moment.text = moment_text(&moment, partial);
+    Ok(moment)
+}
+
+/// A moment in a few lines a model reads as they are.
+fn moment_text(moment: &Moment, partial: bool) -> String {
+    let size = |n: u64| if n >= 1_000_000_000 { format!("{:.1} GB", n as f64 / 1e9) } else { format!("{:.0} MB", n as f64 / 1e6) };
+    let mut out = Vec::new();
+    let running: Vec<String> = moment.processes.iter().take(6).map(|p| format!("{} (CPU {:.0}%, {})", p.name, p.cpu, size(p.memory))).collect();
+    out.push(if running.is_empty() { "running then: nothing".to_owned() } else { format!("running then: {}; memory in all {}", running.join(", "), size(moment.memory_total)) });
+    if !moment.open.is_empty() {
+        let files: Vec<String> = moment.open.iter().take(8).map(|f| format!("{} ({})", f.path, f.mode)).collect();
+        out.push(format!("files open: {}", files.join(", ")));
+    }
+    if !moment.connections.is_empty() {
+        out.push(format!("network: {}", moment.connections.iter().take(6).cloned().collect::<Vec<_>>().join(", ")));
+    }
+    if let Some(last) = moment.last_output.last() {
+        out.push(format!("last output: {}", last.chars().take(200).collect::<String>()));
+    }
+    if partial {
+        out.push("(a long trace: only its first part was read for the open files)".into());
+    }
+    out.join("\n")
 }
 
 /// `trace://t-…: 4m12s, exit 0; peak CPU 796%, 6.4 GB; ran rustc ×304, cargo` (about 120 characters).
@@ -1324,7 +1671,9 @@ fn main() {
             methods::ALERT_ACT,
             methods::SWEEP,
             methods::SWEEP_RUN,
-            methods::FINDING_IGNORE,
+            methods::FINDING_DECIDE,
+            methods::FINDING_VERIFY,
+            methods::SECURITY_HISTORY,
             methods::CHECK,
             methods::CVE,
             methods::ASK,

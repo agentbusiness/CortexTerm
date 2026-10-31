@@ -4,10 +4,12 @@
 //! graph, with nothing to pass between processes. The text is written for a small local model to
 //! read and relay: compact, plain, capped.
 
+use crate::graph;
 use crate::sweep::Area;
 use crate::util::{duration_text, plural, shorten};
 use cc_protocol::contracts::system::{CveReport, SweepReport};
 use std::collections::BTreeSet;
+use serde_json::json;
 use std::time::Duration;
 
 /// What the terminal's model reads of a command's output.
@@ -21,6 +23,8 @@ pub const USAGE: &str = "usage:
       within 15 s (or --within) shows the last sweep's findings; --full waits for every one.
   macsec cve <ID>
       Look up a CVE, GHSA, RUSTSEC, PYSEC, MAL or GO advisory and check it against this Mac.
+  macsec weakness <words>
+      What on this Mac has a known flaw of one kind (sql injection, xss, path traversal, CWE-89 …).
   macsec areas
       List the areas.";
 
@@ -28,6 +32,7 @@ pub const USAGE: &str = "usage:
 pub enum Request {
     Check { areas: Vec<Area>, within: Option<Duration> },
     Cve(String),
+    Weakness(String),
     Areas,
     Help,
 }
@@ -57,6 +62,8 @@ pub fn parse(args: &[String]) -> Result<Request, String> {
             [] => Err("which advisory: macsec cve CVE-2024-3094".into()),
             _ => Err("one advisory id at a time".into()),
         },
+        "weakness" if args.is_empty() => Err("which kind of flaw: macsec weakness sql injection".into()),
+        "weakness" => Ok(Request::Weakness(args.join(" "))),
         "areas" => Ok(Request::Areas),
         "help" | "--help" | "-h" => Ok(Request::Help),
         other => Err(format!("unknown command {other}")),
@@ -252,4 +259,91 @@ pub fn cve_text(r: &CveReport) -> String {
         out.push_str(&format!("Not checked: {}\n", shorten(&r.skipped.join("; "), 400)));
     }
     out
+}
+
+/// Kinds of flaw in plain words, and their CWE ids.
+const WEAKNESSES: &[(&str, &[&str], &[&str])] = &[
+    ("SQL injection", &["sql"], &["CWE-89"]),
+    ("cross-site scripting", &["xss", "cross-site scripting", "cross site scripting"], &["CWE-79"]),
+    ("command or code injection", &["command injection", "shell injection", "code injection", "remote code execution", "rce"], &["CWE-77", "CWE-78", "CWE-94"]),
+    ("path traversal", &["traversal"], &["CWE-22", "CWE-23"]),
+    ("unsafe deserialization", &["deserializ"], &["CWE-502"]),
+    ("server-side request forgery", &["ssrf", "request forgery"], &["CWE-918", "CWE-352"]),
+    ("XML external entities", &["xxe", "xml external"], &["CWE-611"]),
+    ("memory corruption", &["buffer overflow", "memory corruption", "out-of-bounds", "out of bounds", "use after free", "use-after-free", "overflow"], &["CWE-119", "CWE-120", "CWE-121", "CWE-122", "CWE-125", "CWE-787", "CWE-416", "CWE-190"]),
+    ("authentication bypass", &["authentication", "auth bypass", "login bypass"], &["CWE-287", "CWE-306", "CWE-798"]),
+    ("privilege escalation", &["privilege", "access control", "authorization"], &["CWE-269", "CWE-284", "CWE-285", "CWE-862", "CWE-863"]),
+    ("denial of service", &["denial of service", "dos", "redos", "resource exhaustion"], &["CWE-400", "CWE-770", "CWE-1333"]),
+    ("prototype pollution", &["prototype pollution"], &["CWE-1321"]),
+    ("information leak", &["information disclosure", "information exposure", "leak"], &["CWE-200"]),
+    ("certificate validation", &["certificate", "tls", "ssl"], &["CWE-295"]),
+];
+
+/// What the graph knows affects this Mac with flaws of the kind `words` name.
+pub async fn weakness_text(words: &str) -> (String, i32) {
+    let asked = words.to_lowercase();
+    let mut names = Vec::new();
+    let mut ids: BTreeSet<String> = asked.split(|c: char| c.is_whitespace() || c == ',').filter(|w| w.starts_with("cwe-")).map(str::to_uppercase).collect();
+    let said_words: Vec<&str> = asked.split(|c: char| !c.is_alphanumeric() && c != '-').filter(|w| !w.is_empty()).collect();
+    // A cue of several words is a phrase; one word starts a word ("deserializ…"), never sits inside one.
+    let said = |cue: &str| if cue.contains(' ') { asked.contains(cue) } else { said_words.iter().any(|w| w.starts_with(cue)) };
+    for (name, cues, cwes) in WEAKNESSES {
+        if cues.iter().any(|cue| said(cue)) {
+            names.push(*name);
+            ids.extend(cwes.iter().map(|id| (*id).to_owned()));
+        }
+    }
+    if ids.is_empty() {
+        let known: Vec<&str> = WEAKNESSES.iter().map(|(name, _, _)| *name).collect();
+        return (format!("macsec: no kind of flaw matches \"{words}\". Known: {}, or a CWE id.\n", known.join(", ")), 2);
+    }
+    let rows = match graph::query_all(
+        "MATCH (a:Advisory)-[e:AFFECTS]->(t) OPTIONAL MATCH (r:Repo)-[:DEPENDS_ON]->(t) \
+         RETURN a.key, a.title, a.cwe, a.kev, t.key, e.verdict, e.version, e.fixed_in, e.fix, collect(r.key)",
+        json!({}),
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => return (format!("macsec: the memory could not be read: {error}\n"), 1),
+    };
+    let label = if names.is_empty() { ids.iter().cloned().collect::<Vec<_>>().join(", ") } else { names.join(", ") };
+    let mut out = format!("WEAKNESS: {label} ({})\n", ids.iter().cloned().collect::<Vec<_>>().join(", "));
+    let (mut affected, mut clear) = (Vec::new(), BTreeSet::new());
+    for row in &rows {
+        if !graph::texts(&row[2]).iter().any(|c| ids.contains(c)) {
+            continue;
+        }
+        if graph::text(&row[5]) == "affected" {
+            affected.push(row);
+        } else {
+            clear.insert(graph::text(&row[0]));
+        }
+    }
+    out.push_str(&format!("Affects this Mac: {}\n", affected.len()));
+    for (i, row) in affected.iter().take(12).enumerate() {
+        let mut line = format!("{}. {}{} {} {}", i + 1, graph::text(&row[0]), if row[3].as_bool() == Some(true) { " [exploited, CISA KEV]" } else { "" }, graph::text(&row[4]), graph::text(&row[6]));
+        let fixed_in = graph::text(&row[7]);
+        if !fixed_in.is_empty() {
+            line.push_str(&format!(", fixed in {fixed_in}"));
+        }
+        let repos = graph::texts(&row[9]);
+        if !repos.is_empty() {
+            line.push_str(&format!(" · used by {}", repos.iter().take(3).map(|r| crate::util::tilde(std::path::Path::new(r))).collect::<Vec<_>>().join(", ")));
+        }
+        out.push_str(&line);
+        out.push('\n');
+        if let Some(fix) = row[8].as_str().filter(|f| !f.is_empty()) {
+            out.push_str(&format!("   fix (offered, not run): {}\n", shorten(fix, 160)));
+        }
+        out.push_str(&format!("   {}\n", shorten(&graph::text(&row[1]), 160)));
+    }
+    if affected.len() > 12 {
+        out.push_str(&format!("… and {} more.\n", affected.len() - 12));
+    }
+    if !clear.is_empty() {
+        out.push_str(&format!("Checked here and not affecting this Mac: {}.\n", plural(clear.len(), "advisory", "advisories")));
+    }
+    out.push_str("Only advisories CortexTerm has already compared with this Mac are known; `macsec check packages updates` looks again.\n");
+    (out, 0)
 }

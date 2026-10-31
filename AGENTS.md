@@ -27,7 +27,9 @@ Its code was copied from CortexCode (`../CortexCode`) and reshaped. Both apps fo
   `<category>.shares` declaration, where a call may come from, the caller, run options, jobs and
   read sizes, and the one-tool-per-service builder;
 - the write sandbox, `sandbox-kit/`, and the shared models folder, `shared-models/`: the same code
-  in both repositories, byte for byte.
+  in both repositories, byte for byte;
+- the caller's side of shared services and their text for a model, `service-kit/`: the same code in
+  both repositories, byte for byte.
 
 **Any change to the plugin architecture, the mesh, or model and resource sharing is made in both
 CortexTerm and CortexCode**, in the same piece of work, and listed in both repositories' docs with the
@@ -57,6 +59,12 @@ The design canvas (https://claude.ai/artifact/SYWUQrGkcii1eEzrYbQwJy) shows how 
 and behave. A UI change is done only when the running app matches its board: layout, type, colours,
 labels and the keys shown on buttons. Check by screenshotting the running app next to the board. If the
 build should differ from the board, change the board on purpose and say why.
+
+## No builds unless asked
+
+Write the code only. Never build, package, install, release or hot-swap the app or a plugin
+(`build-app.sh`, release scripts, `./cortexterm runner`) until the owner asks for it in so many words.
+`cargo check` to see that the code compiles is fine.
 
 ## Checking a change
 
