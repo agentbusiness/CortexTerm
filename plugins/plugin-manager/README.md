@@ -36,3 +36,10 @@ The band derives expected backend services from the installed plugin units and r
 It does not require CortexCode-only categories (`tools`, `vcs`, `chatflow-coding`, `agents`,
 `browser`) in CortexTerm. Enabled backends that are missing or crashed still appear; intentionally
 disabled and standby providers do not create missing-service warnings. Unit changes refresh the band.
+
+## Current plugin list and settings layout (0.1.10)
+
+Card Host is a retired UI-only component replaced by the Desk. The current-plugin list and
+release comparison exclude it; no installed files are deleted or changed. Other plugins with
+missing release information remain visible. Update results appear below the buttons and wrap
+within the settings panel. A reset with nothing to change is visibly disabled.

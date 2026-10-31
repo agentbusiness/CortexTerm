@@ -13,6 +13,7 @@
 import { Fragment, useState, type ReactNode } from 'react';
 import { definePlugin, duration, errorMessage, useClient, useHost, useQuery, useUiPlugins, type PluginInfo } from '@cortex/sdk';
 import { ResetAll, version } from './ResetAll';
+import { UNUSED_PLUGINS } from './legacy';
 import './plugins.css';
 
 interface SwapStep { step: string; ok: boolean; ms: number; detail?: string }
@@ -121,7 +122,7 @@ function PluginsPanel() {
   // The frame lists every plugin (`units`); a running service or UI package no unit claims is
   // grouped under its own id (UI package ids are `<plugin>.<package>`).
   const services = listed.data?.plugins ?? [];
-  const units = new Map<string, Unit>((listed.data?.units ?? []).map((unit) => [unit.id, { ...unit }]));
+  const units = new Map<string, Unit>((listed.data?.units ?? []).filter((unit) => !UNUSED_PLUGINS.has(unit.id)).map((unit) => [unit.id, { ...unit }]));
   const servicesByUnit = new Map<string, Info[]>();
   // A shell module's hello identifies the module, not necessarily its service category.
   // Match the installed package's declared parts before creating an app-served entry.
@@ -135,6 +136,7 @@ function PluginsPanel() {
   }
   const claimedUi = new Set([...units.values()].flatMap((unit) => unit.ui ?? []));
   for (const plugin of ui) {
+    if (UNUSED_PLUGINS.has(plugin.id.split('.')[0]!)) continue;
     if (claimedUi.has(plugin.id)) continue;
     const name = plugin.id.split('.')[0]!;
     const unit = units.get(name) ?? { id: name, enabled: true, served: true, ui: [] };
