@@ -46,8 +46,8 @@ export function PaneFrame({ pane, focused, title, status, onFocus, onClose, chil
 
 // --- the editor -------------------------------------------------------------------------------
 
-export function EditorPane({ pane, focused, bare, home, onFocus, onShelf, onClose, onAsk, onRunReal }: PaneControls & {
-  pane: PaneRec; home: string; onAsk: Ask; onRunReal: (command: string) => void;
+export function EditorPane({ pane, focused, bare, home, onFocus, onShelf, onClose, onRunReal }: PaneControls & {
+  pane: PaneRec; home: string; onRunReal: (command: string) => void;
 }) {
   const host = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView | null>(null);
@@ -55,7 +55,6 @@ export function EditorPane({ pane, focused, bare, home, onFocus, onShelf, onClos
   const [dirty, setDirty] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
-  const [line, setLine] = useState({ n: 1, text: '' });
   const client = useRuntime().client;
   const saveRef = useRef<() => void>(() => undefined);
   const closeRef = useRef(onClose);
@@ -89,10 +88,6 @@ export function EditorPane({ pane, focused, bare, home, onFocus, onShelf, onClos
         nano, keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap]),
         EditorView.updateListener.of((update) => {
           if (update.docChanged) setDirty(true);
-          if (update.selectionSet || update.docChanged) {
-            const at = update.state.doc.lineAt(update.state.selection.main.head);
-            setLine({ n: at.number, text: at.text });
-          }
         }),
         EditorView.theme({ '&': { height: '100%' }, '.cm-scroller': { fontFamily: 'var(--font-mono)' } }),
       ],
@@ -136,14 +131,7 @@ export function EditorPane({ pane, focused, bare, home, onFocus, onShelf, onClos
       </>}>
       {problem && <p className="ct-hint ct-warn">{problem}{/needs admin/i.test(problem) ? ' Use sudo nano to edit a file that needs admin rights.' : ''}</p>}
       {file?.too_large && <p className="ct-hint">This file is too large or not text for the editor ({size(file.bytes)}). View it with less {quote(pane.path ?? '')}.</p>}
-      <div className="ct-editor-body">
-        <div className="ct-editor" ref={host} />
-        <aside className="ct-editor-side">
-          <span className="ct-label ct-faint">LINE {line.n}</span>
-          <code className="ct-mono ct-editor-line">{line.text || ' '}</code>
-          <button type="button" className="detent sm warn" disabled={!line.text.trim()} onClick={() => onAsk(`In the file ${file?.path ?? name}, explain line ${line.n}: \`${line.text.trim()}\`. Is it valid?`, 'explain')}>EXPLAIN LINE ⌘E</button>
-        </aside>
-      </div>
+      <div className="ct-editor" ref={host} />
       <footer className="ct-nano ct-mono">
         <span><b>^O</b> Save</span><span><b>^X</b> Close</span><span><b>^W</b> Find</span><span><b>^\</b> Replace</span><span><b>^K</b> Cut line</span><span><b>M-U</b> Undo</span><span><b>⌘S</b> Save</span>
       </footer>
