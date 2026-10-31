@@ -20,17 +20,27 @@ const SWATCHES = [
 ] as const;
 const colorStyle = (color?: string) => ({ '--computer-color': (SWATCHES.find((swatch) => swatch.id === color) ?? SWATCHES[0]).value }) as CSSProperties;
 export const LOCAL_COMPUTER: Computer = { node: '', name: 'This Mac', reachable: true, path: 'local' };
+/** Routing uses an empty node for this computer; persisted object members need a name. */
+const colorKey = (node: string) => node || 'local';
+
+function migrateColors(layout: ClusterLayout): ClusterLayout {
+  if (!Object.hasOwn(layout.colors, '')) return layout;
+  const { '': local, ...colors } = layout.colors;
+  return { ...layout, colors: { ...colors, local: colors.local ?? local } };
+}
 
 /** Discovery appends; it never sorts or replaces the person's arrangement. */
 export function useClusterLayout(computers: Computer[]) {
-  const [layout, setLayout] = useShared<ClusterLayout>('ct.cluster', EMPTY_LAYOUT);
+  const [stored, setLayout] = useShared<ClusterLayout>('ct.cluster', EMPTY_LAYOUT);
+  const layout = migrateColors(stored);
   const discovered = computers.map((computer) => computer.node);
   const order = [...layout.order, ...discovered.filter((node) => !layout.order.includes(node))];
   const discoveryKey = JSON.stringify(discovered);
   useEffect(() => {
     setLayout((current) => {
-      const added = discovered.filter((node) => !current.order.includes(node));
-      return added.length ? { ...current, order: [...current.order, ...added] } : current;
+      const migrated = migrateColors(current);
+      const added = discovered.filter((node) => !migrated.order.includes(node));
+      return added.length ? { ...migrated, order: [...migrated.order, ...added] } : migrated;
     });
     // The key represents the discovered identities, independently of metric and name updates.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -43,7 +53,7 @@ export function ComputerPicker({ computers, node, colors, onSelect, onCluster }:
   onSelect: (node: string) => void; onCluster: () => void;
 }) {
   return <div className="ct-computer-controls">
-    <label className="ct-computer-picker" style={colorStyle(colors[node])}>
+    <label className="ct-computer-picker" style={colorStyle(colors[colorKey(node)])}>
       <span className="ct-computer-color" aria-hidden />
       <select aria-label="Machine for all side panes" value={node} onChange={(event) => onSelect(event.target.value)}>
         {computers.map((computer) => <option key={computer.node} value={computer.node}>
@@ -289,12 +299,15 @@ export function Cluster({ open, computers, selected, layout, order, onLayout, on
       <div ref={grid} className="ct-cluster-grid">
         {ordered.map((computer) => <div key={computer.node} data-computer={computer.node}
           ref={(element) => { if (element) slots.current.set(computer.node, element); else slots.current.delete(computer.node); }}
-          style={{ ...colorStyle(layout.colors[computer.node]), ...(lift?.node === computer.node && lift.style ? { height: drag.current?.rect.height } : {}) }}
+          style={{ ...colorStyle(layout.colors[colorKey(computer.node)]), ...(lift?.node === computer.node && lift.style ? { height: drag.current?.rect.height } : {}) }}
           className={`ct-cluster-slot${lift?.node === computer.node ? ' is-placeholder' : ''}`}>
           <ComputerScope node={computer.node || null}>
-            <ClusterCard computer={computer} color={layout.colors[computer.node]} selected={selected === computer.node}
+            <ClusterCard computer={computer} color={layout.colors[colorKey(computer.node)]} selected={selected === computer.node}
               lifted={lift?.node === computer.node} dragStyle={lift?.node === computer.node ? lift.style : undefined}
-              onColor={(color) => onLayout((current) => ({ ...current, colors: { ...current.colors, [computer.node]: color } }))}
+              onColor={(color) => onLayout((current) => {
+                const migrated = migrateColors(current);
+                return { ...migrated, colors: { ...migrated.colors, [colorKey(computer.node)]: color } };
+              })}
               onSelect={() => { finish(false); onSelect(computer.node); }}
               grip={<button type="button" className="ct-cluster-grip" aria-label={`Move ${computer.name}`} aria-describedby="ct-cluster-move-help"
                 aria-pressed={lift?.node === computer.node} onPointerDown={(event) => startPointer(event, computer.node)}
