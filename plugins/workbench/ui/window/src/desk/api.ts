@@ -258,35 +258,35 @@ export interface Alert {
   dismissed: boolean;
 }
 
-/** `system.cve`: one advisory cross-checked against what is installed on this Mac. */
-export interface CveReport {
-  id: string;
-  aliases: string[];
-  title: string;
-  summary: string;
-  published: string;
-  cvss?: { version: string; score: number; severity: string; vector: string } | null;
-  cwe: string[];
-  kev?: { added: string; due: string; ransomware: boolean; action: string } | null;
-  epss?: { score: number; percentile: number } | null;
-  references: { url: string; tags: string[] }[];
-  matches: { what: string; version: string; place: string; verdict: string; why: string; fix?: string | null }[];
-  /** affected | fixed | not-affected | unknown | not-found */
-  verdict: string;
-  verdict_text: string;
-  skipped: string[];
-}
-
 export interface Finding {
   severity: string;
   kind: string;
   text: string;
   fix?: string | null;
   source: string;
-  /** Stable across sweeps; what an ignore is remembered by. */
+  /** Stable across sweeps. */
   key: string;
-  /** The user said not to worry about it. */
+  /** A decision covers it. */
   ignored?: boolean;
+  /** What it is about: findings are grouped and decided by it. */
+  group?: string;
+  /** The covering decision's verdict; empty when open. */
+  decision?: string;
+  /** A fix command that ran and did not clear it. */
+  tried?: string | null;
+}
+
+/** The person's decision about a group of findings (`system.finding.decide`). */
+export interface Decision {
+  /** expected | false_alarm | accepted | vendor */
+  verdict: string;
+  group: string;
+  /** Only these findings; empty: the whole group up to `severity`. */
+  keys: string[];
+  severity: string;
+  at: number;
+  /** 0: no end. */
+  until: number;
 }
 
 export interface SweepReport {
@@ -295,6 +295,27 @@ export interface SweepReport {
   findings: Finding[];
   checked: string[];
   skipped: string[];
+  decisions?: Decision[];
+  /** The latest checks after a fix, newest first. */
+  fixes?: { at: number; group: string; text: string; command: string; gone: boolean }[];
+}
+
+/** `system.security.history`: per bucket, new high, medium, low and info; per group, its buckets. */
+export interface History {
+  since: number;
+  bucket_ms: number;
+  series: [number, number, number, number][];
+  hits: Record<string, number[]>;
+  /** What changed on the computer meanwhile (`macOS 26.1`, `3 apps updated`). */
+  markers?: { at: number; text: string }[];
+}
+
+/** `system.cve`, the part the Alerts pane shows: each copy of the software it covers here. */
+export interface CveReport {
+  id: string;
+  verdict: string;
+  verdict_text: string;
+  matches: { what: string; version: string; place: string; verdict: string; why: string; fix?: string | null }[];
 }
 
 export interface ModelInfo {

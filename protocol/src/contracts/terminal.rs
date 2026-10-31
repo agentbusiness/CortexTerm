@@ -691,6 +691,12 @@ pub struct CommandRunParams {
     /// Extra environment for this command.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
+    /// Folders put in front of PATH after the login profile ran (a venv's bin, toolchains).
+    #[serde(default)]
+    pub path: Vec<String>,
+    /// `bash` for `/bin/bash -lc`; the person's own shell when empty.
+    #[serde(default)]
+    pub shell: String,
     /// Stopped after this long (0: 10 minutes; a `background` one: 24 hours).
     #[serde(default)]
     pub timeout_ms: u64,

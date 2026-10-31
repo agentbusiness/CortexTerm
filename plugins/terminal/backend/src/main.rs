@@ -25,7 +25,7 @@ impl Plugin for TerminalPlugin {
                 methods::COMMAND_RUN => commands.run(ctx, call.params, call.items, call.cancel).await,
                 methods::COMMAND_STOP => to_value(&commands.stop(&id_of(&call.params)?)?),
                 methods::COMMAND_JOBS_LIST => Ok(commands.jobs()),
-                methods::COMMAND_JOBS_GET => to_value(&commands.job(&id_of(&call.params)?)?),
+                methods::COMMAND_JOBS_GET => to_value(&commands.get(&ctx, call.params).await?),
                 methods::COMMAND_OUTPUT_READ => commands.output(parse_params(call.params)?).await,
                 _ => terms.dispatch(&call.method, call.params).await,
             }
@@ -41,6 +41,8 @@ impl Plugin for TerminalPlugin {
     fn activate(&self, ctx: Ctx) -> BoxFuture<'static, Result<(), RpcError>> {
         let _ = self.ctx.set(ctx);
         let terms = self.terms.clone();
+        // Jobs a stopped instance left running are lost now (once the graph answers).
+        tokio::spawn(self.commands.clone().recover());
         Box::pin(async move { terms.attach().await })
     }
 

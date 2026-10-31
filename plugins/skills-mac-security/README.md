@@ -79,3 +79,9 @@ summary `describe` gave, a body follows) and asks for an unknown skill (`not_fou
 ## Skill wording 0.1.4
 
 The four cards use compact output-grounded instructions. No-findings results name their checked scope; incomplete checks remain visible. EPSS is not the chance that this particular Mac will be compromised. Security knowledge avoids unconditional exposure or compromise claims from a setting alone. This wording change has source review only; no fresh security sweep, build or model session was run. See [terminal skill release notes](../../docs/terminal-skills/README.md).
+
+## Weakness check 0.1.5
+
+`weakness-check`: "am I vulnerable to SQL injection?" runs `macsec weakness <words>`, which lists the
+advisories already compared with this Mac whose CWE matches, and what they affect. Not run with a
+model yet.

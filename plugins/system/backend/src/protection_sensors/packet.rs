@@ -147,8 +147,17 @@ impl PacketWatch {
             match capture.child.try_wait() {
                 Ok(Some(exit)) => {
                     ended = true;
-                    self.error =
-                        format!("Packet collector exited ({exit}); {}", capture.last_error);
+                    // Drain what tcpdump said before exiting so the reason is the real one.
+                    while let Ok(message) = capture.receiver.recv_timeout(Duration::from_millis(50)) {
+                        if let Message::Error(line) = message {
+                            capture.last_error = line;
+                        }
+                    }
+                    self.error = if denied(&capture.last_error) {
+                        "Packet capture permission is missing: macOS lets only root read the BPF capture devices (/dev/bpf*). CT never elevates itself. Grant your user read access to BPF (for example with Wireshark's ChmodBPF) and scan detection starts within 30 seconds.".into()
+                    } else {
+                        format!("Packet collector exited ({exit}). {}", capture.last_error)
+                    };
                 }
                 Err(error) => {
                     ended = true;
@@ -214,9 +223,6 @@ impl PacketWatch {
                 status
                     .detail
                     .push_str(&format!(" Collector: {}", capture.last_error));
-            }
-            if ended && !capture.last_error.is_empty() {
-                self.error.push_str(&format!(" {}", capture.last_error));
             }
         } else {
             status.state = "unavailable".into();
@@ -334,14 +340,16 @@ fn start_capture() -> Result<Capture, String> {
     // The IPv6 clause deliberately covers ordinary TCP headers only; the health text exposes
     // that limitation instead of pretending extension-header chains are parsed.
     let filter = "(ip and tcp[13] & 18 = 2) or (ip6 and ip6[6] = 6 and ip6[53] & 18 = 2)";
+    // macOS pktap needs root to create its interface even when BPF is readable, so capture on
+    // the interface that carries the default route.
     let interface = if cfg!(target_os = "macos") {
-        "pktap,all"
+        default_interface().ok_or("No default-route interface; scan detection has no packet source.")?
     } else {
-        "any"
+        "any".into()
     };
     let mut child = Command::new(executable)
         .args([
-            "-l", "-n", "-tt", "-p", "-s", "256", "-i", interface, filter,
+            "-l", "-n", "-tt", "-p", "-s", "256", "-i", &interface, filter,
         ])
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
@@ -374,6 +382,26 @@ fn start_capture() -> Result<Capture, String> {
         started: Instant::now(),
         stats_at: Instant::now(),
     })
+}
+
+fn denied(error: &str) -> bool {
+    ["Permission denied", "Operation not permitted", "don't have permission"]
+        .iter()
+        .any(|text| error.contains(text))
+}
+
+fn default_interface() -> Option<String> {
+    let output = Command::new("/sbin/route")
+        .args(["-n", "get", "default"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("interface:"))
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
 }
 
 fn drain<R: Read>(reader: R, sender: mpsc::SyncSender<Message>, loss: Arc<AtomicU64>, error: bool) {

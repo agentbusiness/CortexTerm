@@ -420,13 +420,15 @@ export function Desk() {
       if (pane.termId) setTimeout(() => runIn(pane.termId!, command, sideNode), 700);
     }).catch((cause) => host.notify(`No shell on ${selectedComputer.name}: ${errorMessage(cause)}`));
   }, [openTerm, runIn, sideNode, selectedComputer.name, host]);
-  const onSideCommand = useCallback((command: string) => {
+
+  /** A command offered for a computer: on that computer's Line, never run until the person does. */
+  const commandOn = useCallback((node: string | undefined, command: string) => {
     void (async () => {
-      if (!focusedTerm || focusedTerm.node !== sideNode) await openTerm(undefined, 'stage', 'shell', sideNode);
+      if (!focusedTerm || focusedTerm.node !== node) await openTerm(undefined, 'stage', 'shell', node);
       line.current?.set(command);
       line.current?.focus();
     })().catch((cause) => host.notify(errorMessage(cause)));
-  }, [focusedTerm, sideNode, openTerm, host]);
+  }, [focusedTerm, openTerm, host]);
 
   const onSignal = useCallback((proc: Proc, signal: string) => {
     clientOf(sideNode).call<{ ok: boolean; detail?: string }>('system.signal', { pid: proc.pid, signal })
@@ -579,7 +581,7 @@ export function Desk() {
       case 'editor': return <EditorPane pane={pane} home={home} onRunReal={(command) => void onShell(command, 'pane')} {...common} />;
       case 'run': return <RunPane pane={pane} home={home} onAsk={onAsk} {...common} />;
       case 'process': return <ProcessPane pane={pane} onAsk={onAsk} onSignal={onSignal} onInvestigate={onInvestigate} {...common} />;
-      case 'alerts': return <AlertsPane pane={pane} onAsk={onAsk} onRunCommand={(command) => line.current?.set(command)} {...common} />;
+      case 'alerts': return <AlertsPane pane={pane} onAsk={(text, intent, runId) => void onAsk(text, intent, runId, { node: pane.node })} onCommand={(command) => commandOn(pane.node, command)} {...common} />;
       case 'ssh': return <SshPane pane={pane} onShell={(command) => void onShell(command, 'pane')} onAsk={(text, intent) => void onAsk(text, intent)} {...common} />;
       case 'schedules': return <SchedulesPane pane={pane} home={home} {...common} />;
     }
@@ -688,7 +690,7 @@ export function Desk() {
                 <p className="ct-hint">These panes belong to this computer. They resume when it reconnects.</p>
                 <button type="button" className="detent" onClick={readComputers}>CHECK CONNECTION</button>
               </div> : <ComputerScope key={sideNode ?? 'local'} node={sideNode ?? null}>
-                {sideView === 'alerts' && <AlertsPane {...sideFrame('alerts')} onAsk={onSideAsk} onRunCommand={onSideCommand} />}
+                {sideView === 'alerts' && <AlertsPane {...sideFrame('alerts')} onAsk={onSideAsk} onCommand={(command) => commandOn(sideNode ?? undefined, command)} />}
                 {sideView === 'machine' && <Sidebar computer={nameOf(sideNode)} onAsk={onSideAsk} onSignal={onSignal} onInvestigate={onInvestigate} />}
                 {sideView === 'traces' && <Traces open={sideTrace} home={sideHome} onOpen={setSideTrace} onAsk={onSideAsk}
                   onOpenRun={(runId) => { setSideRun(runId); setSideView('log'); }} />}

@@ -27,6 +27,12 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// The incident subject of a sweep finding group: one incident per group, which the window finds
+/// by the group's name.
+pub fn group_subject(group: &str) -> String {
+    format!("group:{group}")
+}
+
 pub fn digest(text: &str) -> String {
     Sha256::digest(text.as_bytes())[..16]
         .iter()
@@ -716,6 +722,19 @@ impl Store {
         self.incidents.iter().find(|i| i.id == id).cloned()
     }
 
+    pub fn incidents(&self) -> impl Iterator<Item = &SecurityIncident> {
+        self.incidents.iter()
+    }
+
+    /// The person decided about what these incidents are about: their open ones are dismissed.
+    pub fn dismiss(&mut self, key: &str) {
+        for incident in self.incidents.iter_mut().filter(|i| i.key == key && i.state == "open") {
+            incident.state = "dismissed".into();
+            incident.revision = incident.revision.saturating_add(1);
+            Self::save(incident);
+        }
+    }
+
     pub fn action(&mut self, action: &ProtectionAction) -> Result<(), String> {
         if !self.loaded {
             return Err("Protection memory is still starting.".into());
@@ -914,7 +933,7 @@ pub fn rank(value: &str) -> u8 {
         _ => 0,
     }
 }
-fn normal_severity(value: &str) -> &str {
+pub fn normal_severity(value: &str) -> &str {
     match rank(value) {
         3 => "high",
         2 => "medium",
