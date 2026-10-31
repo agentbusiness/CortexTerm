@@ -24,6 +24,7 @@ export const LOCAL_COMPUTER: Computer = { node: '', name: 'This Mac', reachable:
 const colorKey = (node: string) => node || 'local';
 
 function migrateColors(layout: ClusterLayout): ClusterLayout {
+  if (!layout.colors) return { ...layout, colors: {} };
   if (!Object.hasOwn(layout.colors, '')) return layout;
   const { '': local, ...colors } = layout.colors;
   if (colors.local === undefined && local !== undefined) colors.local = local;
@@ -33,7 +34,7 @@ function migrateColors(layout: ClusterLayout): ClusterLayout {
 /** Discovery appends; it never sorts or replaces the person's arrangement. */
 export function useClusterLayout(computers: Computer[]) {
   const [stored, setLayout] = useShared<ClusterLayout>('ct.cluster', EMPTY_LAYOUT);
-  const legacyColors = Object.hasOwn(stored.colors, '');
+  const legacyColors = Object.hasOwn(stored.colors ?? {}, '');
   const layout = migrateColors(stored);
   const discovered = computers.map((computer) => computer.node);
   const order = [...layout.order, ...discovered.filter((node) => !layout.order.includes(node))];
