@@ -37,6 +37,12 @@ Updates from the official releases (`docs/RELEASES.md`).
 
 ## Configuration
 
+Unreleased UI source change (0.1.15): bottom-right update cards render through a portal into
+the workbench root, keeping them outside the band layout and above the settings scrim. The
+stack scrolls on shorter windows. It still opens for an update round, a pending decision or
+an unseen failure; an idle check with no updates does not open a card. Source reviewed only;
+no build, install or live verification.
+
 ```toml
 [plugin.updater.config]
 enabled = true                      # false: never look

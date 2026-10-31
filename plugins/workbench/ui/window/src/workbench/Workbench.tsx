@@ -100,6 +100,10 @@ export function Workbench({ registry, shell }: { registry: PluginRegistry; shell
             </div>
             {/* The Desk puts its own band items here: the Desk's name, the model, attention, Map. */}
             <div id="ct-band" className="ct-band-items" />
+            <ComputerScope node={null}>
+              {/* The Desk owns settings and panes; an old installed Card host must not mount them again. */}
+              <SlotList registry={registry} name="workbench.band@1" className="cx-band-item" exclude={['card-host.card']} />
+            </ComputerScope>
           </div>
           {settled && <Desk />}
           </>)}
@@ -145,10 +149,10 @@ function PickedSlot({ registry, name, props, className, flow }: SlotRenderProps 
 }
 
 /** Every plugin contributed to a slot, each in its own slot host (each hot-swaps on its own). */
-function SlotList({ registry, name, props, className }: SlotListProps & { registry: PluginRegistry }) {
+function SlotList({ registry, name, props, className, exclude = [] }: SlotListProps & { registry: PluginRegistry; exclude?: readonly string[] }) {
   const ids = useSyncExternalStore(
     (listener) => registry.subscribe(listener),
-    () => registry.allForSlot(name).map((plugin) => `${plugin.id}:${registry.reloadToken(plugin.id)}`).join('\n'),
+    () => registry.allForSlot(name).filter((plugin) => !exclude.includes(plugin.id)).map((plugin) => `${plugin.id}:${registry.reloadToken(plugin.id)}`).join('\n'),
   );
   if (!ids) return null;
   return (

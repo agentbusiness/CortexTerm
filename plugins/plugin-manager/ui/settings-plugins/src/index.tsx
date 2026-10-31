@@ -122,16 +122,16 @@ function PluginsPanel() {
   // grouped under its own id (UI package ids are `<plugin>.<package>`).
   const services = listed.data?.plugins ?? [];
   const units = new Map<string, Unit>((listed.data?.units ?? []).map((unit) => [unit.id, { ...unit }]));
-  const claimedCategories = new Set([...units.values()].map((unit) => unit.category).filter(Boolean));
-  // A service no unit declares as its backend: one served by a plugin's app-shell module over the
-  // WebSocket (the plugin of the same id), else its own entry.
+  const servicesByUnit = new Map<string, Info[]>();
+  // A shell module's hello identifies the module, not necessarily its service category.
+  // Match the installed package's declared parts before creating an app-served entry.
   for (const service of services) {
-    if (claimedCategories.has(service.category)) continue;
-    claimedCategories.add(service.category);
-    const owner = units.get(service.category);
-    units.set(service.category, owner && !owner.category
-      ? { ...owner, category: service.category }
-      : { id: service.category, version: service.version, enabled: true, served: true, category: service.category, ui: [] });
+    const owner = [...units.values()].find((unit) => unit.category === service.category)
+      ?? [...units.values()].find((unit) => unit.id === service.plugin_id || unit.shell?.includes(service.plugin_id))
+      ?? units.get(service.category);
+    const id = owner?.id ?? service.category;
+    if (!owner) units.set(id, { id, version: service.version, enabled: true, served: true, category: service.category, ui: [] });
+    servicesByUnit.set(id, [...(servicesByUnit.get(id) ?? []), service]);
   }
   const claimedUi = new Set([...units.values()].flatMap((unit) => unit.ui ?? []));
   for (const plugin of ui) {
@@ -144,7 +144,7 @@ function PluginsPanel() {
 
   const serviceRows = (unit: Unit): ReactNode => {
     // The instance serving the category first, then standby ones.
-    const instances = services.filter((service) => service.category === unit.category).sort((a, b) => Number(b.state === 'active') - Number(a.state === 'active'));
+    const instances = [...(servicesByUnit.get(unit.id) ?? [])].sort((a, b) => Number(b.state === 'active') - Number(a.state === 'active'));
     return instances.map((service) => {
       const process = (service.transport ?? (service.exec === 'websocket' ? 'websocket' : 'process')) !== 'websocket';
       const outcome = results[service.category];
@@ -194,10 +194,10 @@ function PluginsPanel() {
             const toggleable = !unit.served;
             const shown = open === name;
             // The one fact worth a line of its own: the plugin is off, or its service is not running.
-            const running = services.filter((service) => service.category === unit.category);
+            const running = servicesByUnit.get(name) ?? [];
+            const stopped = running.find((service) => !running.some((other) => other.category === service.category && other.state === 'active'));
             const problem = off ? 'off'
-              : unit.category && running.length > 0 && !running.some((service) => service.state === 'active') ? running[0]!.state
-              : null;
+              : stopped?.state ?? null;
             return (
               <Fragment key={name}>
                 <tr className={`cx-unit${shown ? ' cx-open' : ''}`} data-vertical={name} data-enabled={off ? 'false' : 'true'}>
@@ -243,7 +243,7 @@ function PluginsPanel() {
                     <td><div className="cx-plugin-acts"><button className="detent" type="button" disabled={busy !== null} data-action="rollback-plugin" onClick={() => void rollbackUnit(name)}>Use previous version</button></div></td>
                   </tr>
                 ) : null}
-                {shown && !off && unit.category ? serviceRows(unit) : null}
+                {shown && !off ? serviceRows(unit) : null}
                 {shown && off && unit.category ? (
                   <tr className="cx-part" data-category={unit.category} data-state="disabled"><td><span className="cx-part-kind">service</span> {unit.category}</td><td colSpan={2}><span className="ap faint">stopped</span></td></tr>
                 ) : null}

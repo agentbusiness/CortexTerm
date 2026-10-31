@@ -20,6 +20,13 @@ cortex-pack build plugins/workbench                  # -> plugins/workbench/targ
 
 ## Command output — unreleased source changes (0.1.20)
 
+The Desk window mounts the existing `workbench.band@1` contributions in local-computer scope
+again, including the updater's bottom-right cards, restart action and service/connection status.
+It excludes the legacy `card-host.card` UI if an older installation still has that package:
+the Desk already owns settings and panes. The installed package is not removed or disabled.
+This restores an existing slot; no plugin contract changes. Source reviewed only; no build,
+install or live verification.
+
 Command output, assistant checks, and in-card tables/logs have a 320px maximum body height.
 Output follows its latest line until the reader scrolls upward, uses an upward navigation key,
 or starts selecting text. “Follow output ↓” resumes the live tail. Paused Run cards hold a fixed
