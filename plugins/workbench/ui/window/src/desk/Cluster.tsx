@@ -26,12 +26,14 @@ const colorKey = (node: string) => node || 'local';
 function migrateColors(layout: ClusterLayout): ClusterLayout {
   if (!Object.hasOwn(layout.colors, '')) return layout;
   const { '': local, ...colors } = layout.colors;
-  return { ...layout, colors: { ...colors, local: colors.local ?? local } };
+  if (colors.local === undefined && local !== undefined) colors.local = local;
+  return { ...layout, colors };
 }
 
 /** Discovery appends; it never sorts or replaces the person's arrangement. */
 export function useClusterLayout(computers: Computer[]) {
   const [stored, setLayout] = useShared<ClusterLayout>('ct.cluster', EMPTY_LAYOUT);
+  const legacyColors = Object.hasOwn(stored.colors, '');
   const layout = migrateColors(stored);
   const discovered = computers.map((computer) => computer.node);
   const order = [...layout.order, ...discovered.filter((node) => !layout.order.includes(node))];
@@ -44,7 +46,7 @@ export function useClusterLayout(computers: Computer[]) {
     });
     // The key represents the discovered identities, independently of metric and name updates.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [discoveryKey, setLayout]);
+  }, [discoveryKey, setLayout, legacyColors]);
   return { layout, setLayout, order };
 }
 
