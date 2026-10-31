@@ -12,6 +12,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { errorMessage, useClient, useQuery, useSlotInfo, useSlotState } from '@cortex/sdk';
+import { UNUSED_PLUGINS } from './legacy';
 
 interface ResetItem { plugin: string; name?: string; installed?: string; release?: string; from?: string; files?: string[]; action: string }
 interface Plan { plugins: ResetItem[]; running?: boolean; offline?: string | null }
@@ -67,6 +68,7 @@ export function ResetAll() {
   // The plan is the status line; the updater answers from its last catalog lookup, so this is cheap.
   const planned = useQuery<Plan>('update.reset_plan', (c) => c.call<Plan>('update.reset_plan', {}), { topics: ['plugin.swapped', 'plugin.unit', 'source.changed', 'update.changed'] });
   const plan = planned.data ?? null;
+  const items = (plan?.plugins ?? []).filter((item) => !UNUSED_PLUGINS.has(item.plugin));
   const dialog = useRef<HTMLDivElement>(null);
 
   // Remounted during a reset (this panel's plugin was reinstalled): the outcome is in `recent`.
@@ -131,20 +133,20 @@ export function ResetAll() {
     };
   }, [open]);
 
-  const touched = (plan?.plugins ?? []).filter((item) => item.action === 'install' || item.action === 'source');
-  const names = new Map((plan?.plugins ?? []).map((item) => [item.plugin, item.name || item.plugin]));
+  const touched = items.filter((item) => item.action === 'install' || item.action === 'source');
+  const names = new Map(items.map((item) => [item.plugin, item.name || item.plugin]));
 
   // The status line: what differs from the build every plugin should run, and what carries changes.
-  const references = (plan?.plugins ?? []).filter((item) => item.action !== 'unofficial');
+  const references = items.filter((item) => item.action !== 'unofficial');
   const bundled = references.filter((item) => item.from === 'app');
   const source = plan?.offline || (references.length > 0 && bundled.length === references.length)
     ? 'the build this app came with'
     : bundled.length > 0 ? 'its release or bundled build' : 'its official release';
-  const differ = (plan?.plugins ?? []).filter((item) => item.action === 'install');
+  const differ = items.filter((item) => item.action === 'install');
   const ownBuilds = differ.filter((item) => (item.installed ?? '').split('+')[1]?.startsWith('dev.'));
-  const changedOnes = (plan?.plugins ?? []).filter((item) => (item.files?.length ?? 0) > 0);
-  const blocked = (plan?.plugins ?? []).filter((item) => item.action === 'frame');
-  const outside = (plan?.plugins ?? []).filter((item) => item.action === 'unofficial');
+  const changedOnes = items.filter((item) => (item.files?.length ?? 0) > 0);
+  const blocked = items.filter((item) => item.action === 'frame');
+  const outside = items.filter((item) => item.action === 'unofficial');
   const clean = plan !== null && differ.length === 0 && changedOnes.length === 0 && blocked.length === 0;
   const state = planned.error && !plan ? 'error' : !plan ? 'loading' : clean ? outside.length ? 'partial' : 'clean' : 'differs';
   const button = (
@@ -154,7 +156,7 @@ export function ResetAll() {
         {state === 'error' && <span className="inline-error">The comparison failed: {planned.error}</span>}
         {(state === 'clean' || state === 'partial') && (
           <>
-            <span className="t">{references.length === 0 ? 'No installed plugin has a release or bundled build to compare.' : `${outside.length ? 'Plugins with a matching reference run' : 'Every plugin runs'} ${source}. No local data changes found.`}</span>
+            <span className="t">{references.length === 0 ? 'No release information is available.' : plan?.offline ? 'Installed plugins match the bundled builds. No local changes.' : `${outside.length ? 'Released plugins' : 'All current plugins'} are up to date. No local changes.`}</span>
           </>
         )}
         {state === 'differs' && (
@@ -167,9 +169,11 @@ export function ResetAll() {
         {outside.length > 0 && <span className="cx-settings-line">No release or bundled package available: {some(outside)}. Kept installed; excluded from reset.</span>}
         {plan?.offline && <span className="cx-settings-line cx-reset-offline" title={plan.offline}>No official release can be read; the app's own build is the reference.</span>}
       </div>
-      <CheckUpdates unmatched={outside.length} offline={Boolean(plan?.offline)} />
-      <button className="detent warn" type="button" data-action="reset-all" disabled={open || touched.length === 0} onClick={start}
-        title={touched.length ? 'Every plugin back to the build it should run, your changes dropped' : 'Nothing to reset'}>Reset all plugins…</button>
+      <div className="cx-reset-actions">
+        <CheckUpdates unmatched={outside.length} offline={Boolean(plan?.offline)} />
+        <button className="detent warn" type="button" data-action="reset-all" disabled={open || touched.length === 0} onClick={start}
+          title={touched.length ? 'Every plugin back to the build it should run, your changes dropped' : 'Nothing to reset'}>Reset all plugins…</button>
+      </div>
     </div>
   );
   if (!open) return button;
@@ -197,7 +201,7 @@ export function ResetAll() {
                     ? <p>{blocked.length ? 'Restart CortexTerm first; plugin updates need the newer frame.' : outside.length ? 'No matching plugins need a reset.' : `Every plugin runs ${source}, with no local data changes. Nothing to reset.`}</p>
                     : <p>Your changes to {touched.length === 1 ? 'this plugin are' : `these ${touched.length} plugins are`} dropped and the package installed. The frame, your projects and sessions stay. This cannot be undone.</p>}
                   <ul className="cx-reset-list">
-                    {plan.plugins.map((item) => (
+                    {items.map((item) => (
                       <li key={item.plugin} data-plugin={item.plugin} data-reset-action={item.action}>
                         <span className="t">{item.name || item.plugin}</span>
                         <span className={`ap ${item.action === 'install' || item.action === 'source' ? 'live' : 'faint'}`}>{line(item)}</span>
@@ -282,11 +286,11 @@ function CheckUpdates({ unmatched, offline }: { unmatched: number; offline: bool
     : failed > 0 ? `${failed === 1 ? '1 update' : `${failed} updates`} could not be installed`
     : data.restart ? 'Restart to finish the update'
     : offline ? 'No official release available; compared with bundled builds'
-    : unmatched > 0 ? 'No updates found for plugins with a matching release'
+    : unmatched > 0 ? `No updates found. ${unmatched} plugin${unmatched === 1 ? ' has' : 's have'} no matching release.`
     : 'Everything is up to date';
   return (
     <>
-      {found && <span className="ap faint" data-update-check={found}>{found}</span>}
+      {found && <span className="cx-update-result" role="status" data-update-check={found}>{found}</span>}
       <button className="detent" type="button" data-action="check-updates" disabled={checking} onClick={() => void check()}>{checking ? 'Checking…' : 'Check for updates'}</button>
     </>
   );

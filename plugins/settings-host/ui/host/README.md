@@ -24,3 +24,9 @@ React, ReactDOM and `@cortex/sdk` are peer dependencies the workbench provides.
 Styles use the theme's tokens and primitives only (`ui/verify/tokens.mjs` checks). Nothing is
 imported from the renderer or from another plugin: the package builds alone (`ui/verify/standalone.mjs`).
 <!-- slot-contract:end -->
+# Settings layout correction (settings-host 0.1.7)
+
+The dialog stays within the viewport and sizes to its content, with scrolling inside the panel.
+Its navigation is isolated from the workbench's compact navigation rules. Narrow windows use a
+horizontal navigation strip whose items retain their own width, and the plugin panel can shrink
+without widening the dialog. This changes layout only; no installed-app state is rewritten.

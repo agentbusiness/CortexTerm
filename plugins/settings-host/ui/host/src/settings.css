@@ -1,10 +1,13 @@
 /* settings.host@1 — a window over the workbench: the design's sheet, wider, with the index's nav. */
-#cc .cx-settings-scrim{padding-top:8vh;}
-#cc .cx-settings{width:min(980px,calc(100vw - 32px));height:min(720px,84vh);display:flex;flex-direction:column;}
-#cc .cx-settings-body{flex:1;min-height:0;display:grid;grid-template-columns:184px 1px minmax(0,1fr);}
+#cc .cx-settings-scrim{padding:24px 16px;}
+#cc .cx-settings{width:min(980px,100%);max-width:100%;max-height:calc(100dvh - 48px);min-width:0;display:flex;flex-direction:column;}
+#cc .cx-settings-body{flex:1;min-height:0;min-width:0;display:grid;grid-template-columns:184px 1px minmax(0,1fr);overflow:hidden;}
 #cc .cx-settings-body::before{content:"";grid-column:2;grid-row:1;background:var(--rule);}
-#cc .cx-settings-nav{grid-column:1;grid-row:1;padding:16px 12px 0 0;}
-#cc .cx-settings-panel{grid-column:3;grid-row:1;min-height:0;overflow:auto;padding:16px 20px 48px;}
+#cc .cx-settings-nav{grid-column:1;grid-row:1;display:block;min-width:0;overflow:auto;padding:16px 12px 16px 0;}
+#cc .cx-settings-nav button{width:100%;grid-template-columns:20px minmax(0,1fr);white-space:normal;}
+#cc .cx-settings-nav .kk{display:block;}
+#cc .cx-settings-nav .nm{min-width:0;overflow-wrap:anywhere;}
+#cc .cx-settings-panel{grid-column:3;grid-row:1;min-height:0;min-width:0;overflow:auto;padding:16px 20px 24px;}
 #cc .cx-settings:focus{outline:none;}
 /* The shared look of settings panels' titles, lines and paths. */
 #cc .cx-settings-title{font-family:var(--font-reading);font-size:19px;font-weight:500;margin:12px 0 8px;color:var(--ink);letter-spacing:-.008em;}
@@ -12,3 +15,12 @@
 /* Settings pages use the panel's whole width: the theme's reading-width caps do not apply here. */
 #cc .cx-settings-panel .tbl,#cc .cx-settings-panel .settings-widget{max-width:none;}
 #cc .cx-path{font-family:var(--font-mono);font-size:12px;overflow-wrap:anywhere;}
+@media(max-width:640px){
+  #cc .cx-settings-body{display:flex;flex-direction:column;}
+  #cc .cx-settings-body::before{display:none;}
+  #cc .cx-settings-nav{display:flex;flex:0 0 auto;overflow-x:auto;padding:8px 0;border-bottom:1px solid var(--rule);}
+  #cc .cx-settings-nav li{flex:0 0 auto;}
+  #cc .cx-settings-nav button{width:auto;grid-template-columns:auto;white-space:nowrap;}
+  #cc .cx-settings-nav .kk{display:none;}
+  #cc .cx-settings-panel{padding:12px 16px 24px;}
+}
