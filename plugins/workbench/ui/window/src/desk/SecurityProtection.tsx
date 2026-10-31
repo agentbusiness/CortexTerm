@@ -50,8 +50,8 @@ function stopTarget(incident: SecurityIncident): StopTarget | null {
   // All facts with a process identity must agree. A correlated incident can contain children;
   // choosing an arbitrary last PID would stop something the person did not approve.
   const identities = incident.observations.filter((entry) => !entry.source.startsWith('import:') && entry.pid && entry.pid > 1 && entry.process_started && entry.executable);
-  if (!identities.length) return null;
   const first = identities[0];
+  if (!first) return null;
   if (identities.some((entry) => entry.pid !== first.pid || entry.process_started !== first.process_started || entry.executable !== first.executable)) return null;
   const native = [...identities].sort((a, b) => b.at - a.at);
   const startedUs = native.find((entry) => entry.process_started_us != null)?.process_started_us ?? undefined;

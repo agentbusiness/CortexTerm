@@ -69,7 +69,7 @@ class LiveStore {
 
   subscribe = (listener: () => void) => {
     this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
+    return () => { this.listeners.delete(listener); };
   };
 
   snapshot = () => this.version;
