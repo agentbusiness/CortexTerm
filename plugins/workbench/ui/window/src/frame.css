@@ -24,8 +24,8 @@ body{overflow:hidden;}
 /* A slot is the box a plugin draws in; a staged version waits in it, hidden. */
 #cc .cx-slot{position:relative;min-width:0;min-height:0;display:flex;flex-direction:column;}
 #cc .cx-slot>.cx-instance{flex:1;min-height:0;min-width:0;display:flex;flex-direction:column;}
-#cc .cx-band-item{flex:0 0 auto;flex-direction:row;align-items:center;}
-#cc .cx-band-item>.cx-instance{flex-direction:row;align-items:center;}
+/* A healthy plugin can render null. Its bookkeeping wrappers must not consume a flex gap. */
+#cc .cx-band-item,#cc .cx-band-item>.cx-instance{display:contents;}
 /* The band never carries a slot's waiting or vacancy text: it would push the window below. */
 #cc .cx-band-item>.cx-slot-empty,#cc .cx-band-item .cx-slot-failed{display:none;}
 #cc .cx-theme-slot{display:none;}

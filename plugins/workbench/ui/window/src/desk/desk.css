@@ -567,14 +567,18 @@
 #cc .ct-memkey .comp{color:var(--rubric-lift);}
 #cc .ct-memkey .swap{color:var(--ink-3);}
 
-/* --- the band: status text only, no buttons ------------------------------------------------- */
-#cc .ct-band-items{display:flex;align-items:center;gap:18px;}
+/* --- the band: one readout and visibly outlined actions ------------------------------------ */
+#cc .ct-band-items{display:flex;align-items:center;gap:8px;}
+#cc .ct-band-items>.grow{display:block;min-width:0;}
 #cc .ct-band-note{background:transparent;border:0;padding:0;font:600 9.5px Archivo,sans-serif;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3);white-space:nowrap;}
 #cc button.ct-band-note{cursor:pointer;}
 #cc .ct-band-note.warn{color:var(--rubric-lift);}
 #cc .ct-band-note.blue{color:var(--counter);}
 #cc button.ct-band-note:hover{color:var(--ink);}
-#cc .ct-band-gear{display:inline-flex;align-items:center;margin-left:10px;}
+#cc .ct-band-action{flex:0 0 auto;height:24px;white-space:nowrap;}
+#cc .ct-band-model{min-width:0;overflow:hidden;text-overflow:ellipsis;}
+#cc .ct-band-gear{display:inline-flex;align-items:center;justify-content:center;flex:0 0 24px;width:24px;height:24px;padding:0;margin-left:0;}
+@media(max-width:880px){#cc .ct-band-items{flex-basis:100%;}}
 
 /* --- Runs in the CC conversation grammar: no box, a hairline between turns, output behind a rule
    like CC's thinking, meta and actions in CC's small faint caps ------------------------------- */

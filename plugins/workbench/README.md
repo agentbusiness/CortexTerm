@@ -45,3 +45,8 @@ injected command flags, additional emulator, dependency, or shared protocol chan
 The window respects `TermState.interactive` as well as alternate-screen mode for direct keyboard
 ownership, retaining the manual terminal toggle, the existing input forms and paste guard.
 This source change has not been built, packaged, installed, or visually verified in the app.
+## Top-bar controls (0.1.22)
+
+Attention, alerts, and settings use outlined controls. Settings stays at the right edge after
+plugin notices. Empty plugin slot wrappers have no layout box, so healthy services and an idle
+updater do not leave gaps after the settings gear. The model readout can shorten in narrow windows.

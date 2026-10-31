@@ -98,12 +98,12 @@ export function Workbench({ registry, shell }: { registry: PluginRegistry; shell
               <Cross />
               <i>IronGraph</i>
             </div>
-            {/* The Desk puts its own band items here: the Desk's name, the model, attention, Map. */}
-            <div id="ct-band" className="ct-band-items" />
             <ComputerScope node={null}>
               {/* The Desk owns settings and panes; an old installed Card host must not mount them again. */}
               <SlotList registry={registry} name="workbench.band@1" className="cx-band-item" exclude={['card-host.card']} />
             </ComputerScope>
+            {/* The Desk's actions end with settings at the right edge, after any plugin notices. */}
+            <div id="ct-band" className="ct-band-items" />
           </div>
           {settled && <Desk />}
           </>)}
