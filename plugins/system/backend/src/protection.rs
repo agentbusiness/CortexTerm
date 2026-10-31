@@ -293,6 +293,12 @@ impl Store {
             if incident.last_at.saturating_add(RETENTION) < now_ms() {
                 continue;
             }
+            // Before 0.1.18 the sweep made one incident per finding; its findings are now one
+            // incident per group.
+            if incident.key.starts_with("finding:") {
+                graph::retire(vec![graph::r("ProtectionIncident", &incident.id)], "one incident per group now");
+                continue;
+            }
             incident.observations.truncate(MAX_OBSERVATIONS);
             if let Some(investigation) = incident.investigation.as_mut() {
                 investigation.observations.truncate(16);

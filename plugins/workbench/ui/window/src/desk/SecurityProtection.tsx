@@ -1,7 +1,7 @@
 /** Alerts & Security for one computer: broken sensors, a chart of what came up, one list grouped by
  * what it is about, and the person's decisions. Sensor, finding and model text is rendered as text,
  * never HTML or commands; fixes go through the assistant, which checks again after they run. */
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import { ago, errorMessage, useRuntime } from '@cortex/sdk';
 import type { Alert, CveReport, Decision, Finding, History, SweepReport } from './api';
 import { quote } from './api';
@@ -87,6 +87,8 @@ const STAGES: [string, string, string[]][] = [
 /** An advisory id in a finding's words. */
 const ADVISORY = /\b(CVE-\d{4}-\d{4,}|GHSA(?:-[0-9a-z]{4}){3}|RUSTSEC-\d{4}-\d{4}|PYSEC-\d{4}-\d+|GO-\d{4}-\d+|MAL-\d{4}-\d+)\b/i;
 /** Lets the admin group read the packet capture devices until the next restart. */
+/** Questions the ask box offers; a click asks it. */
+const EXAMPLES = ['Am I vulnerable to SQL injection?', 'What changed this week?'];
 const GRANT_BPF = 'sudo chgrp admin /dev/bpf* && sudo chmod g+r /dev/bpf*';
 const SYSTEM_PATH = /^\/(System|usr|bin|sbin)\//;
 /** The outermost app or bundle a path is in, else the path. */
@@ -168,7 +170,7 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
   const [tab, setTab] = useState<'open' | 'decided'>('open');
   const [selected, setSelected] = useState('');
   const [deciding, setDeciding] = useState(false);
-  const [allFindings, setAllFindings] = useState(false);
+  const [openCheck, setOpenCheck] = useState('');
   const [coverage, setCoverage] = useState(false);
   const [sweeping, setSweeping] = useState(false);
   const [question, setQuestion] = useState('');
@@ -371,7 +373,7 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
 
   const items = useMemo(() => itemsOf(report, incidents, machineAlerts.alerts), [report, incidents, machineAlerts.alerts]);
   const shown = items.filter((item) => (tab === 'open') === item.open);
-  const item = items.find((entry) => entry.key === selected) ?? shown[0];
+  const item = items.find((entry) => entry.key === selected);
   const openCount = items.filter((entry) => entry.open).length;
   const urgent = items.filter((entry) => entry.open && priority(entry.severity) === 'ACT NOW').length;
 
@@ -380,7 +382,7 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [item?.incident?.id]);
 
-  const select = (key: string) => { setSelected(key); setDeciding(false); setAllFindings(false); setConfirmStop(null); setCopies(null); };
+  const select = (key: string) => { setSelected(key); setDeciding(false); setOpenCheck(''); setConfirmStop(null); setCopies(null); };
 
   const whereItLives = (id: string) => {
     setCopies({ id });
@@ -416,8 +418,8 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
 
   /** A question about a kind of flaw is answered here from the security memory (`macsec weakness`);
    *  anything else goes to the computer's assistant. */
-  const submitQuestion = async () => {
-    const text = question.trim();
+  const submitQuestion = async (said = question) => {
+    const text = said.trim();
     if (!text) return;
     setQuestion(''); setAnswer(null);
     try {
@@ -464,7 +466,8 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
     </header>
     <form className="ct-sec-ask" onSubmit={(event) => { event.preventDefault(); void submitQuestion(); }}>
       <span className="ct-label">ASK</span>
-      <input type="text" value={question} spellCheck={false} placeholder="Am I vulnerable to SQL injection? · CVE-2024-3094 · what changed on Tuesday?" aria-label="Ask about this computer's security" onChange={(event) => setQuestion(event.target.value)} />
+      <input type="text" value={question} spellCheck={false} placeholder="Type a question about this computer's security, then Return" aria-label="Ask about this computer's security" onChange={(event) => setQuestion(event.target.value)} />
+      {!question && EXAMPLES.map((example) => <button key={example} type="button" className="ct-seg" title="Ask this now" onClick={() => void submitQuestion(example)}>{example}</button>)}
     </form>
 
     {answer && <div className="ct-sec-answer" role="status">
@@ -482,15 +485,8 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
 
     {status && <div className={`ct-sec-health${broken.length ? ' broken' : ''}`}>
       <span className="ct-label ct-blue">{working} OF {status.sensors.length} SENSORS WORKING</span>
-      {broken.map((sensor) => <span key={sensor.id} className="ct-sec-sensor"><span className="ct-label ct-warn">{sensor.label}</span><span dir="auto">{sensor.detail}</span>
-        {sensor.id === 'packet-watch' && sensor.state === 'unavailable' && <button type="button" className="detent sm warn" aria-expanded={granting} onClick={() => setGranting((value) => !value)}>HOW TO GRANT</button>}
-      </span>)}
+      {broken.length > 0 && <span className="ct-label ct-warn ct-sec-broken" title={broken.map((sensor) => `${sensor.label}: ${sensor.detail}`).join('\n')}>{broken.map((sensor) => sensor.label).join(' · ')}</span>}
       <button type="button" className="detent sm" aria-expanded={coverage} onClick={() => setCoverage((value) => !value)}>COVERAGE {coverage ? '▾' : '▸'}</button>
-    </div>}
-    {granting && <div className="ct-sec-grant">
-      <p>Scan detection reads packet headers through macOS's capture devices (<code>/dev/bpf*</code>), which only root can read by default. CT never asks for administrator rights by itself. This command lets the admin group, which you are in, read them until the Mac restarts; for a permanent grant, install Wireshark's ChmodBPF. Scan detection starts within 30 seconds.</p>
-      <pre dir="ltr">{GRANT_BPF}</pre>
-      <div className="ct-protection-actions"><button type="button" className="detent sm warn" onClick={() => { onCommand(GRANT_BPF); setGranting(false); }}>PUT IT ON THE LINE</button><button type="button" className="detent sm" onClick={() => setGranting(false)}>CLOSE</button></div>
     </div>}
     {status && coverage && coverageView()}
 
@@ -514,23 +510,24 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
         </div>
         {tab === 'decided' && (report?.fixes ?? []).filter((fix) => fix.gone).slice(0, 8).map((fix) => fixCard(fix))}
         {shown.length === 0 && <p className="ct-asec-note">{tab === 'open' ? 'Nothing open. The checks only know what they can see; no findings is not an all-clear.' : 'No decisions yet.'}</p>}
-        {shown.map((entry) => <button key={entry.key} type="button" className={`ct-sec-row ${tone(entry.severity)}${entry.key === item?.key ? ' on' : ''}`} aria-pressed={entry.key === item?.key} onClick={() => select(entry.key)}>
+        {shown.map((entry) => <Fragment key={entry.key}><button type="button" className={`ct-sec-row ${tone(entry.severity)}${entry.key === item?.key ? ' on' : ''}`} aria-pressed={entry.key === item?.key} onClick={() => select(entry.key === item?.key ? '' : entry.key)}>
           <span className="ct-label sev">{entry.open ? priority(entry.severity) : verdictName(entry.decision?.verdict ?? 'dismissed')}</span>
           <Hits hits={[...(history?.hits[entry.key] ?? []), ...(entry.incident ? history?.hits[entry.incident.id] ?? [] : [])]} buckets={history?.series.length ?? 0} />
           <span className="ct-sec-row-main"><span className="ct-sec-row-title" dir="auto">{entry.title}</span><span className="ct-sec-row-text" dir="auto">{entry.text}</span></span>
           <span className="ct-sec-row-side"><span className="ct-label ct-faint">{entry.kind === 'sweep' ? plural(entry.count, 'finding') : entry.kind === 'incident' ? 'INCIDENT' : entry.alert?.kind.toUpperCase()}</span><time className="ct-label ct-faint" dateTime={iso(entry.last)}>{date(entry.last) ? ago(entry.last) : ''}</time></span>
-        </button>)}
+        </button>
+        {item && entry.key === item.key && <section className="ct-sec-detail" tabIndex={-1} aria-label={item.title} onKeyDown={onDetailKey}>
+          {deciding && item.kind === 'sweep' ? <DecideSheet item={item} before={precedent(report, item)} busy={!!busy} onCancel={() => setDeciding(false)} onDecide={(verdict, keys, forDays) => void decide(item.key, verdict, keys, forDays)} />
+            : item.kind === 'sweep' ? sweepView(item) : item.incident ? incidentView(item, item.incident) : alertView(item)}
+        </section>}
+        </Fragment>)}
       </div>
-      {item && <section className="ct-sec-detail" tabIndex={-1} aria-label={item.title} onKeyDown={onDetailKey}>
-        {deciding && item.kind === 'sweep' ? <DecideSheet item={item} before={precedent(report, item)} busy={!!busy} onCancel={() => setDeciding(false)} onDecide={(verdict, keys, forDays) => void decide(item.key, verdict, keys, forDays)} />
-          : item.kind === 'sweep' ? sweepView(item) : item.incident ? incidentView(item, item.incident) : alertView(item)}
-      </section>}
     </div>
   </section>;
 
   function sweepView(entry: Item) {
     const decision = entry.decision;
-    const findings = allFindings ? entry.findings : entry.findings.slice(0, 6);
+    const checks = checksOf(entry.findings);
     const tried = entry.findings.find((finding) => finding.tried)?.tried;
     const investigation = entry.incident?.investigation;
     const advisory = entry.findings.map((finding) => ADVISORY.exec(finding.text)?.[1]?.toUpperCase()).find(Boolean);
@@ -538,12 +535,14 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
       <div className="ct-sec-detail-head"><h3 dir="auto">{entry.title}</h3><span className="ct-label ct-faint">{entry.open ? priority(entry.severity) : verdictName(decision?.verdict ?? '')} · {plural(entry.count, 'finding')}</span></div>
       {entry.where && <code className="ct-sec-where" dir="ltr">{entry.where}</code>}
       {decision && <p className="ct-sec-decided">Decided <b>{verdictName(decision.verdict)}</b> {ago(decision.at)}: {decision.keys.length ? `only these ${plural(decision.keys.length, 'finding')}` : `everything about it up to ${priority(decision.severity).toLowerCase()}`}, {decision.until ? `until ${new Date(decision.until).toLocaleDateString()}` : 'no end'}. A worse finding shows again. <button type="button" className="detent sm" disabled={!!busy} onClick={() => void decide(entry.key, '')}>UNDO</button></p>}
-      <ol className="ct-sec-findings">{findings.map((finding) => <li key={finding.key}>
-        <span className={`ct-label ${tone(finding.severity)}`}>{priority(finding.severity)}</span>
-        <span dir="auto">{finding.text}</span>
-        {finding.fix && <code dir="ltr" title="The assistant offers it; it never runs by itself">{finding.fix}</code>}
+      <ol className="ct-sec-findings">{checks.map((check) => <li key={check.id}>
+        <span className={`ct-label ${tone(check.findings[0]!.severity)}`}>{priority(check.findings[0]!.severity)}</span>
+        <span dir="auto">{check.findings.length > 1 && <b>{check.findings.length} × {check.source}. </b>}{check.findings[0]!.text}</span>
+        {check.findings[0]!.fix && <code dir="ltr" title="The assistant offers it; it never runs by itself">{check.findings[0]!.fix}</code>}
+        {check.findings.length > 1 && <button type="button" className="ct-seg" aria-expanded={openCheck === check.id} onClick={() => setOpenCheck(openCheck === check.id ? '' : check.id)}>{openCheck === check.id ? 'HIDE ▾' : `ALL ${check.findings.length} ▸`}</button>}
+        {openCheck === check.id && <ul className="ct-sec-each">{check.findings.slice(0, 50).map((finding) => <li key={finding.key} dir="auto">{finding.text}</li>)}
+          {check.findings.length > 50 && <li className="ct-faint">and {check.findings.length - 50} more. Ask about them, or decide about the whole group.</li>}</ul>}
       </li>)}</ol>
-      {entry.findings.length > findings.length && <button type="button" className="ct-seg" onClick={() => setAllFindings(true)}>ALL {entry.findings.length} ▸</button>}
       {tried && <p className="ct-asec-note ct-warn">Tried <code>{tried}</code>: a fresh check still finds it. The assistant won't offer it again.</p>}
       {(report?.fixes ?? []).filter((fix) => fix.group === entry.key).slice(0, 3).map((fix) => fixCard(fix))}
       {advisory && copiesView(entry, advisory)}
@@ -756,9 +755,15 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
     </div>;
     return <div className="ct-sec-coverage">
       <p className="ct-asec-note" dir="auto">{status!.visibility}</p>
-      <ul className="ct-protection-sensors" aria-label="Monitoring coverage">{status!.sensors.slice(0, 32).map((sensor) => <li key={sensor.id}>
+      <ul className="ct-protection-sensors" aria-label="Monitoring coverage">{[...broken, ...status!.sensors.filter((sensor) => !broken.includes(sensor))].slice(0, 32).map((sensor) => <li key={sensor.id}>
         <div className="ct-protection-sensor-head"><span className="ct-label">{sensor.label}</span><span className={`ct-label ct-protection-state ${sensor.state === 'active' ? '' : sensor.state === 'disabled' ? 'ct-faint' : 'ct-warn'}`}>{sensor.state || 'unknown'}</span></div>
         <p className="ct-asec-note" dir="auto">{sensor.detail}</p>
+        {sensor.id === 'packet-watch' && sensor.state === 'unavailable' && !granting && <button type="button" className="detent sm warn" onClick={() => setGranting(true)}>HOW TO GRANT</button>}
+        {sensor.id === 'packet-watch' && granting && <div className="ct-sec-grant">
+          <p>Scan detection reads packet headers through macOS's capture devices (<code>/dev/bpf*</code>), which only root can read by default. CT never asks for administrator rights by itself. This command lets the admin group, which you are in, read them until the Mac restarts; for a permanent grant, install Wireshark's ChmodBPF. Scan detection starts within 30 seconds.</p>
+          <pre dir="ltr">{GRANT_BPF}</pre>
+          <div className="ct-protection-actions"><button type="button" className="detent sm warn" onClick={() => { onCommand(GRANT_BPF); setGranting(false); }}>PUT IT ON THE LINE</button><button type="button" className="detent sm" onClick={() => setGranting(false)}>CLOSE</button></div>
+        </div>}
         <p className="ct-protection-meta">{date(sensor.last_at) ? <time dateTime={iso(sensor.last_at)} title={time(sensor.last_at)}>Last seen {ago(sensor.last_at)}</time> : 'Nothing seen yet'}{sensor.dropped > 0 && <span className="ct-warn"> · {count(sensor.dropped)} events lost</span>}</p>
       </li>)}</ul>
       {toggle('packet_watch', 'Watch for network scans', 'Packet metadata, when macOS allows capture.')}
@@ -828,6 +833,18 @@ function itemsOf(report: SweepReport | null, incidents: SecurityIncident[], aler
     items.push({ key: alert.id, kind: 'alert', title: alert.text, where: '', text: alert.kind, severity: alert.severity, open: true, last: alert.at, count: 1, findings: [], alert });
   }
   return items.sort((a, b) => Number(b.open) - Number(a.open) || rank(a.severity) - rank(b.severity) || b.last - a.last);
+}
+
+/** A group's findings by the check that found them, worst first: one line per check, not one per file. */
+function checksOf(findings: Finding[]): { id: string; source: string; findings: Finding[] }[] {
+  const checks = new Map<string, { id: string; source: string; findings: Finding[] }>();
+  for (const finding of findings) {
+    const id = `${finding.source}:${finding.kind}`;
+    const check = checks.get(id) ?? { id, source: finding.source, findings: [] };
+    check.findings.push(finding);
+    checks.set(id, check);
+  }
+  return [...checks.values()].sort((a, b) => rank(a.findings[0]!.severity) - rank(b.findings[0]!.severity) || b.findings.length - a.findings.length);
 }
 
 /** What the person chose before for findings from the same check about other things. */

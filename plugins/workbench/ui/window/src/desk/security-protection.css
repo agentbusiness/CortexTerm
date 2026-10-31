@@ -10,7 +10,7 @@
 .ct-protection summary{cursor:pointer;line-height:1.5;}
 .ct-protection summary:hover{color:var(--ink);}
 .ct-protection-setup{padding:8px 0;color:var(--ink-2);font:14px/1.5 "Source Serif 4",Georgia,serif;}
-.ct-protection-command{max-height:150px;overflow:auto;white-space:pre-wrap;margin:8px 0;padding:10px;border:1px solid var(--rule-2);color:var(--ink);font:12px/1.6 var(--font-mono);user-select:text;}
+.ct-protection-command{white-space:pre-wrap;overflow-wrap:anywhere;margin:8px 0;padding:10px;border:1px solid var(--rule-2);color:var(--ink);font:12px/1.6 var(--font-mono);user-select:text;}
 .ct-protection-import{display:flex;align-items:flex-end;flex-wrap:wrap;gap:10px;margin:10px 0;}
 .ct-protection-import label{display:flex;flex-direction:column;gap:5px;min-width:0;flex:1 1 220px;}
 .ct-protection-import label:first-child{flex:0 1 220px;}
@@ -20,7 +20,7 @@
 .ct-protection-imports li{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 0;border-top:1px solid var(--rule);}
 .ct-protection-imports li>span{min-width:0;}
 .ct-protection-imports code{display:block;font:12px/1.6 var(--font-mono);}
-.ct-protection-timeline{list-style:none;margin:0;padding:0;max-height:520px;overflow:auto;overscroll-behavior:contain;}
+.ct-protection-timeline{list-style:none;margin:0;padding:0;}
 .ct-protection-timeline>li{border-top:1px solid var(--rule);padding:10px 0;}
 .ct-protection-timeline>li:focus{outline:1px solid var(--rubric);outline-offset:-1px;background:var(--rubric-wash);}
 .ct-protection-evidence-meta{display:flex;flex-wrap:wrap;align-items:baseline;gap:5px 12px;font:11px/1.6 var(--font-mono);color:var(--ink-2);}
@@ -55,15 +55,15 @@
 .ct-sec h3,.ct-sec h4{margin:0;}
 .ct-sec-head{display:flex;align-items:baseline;flex-wrap:wrap;gap:8px 14px;}
 .ct-sec-head .detent{align-self:center;}
-.ct-sec-ask{display:flex;align-items:center;gap:8px;border:1px solid var(--rule-2);padding:0 10px;height:30px;}
+.ct-sec-ask{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;border:1px solid var(--rule-2);padding:3px 10px;min-height:30px;}
 .ct-sec-ask:focus-within{border-color:var(--rubric);}
-.ct-sec-ask input{flex:1;min-width:0;background:transparent;border:0;outline:0;color:var(--ink);font:13px Archivo,sans-serif;caret-color:var(--rubric-lift);}
+.ct-sec-ask input{flex:1 1 220px;min-width:0;height:22px;background:transparent;border:0;outline:0;color:var(--ink);font:13px Archivo,sans-serif;caret-color:var(--rubric-lift);}
 .ct-sec-ask input::placeholder{color:var(--ink-3);}
-.ct-sec-health{display:flex;align-items:baseline;flex-wrap:wrap;gap:6px 14px;padding:8px 12px;border:1px solid var(--rule);}
+.ct-sec-ask .ct-seg{flex:none;}
+.ct-sec-health{display:flex;align-items:center;gap:14px;padding:4px 4px 4px 12px;border:1px solid var(--rule);white-space:nowrap;min-width:0;}
 .ct-sec-health.broken{border-color:var(--rule-2);}
-.ct-sec-health .detent{margin-left:auto;align-self:center;}
-.ct-sec-sensor{display:flex;align-items:baseline;gap:8px;flex:1 1 280px;min-width:0;font:13px/1.45 Archivo,sans-serif;color:var(--ink-2);overflow-wrap:anywhere;}
-.ct-sec-sensor .ct-label{flex:none;}
+.ct-sec-health .detent{margin-left:auto;flex:none;}
+.ct-sec-broken{min-width:0;overflow:hidden;text-overflow:ellipsis;}
 .ct-sec-coverage{display:flex;flex-direction:column;gap:12px;padding:4px 0 8px;border-bottom:1px solid var(--rule);}
 .ct-sec-switch{display:flex;align-items:flex-start;gap:12px;font:14px/1.4 "Source Serif 4",Georgia,serif;color:var(--ink);}
 .ct-sec-switch .sw{flex:none;margin-top:2px;}
@@ -86,8 +86,8 @@
 .ct-sec-chart .k3{stroke:var(--ink-3);stroke-dasharray:2 4;}
 .ct-sec-chart .hit{fill:color-mix(in srgb,var(--counter) 22%,transparent);}
 .ct-sec-axis{display:flex;justify-content:space-between;padding-top:4px;}
-.ct-sec-body{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start;}
-.ct-sec-list{flex:999 1 420px;min-width:0;display:flex;flex-direction:column;max-height:52vh;overflow:auto;overscroll-behavior:contain;}
+.ct-sec-body{display:flex;flex-direction:column;}
+.ct-sec-list{min-width:0;display:flex;flex-direction:column;}
 .ct-sec-tabs{display:flex;align-items:baseline;gap:12px;padding-bottom:8px;}
 .ct-sec-row{display:grid;grid-template-columns:64px 56px minmax(0,1fr) auto;gap:12px;align-items:center;width:100%;padding:10px 12px;border:1px solid var(--rule);border-top-width:0;background:transparent;color:var(--ink);text-align:start;cursor:pointer;}
 .ct-sec-tabs+.ct-sec-row,.ct-sec-tabs+p+.ct-sec-row{border-top-width:1px;}
@@ -104,7 +104,7 @@
 .ct-sec-row-title{font:15px/1.35 "Source Serif 4",Georgia,serif;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .ct-sec-row-text{font:12px/1.4 Archivo,sans-serif;color:var(--ink-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .ct-sec-row-side{display:flex;flex-direction:column;align-items:flex-end;gap:4px;white-space:nowrap;}
-.ct-sec-detail{flex:1 1 380px;min-width:0;display:flex;flex-direction:column;gap:10px;padding:14px 16px;border:1px solid var(--rule-2);outline:0;}
+.ct-sec-detail{min-width:0;display:flex;flex-direction:column;gap:10px;padding:14px 16px 18px;border:1px solid var(--counter);border-top-width:0;margin-bottom:10px;outline:0;}
 .ct-sec-detail:focus-visible{border-color:var(--rubric);}
 .ct-sec-detail h4{margin-top:6px;}
 .ct-sec-detail-head{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 12px;}
@@ -115,6 +115,8 @@
 .ct-sec-findings{list-style:none;margin:0;padding:0;}
 .ct-sec-findings>li{display:grid;grid-template-columns:64px minmax(0,1fr);gap:2px 12px;padding:7px 0;border-top:1px solid var(--rule);font:13px/1.45 Archivo,sans-serif;color:var(--ink);overflow-wrap:anywhere;}
 .ct-sec-findings code{grid-column:2;font:11px/1.5 var(--font-mono);color:var(--ink-2);}
+.ct-sec-findings .ct-seg{grid-column:2;justify-self:start;}
+.ct-sec-each{grid-column:2;margin:0;padding:0 0 0 12px;border-left:1px solid var(--rule);list-style:none;font:12px/1.5 Archivo,sans-serif;color:var(--ink-2);}
 .ct-sec-read{display:flex;flex-direction:column;gap:4px;border-top:1px solid var(--rule);padding-top:10px;}
 .ct-sec-decide{display:flex;flex-direction:column;gap:10px;}
 .ct-sec-verdicts{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;}
