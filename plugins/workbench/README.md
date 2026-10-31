@@ -50,3 +50,8 @@ This source change has not been built, packaged, installed, or visually verified
 Attention, alerts, and settings use outlined controls. Settings stays at the right edge after
 plugin notices. Empty plugin slot wrappers have no layout box, so healthy services and an idle
 updater do not leave gaps after the settings gear. The model readout can shorten in narrow windows.
+
+## Editor layout (0.1.23)
+
+The built-in editor fills its pane. The per-line explanation sidebar is removed at the user's
+request; line numbers, syntax highlighting, search, and the Nano-style shortcut footer remain.

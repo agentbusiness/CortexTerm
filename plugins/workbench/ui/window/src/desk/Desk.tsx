@@ -576,7 +576,7 @@ export function Desk() {
     const common = { focused: isFocused, onFocus: () => focusPane(pane.id), onShelf: () => toShelf(pane.id), onClose: () => closePane(pane.id) };
     switch (pane.kind) {
       case 'term': return <TermPane pane={pane} sessionId={pane.node ? desk.sessions?.[pane.node] : desk.sessionId} computer={nameOf(pane.node)} home={home} slot={slot} actions={actions} onKeyboard={onTerminalKeyboard} {...common} />;
-      case 'editor': return <EditorPane pane={pane} home={home} onAsk={onAsk} onRunReal={(command) => void onShell(command, 'pane')} {...common} />;
+      case 'editor': return <EditorPane pane={pane} home={home} onRunReal={(command) => void onShell(command, 'pane')} {...common} />;
       case 'run': return <RunPane pane={pane} home={home} onAsk={onAsk} {...common} />;
       case 'process': return <ProcessPane pane={pane} onAsk={onAsk} onSignal={onSignal} onInvestigate={onInvestigate} {...common} />;
       case 'alerts': return <AlertsPane pane={pane} onAsk={onAsk} onRunCommand={(command) => line.current?.set(command)} {...common} />;
