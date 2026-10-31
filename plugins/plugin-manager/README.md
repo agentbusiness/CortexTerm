@@ -17,3 +17,15 @@ cortex-pack build plugins/plugin-manager --install       # a dev build, installe
 ```
 
 The frame runs plugins only from installed packages; `--install` (or `cx plugin install <file>`) hot-swaps the UI packages together; Settings > Plugins disables and enables the whole plugin.
+
+## Unreleased source changes (0.1.7)
+
+Settings groups a service with its installed package by backend category or by the hello's
+plugin/module id matching the package id or a declared shell module. File Browser's
+`filebrowser-native` transfer service appears in File Browser's details, controlled by its one
+enable/disable switch. This uses existing frame metadata; no contract or lifecycle changes.
+
+The reset comparison distinguishes release references, bundled references and installed plugins
+with neither. Missing reference packages stay installed and are excluded from reset. Manual
+update results follow live updater status, include failed updates and qualify the result when
+release coverage is incomplete. Source reviewed only; no build, install or live verification.

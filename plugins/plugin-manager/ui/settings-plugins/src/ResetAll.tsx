@@ -45,7 +45,7 @@ function line(item: ResetItem): string {
     case 'source': return `${target(item)} stays; ${changed(item)}`;
     case 'none': return `${target(item)}, unchanged`;
     case 'frame': return `${target(item)} needs a newer frame; left as it is`;
-    default: return 'not in the releases nor in the app; left as it is';
+    default: return 'no release or bundled package; kept installed';
   }
 }
 
@@ -135,22 +135,26 @@ export function ResetAll() {
   const names = new Map((plan?.plugins ?? []).map((item) => [item.plugin, item.name || item.plugin]));
 
   // The status line: what differs from the build every plugin should run, and what carries changes.
-  const source = plan?.offline ? 'the build this app came with' : 'its official release';
+  const references = (plan?.plugins ?? []).filter((item) => item.action !== 'unofficial');
+  const bundled = references.filter((item) => item.from === 'app');
+  const source = plan?.offline || (references.length > 0 && bundled.length === references.length)
+    ? 'the build this app came with'
+    : bundled.length > 0 ? 'its release or bundled build' : 'its official release';
   const differ = (plan?.plugins ?? []).filter((item) => item.action === 'install');
   const ownBuilds = differ.filter((item) => (item.installed ?? '').split('+')[1]?.startsWith('dev.'));
   const changedOnes = (plan?.plugins ?? []).filter((item) => (item.files?.length ?? 0) > 0);
   const blocked = (plan?.plugins ?? []).filter((item) => item.action === 'frame');
   const outside = (plan?.plugins ?? []).filter((item) => item.action === 'unofficial');
   const clean = plan !== null && differ.length === 0 && changedOnes.length === 0 && blocked.length === 0;
-  const state = planned.error && !plan ? 'error' : !plan ? 'loading' : clean ? 'clean' : 'differs';
+  const state = planned.error && !plan ? 'error' : !plan ? 'loading' : clean ? outside.length ? 'partial' : 'clean' : 'differs';
   const button = (
     <div className="cx-reset-all" data-reset-all={phase} data-reset-state={state} data-differ={differ.length} data-changed={changedOnes.length}>
       <div className="cx-reset-status">
         {state === 'loading' && <span className="cx-settings-line">Comparing every plugin with the build it should run…</span>}
         {state === 'error' && <span className="inline-error">The comparison failed: {planned.error}</span>}
-        {state === 'clean' && (
+        {(state === 'clean' || state === 'partial') && (
           <>
-            <span className="t">{outside.length ? 'Plugins with a matching release run' : 'Every plugin runs'} {source}. No changes of yours.</span>
+            <span className="t">{references.length === 0 ? 'No installed plugin has a release or bundled build to compare.' : `${outside.length ? 'Plugins with a matching reference run' : 'Every plugin runs'} ${source}. No local data changes found.`}</span>
           </>
         )}
         {state === 'differs' && (
@@ -160,10 +164,10 @@ export function ResetAll() {
             {changedOnes.length > 0 && <span className={differ.length > 0 ? 'cx-settings-line' : 't'}>{changedOnes.length === 1 ? '1 plugin carries' : `${changedOnes.length} plugins carry`} your changes: {some(changedOnes)}.</span>}
           </>
         )}
-        {outside.length > 0 && <span className="cx-settings-line">No matching release: {some(outside)}. Left unchanged.</span>}
+        {outside.length > 0 && <span className="cx-settings-line">No release or bundled package available: {some(outside)}. Kept installed; excluded from reset.</span>}
         {plan?.offline && <span className="cx-settings-line cx-reset-offline" title={plan.offline}>No official release can be read; the app's own build is the reference.</span>}
       </div>
-      <CheckUpdates />
+      <CheckUpdates unmatched={outside.length} offline={Boolean(plan?.offline)} />
       <button className="detent warn" type="button" data-action="reset-all" disabled={open || touched.length === 0} onClick={start}
         title={touched.length ? 'Every plugin back to the build it should run, your changes dropped' : 'Nothing to reset'}>Reset all plugins…</button>
     </div>
@@ -178,7 +182,7 @@ export function ResetAll() {
         <div className="sheet-scrim open" data-slot={owner.slot} data-plugin-id={owner.pluginId} data-portal="reset-all">
           <div ref={dialog} className="sheet cx-reset-sheet" role="dialog" aria-modal="true" aria-label="Reset all plugins" tabIndex={-1} data-phase={phase}>
             <div className="sheet-h">
-              <span className="ap">Reset all plugins to their official release</span>
+              <span className="ap">Reset plugins to their release or bundled build</span>
               <span className="grow" />
               <button className="detent" type="button" data-action="reset-close" disabled={phase === 'resetting'} onClick={close}>Close</button>
             </div>
@@ -190,7 +194,7 @@ export function ResetAll() {
                 <>
                   {plan.offline && <p className="hint" data-reset-offline="">The official releases could not be read ({plan.offline}). The packages this app was built with stand in.</p>}
                   {touched.length === 0
-                    ? <p>{blocked.length ? 'Restart CortexTerm first; plugin updates need the newer frame.' : outside.length ? 'No matching plugins need a reset.' : `Every plugin runs its ${plan.offline ? "app's build" : 'official release'}, with no changes of yours. Nothing to reset.`}</p>
+                    ? <p>{blocked.length ? 'Restart CortexTerm first; plugin updates need the newer frame.' : outside.length ? 'No matching plugins need a reset.' : `Every plugin runs ${source}, with no local data changes. Nothing to reset.`}</p>
                     : <p>Your changes to {touched.length === 1 ? 'this plugin are' : `these ${touched.length} plugins are`} dropped and the package installed. The frame, your projects and sessions stay. This cannot be undone.</p>}
                   <ul className="cx-reset-list">
                     {plan.plugins.map((item) => (
@@ -206,7 +210,7 @@ export function ResetAll() {
               {phase === 'resetting' && <p className="hint" data-reset-progress="">{status.data?.detail || 'Resetting…'}</p>}
               {phase === 'done' && result && (
                 <>
-                  <p>{result.length === 0 ? 'Nothing changed.' : result.every((entry) => entry.outcome === 'reset') ? 'Every plugin runs its official release now.' : 'Some plugins could not be reset.'}</p>
+                  <p>{result.length === 0 ? 'Nothing changed.' : result.every((entry) => entry.outcome === 'reset') ? 'The listed plugins were reset to their reference builds.' : 'Some plugins could not be reset.'}</p>
                   <ul className="cx-reset-list">
                     {result.map((entry) => (
                       <li key={`${entry.plugin}-${entry.ms}`} data-plugin={entry.plugin} data-reset-outcome={entry.outcome}>
@@ -240,32 +244,46 @@ export function ResetAll() {
   );
 }
 
-interface CheckStatus { state: string; detail: string; error?: string | null; waiting?: string[]; pending?: unknown[]; round?: { state: string }[]; restart?: unknown | null }
+interface CheckStatus { state: string; detail: string; error?: string | null; waiting?: string[]; pending?: unknown[]; failed?: unknown[]; round?: { state: string }[]; restart?: unknown | null }
 
 /** Look at the catalog now (update.check): what applies by itself installs, as the updater's popup
  * shows; here one line says what the check found. */
-function CheckUpdates() {
+function CheckUpdates({ unmatched, offline }: { unmatched: number; offline: boolean }) {
   const client = useClient();
+  const status = useQuery<CheckStatus>('update.status:plugins-check', (c) => c.call<CheckStatus>('update.status', {}), { topics: ['update.changed'] });
   const [checking, setChecking] = useState(false);
-  const [found, setFound] = useState<string | null>(null);
+  const [checked, setChecked] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const check = async () => {
     setChecking(true);
-    setFound(null);
+    setChecked(false);
+    setError(null);
     try {
-      const status = await client.call<CheckStatus>('update.check', {});
-      const busy = (status.round ?? []).filter((item) => ['queued', 'downloading', 'installing'].includes(item.state)).length;
-      setFound(status.error ? `The check failed: ${status.error}`
-        : busy > 0 ? `${busy === 1 ? '1 update' : `${busy} updates`} installing`
-        : (status.waiting?.length ?? 0) > 0 ? 'Updates wait for the running work to end'
-        : (status.pending?.length ?? 0) > 0 ? 'Updates wait for your answer'
-        : status.restart ? 'Restart to finish the update'
-        : 'Everything is up to date');
+      await client.call<CheckStatus>('update.check', {});
+      await status.refresh();
+      setChecked(true);
     } catch (cause) {
-      setFound(errorMessage(cause));
+      setError(errorMessage(cause));
     } finally {
       setChecking(false);
     }
   };
+  const data = status.data;
+  const busy = (data?.round ?? []).filter((item) => ['queued', 'downloading', 'installing'].includes(item.state)).length;
+  const failed = Math.max((data?.failed ?? []).length, (data?.round ?? []).filter((item) => item.state === 'failed').length);
+  const found = error ? `The check failed: ${error}` : !checked ? null
+    : status.error ? `The update status could not be read: ${status.error}`
+    : !data ? 'Reading update status…'
+    : data.error ? `The check failed: ${data.error}`
+    : busy > 0 ? `${busy === 1 ? '1 update' : `${busy} updates`} installing`
+    : data.state !== 'idle' ? data.detail || 'Checking for updates…'
+    : (data.waiting?.length ?? 0) > 0 ? 'Updates wait for the running work to end'
+    : (data.pending?.length ?? 0) > 0 ? 'Updates wait for your answer'
+    : failed > 0 ? `${failed === 1 ? '1 update' : `${failed} updates`} could not be installed`
+    : data.restart ? 'Restart to finish the update'
+    : offline ? 'No official release available; compared with bundled builds'
+    : unmatched > 0 ? 'No updates found for plugins with a matching release'
+    : 'Everything is up to date';
   return (
     <>
       {found && <span className="ap faint" data-update-check={found}>{found}</span>}

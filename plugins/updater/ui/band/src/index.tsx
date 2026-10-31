@@ -9,8 +9,9 @@
  * until seen.
  */
 
-import { definePlugin, errorMessage, useClient, useQuery, useShared } from '@cortex/sdk';
+import { definePlugin, errorMessage, useClient, useQuery, useShared, useSlotInfo } from '@cortex/sdk';
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 
 interface Pending { plugin: string; name?: string; version: string; from?: string; installed?: string; files?: string[] }
 interface Applied { plugin: string; version: string; ms: number; outcome: string; detail?: string }
@@ -113,6 +114,7 @@ function Round({ rows, onHide }: { rows: RoundItem[]; onHide: () => void }) {
 
 function Updates() {
   const client = useClient();
+  const owner = useSlotInfo();
   const status = useQuery<Status>('update.status:band', (c) => c.call<Status>('update.status', {}), { topics: ['update.changed'] });
   const [, setSettings] = useShared<string | null>('settings.open', null);
   const [, setOverlay] = useShared<boolean>('overlay.open', false);
@@ -163,8 +165,8 @@ function Updates() {
   return (
     <>
       {band}
-      {(showRound || ask || broke) && (
-      <div style={{ position: 'fixed', right: 16, bottom: 16, zIndex: 89, width: 'min(400px, calc(100% - 32px))', maxHeight: 'calc(100vh - 32px)', display: 'flex', flexDirection: 'column', gap: 8 }}>
+      {(showRound || ask || broke) && createPortal(
+      <div data-slot={owner.slot} data-plugin-id={owner.pluginId} data-portal="updates" style={{ position: 'fixed', right: 16, bottom: 16, zIndex: 89, width: 'min(400px, calc(100% - 32px))', maxHeight: 'calc(100vh - 32px)', display: 'flex', flexDirection: 'column', gap: 8, overflowY: 'auto' }}>
       {showRound && <Round rows={rows} onHide={() => setHidden(signature)} />}
       {ask ? (
         <div className="sheet" role="dialog" aria-modal="false" aria-labelledby="updater-ask-title" style={{ width: '100%', minHeight: 0 }}>
@@ -212,7 +214,7 @@ function Updates() {
           </div>
         </div>
       ) : null}
-      </div>
+      </div>, document.getElementById('cc') ?? document.body,
       )}
     </>
   );
