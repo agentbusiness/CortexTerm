@@ -29,3 +29,10 @@ The reset comparison distinguishes release references, bundled references and in
 with neither. Missing reference packages stay installed and are excluded from reset. Manual
 update results follow live updater status, include failed updates and qualify the result when
 release coverage is incomplete. Source reviewed only; no build, install or live verification.
+
+## Service status (0.1.9)
+
+The band derives expected backend services from the installed plugin units and reported services.
+It does not require CortexCode-only categories (`tools`, `vcs`, `chatflow-coding`, `agents`,
+`browser`) in CortexTerm. Enabled backends that are missing or crashed still appear; intentionally
+disabled and standby providers do not create missing-service warnings. Unit changes refresh the band.
