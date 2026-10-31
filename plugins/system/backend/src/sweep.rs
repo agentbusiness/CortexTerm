@@ -87,7 +87,7 @@ fn ids_text(ids: &[String]) -> String {
     text
 }
 
-async fn blocking(f: fn() -> Part) -> Part {
+async fn blocking(f: impl FnOnce() -> Part + Send + 'static) -> Part {
     tokio::task::spawn_blocking(f).await.unwrap_or_default()
 }
 
@@ -232,6 +232,8 @@ pub async fn run_areas(areas: &[Area], within: Option<Duration>, last: &SweepRep
     let started = Instant::now();
     let has = |area: Area| areas.contains(&area);
     let scope = inventory::Scope { updates: has(Updates) || has(Apps), apps: has(Apps), deps: has(Packages), secrets: has(Secrets) };
+    let discovery = std::sync::Arc::new(crate::filesystem::Scan::default());
+    let _cancel = crate::filesystem::CancelOnDrop(discovery.clone());
     let mut groups: Vec<(Vec<Area>, BoxFuture<'static, Part>)> = Vec::new();
     let mut group = |area: Area, work: BoxFuture<'static, Part>| {
         if has(area) {
@@ -241,17 +243,20 @@ pub async fn run_areas(areas: &[Area], within: Option<Duration>, last: &SweepRep
     group(Packages, Box::pin(packages()));
     group(Settings, Box::pin(blocking(posture::checks)));
     group(Network, Box::pin(netsec::checks()));
-    group(Malware, Box::pin(blocking(malware::checks)));
-    group(Persistence, Box::pin(async { merged(tokio::join!(blocking(persist::checks), blocking(launch_checks))) }));
+    let disk = discovery.clone();
+    group(Malware, Box::pin(blocking(move || malware::checks(disk))));
+    let disk = discovery.clone();
+    group(Persistence, Box::pin(async move { merged(tokio::join!(blocking(move || persist::checks(disk)), blocking(launch_checks))) }));
     group(Privacy, Box::pin(blocking(privacy::checks)));
     group(Intrusion, Box::pin(blocking(intrusion::checks)));
-    group(Agents, Box::pin(blocking(agents::checks)));
+    let disk = discovery.clone();
+    group(Agents, Box::pin(blocking(move || agents::checks(disk))));
     group(Ssh, Box::pin(blocking(ssh_checks)));
     group(Secrets, Box::pin(blocking(history_checks)));
     // One inventory run serves every area that needs it.
     if scope.any() {
         let served = areas.iter().copied().filter(|a| matches!(a, Updates | Apps | Packages | Secrets)).collect();
-        groups.insert(groups.len().min(1), (served, Box::pin(inventory::checks(scope))));
+        groups.insert(groups.len().min(1), (served, Box::pin(inventory::checks(scope, discovery))));
     }
 
     let deadline = within.map(|d| tokio::time::Instant::now() + d);
@@ -303,6 +308,8 @@ pub async fn run_areas(areas: &[Area], within: Option<Duration>, last: &SweepRep
     if last.at != 0 {
         all.findings.extend(last.findings.iter().filter(|f| late.iter().any(|a| a.covers(f))).cloned());
     }
+    all.skipped.sort();
+    all.skipped.dedup();
     all.findings.sort_by_key(|f| rank(&f.severity));
     let report = SweepReport {
         at: now_ms(),

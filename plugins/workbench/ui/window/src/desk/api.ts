@@ -30,6 +30,7 @@ export interface TermState {
   running?: Run | null;
   last_exit?: number | null;
   alternate_screen: boolean;
+  interactive?: boolean;
   attention: string;
   git_branch?: string | null;
   /** What the running command asks (a prompt line, or a password: the terminal stopped echoing). */

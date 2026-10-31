@@ -102,8 +102,9 @@ the others sit on a shelf as small live cards. ⌘J jumps to whatever needs you,
 updating the app doesn't kill what's running in them.
 
 **Log view.** Any command's output can be opened as a log. JSON and logfmt are detected, lines get
-levels, and there's a timeline and filters. When a command fails, the model can read it and
-suggest a fix.
+levels, and there's a timeline and filters. When a command fails, the model automatically reads
+its recorded output, explains the error and offers a fix in the same conversation. You choose
+whether to run the fix. Successful commands and Ctrl+C do not trigger an explanation.
 
 **Processes.** The sidebar shows CPU, memory, GPU, network and disk, and every process with its
 ports. You can ask what a process is, chart it over the last 20 minutes, watch the files and
@@ -112,8 +113,11 @@ sockets it opens, or record a trace that's kept for a week.
 **Passwords and prompts.** When a command asks for a password or a yes/no, CortexTerm notices and
 asks you in place. If you choose to remember it, the password goes into the macOS Keychain.
 
-**Editors and top.** `nano` and `vi` open a built-in editor, `top` and `htop` open the process view.
-Put `!` in front to get the real program.
+**File editing.** Type `edit` to turn the shared input green and browse files in the focused shell's
+folder. Type part of a filename to filter, use ↑↓ to choose, Tab to complete a path and Enter to open
+a file or browse a folder. Escape returns to the normal input. `edit path/to/file` opens the built-in
+editor; a new file is written only when saved. Standard commands—including `nano`, `vim`, `top`,
+`less` and `man`—run their actual tools without being replaced by a built-in view.
 
 **Memory.** It remembers the folders you work in, the commands you use there, your SSH hosts and the
 fixes that worked. This stays on your Mac and is never shared.

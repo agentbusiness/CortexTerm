@@ -1,26 +1,15 @@
-Find why something failed in logs: macOS unified log, app and crash logs, system journal, log files.
+Find relevant failure evidence in macOS, Linux or application logs with bounded output.
 
-`run` shows only about 60 lines: always filter and limit. Never follow a log (`tail -f`, `log stream`, `journalctl -f`): it never ends.
+## Inspect
 
-## macOS
+Establish target, application, time window and time zone. `run` shows about 60 lines and 4000 characters; select relevant records before that limit. Never use `tail -f`, `log stream` or `journalctl -f` here.
 
-- The unified log, filtered and recent: `log show --last 10m --style compact --predicate 'process == "<name>"' | tail -40`. Errors only: add `and messageType == error`. By text: `--predicate 'eventMessage CONTAINS[c] "<text>"'`. Keep `--last` short: a long window is slow.
-- Crash reports: `ls -t ~/Library/Logs/DiagnosticReports | head`. Read the top of the newest: the exception type and the first frames of the crashed thread say most.
-- App logs: `~/Library/Logs/<app>/`, Homebrew services: `$(brew --prefix)/var/log/`.
-- Why the Mac slept, woke or restarted: `pmset -g log | grep -E 'Sleep|Wake|Shutdown' | tail -20`.
+On Linux: `journalctl -u <observed-unit> -n 40 --no-pager`; add an appropriate `--since` when needed. On macOS: a short `log show --last 10m --style compact --predicate 'process == "<name>"'` query. For a known file: `tail -n 40 '<path>'`, then a small range around a relevant match.
 
-## Linux
+Use structured fields or request IDs when logs are JSON or interleaved. Filter tokens, passwords, session cookies and private payloads before output. Read compressed logs with the installed format's supported reader.
 
-- A service: `journalctl -u <unit> -n 50 --no-pager`. Since a time: `--since "1 hour ago"`. Errors: `-p err`.
-- This boot's errors: `journalctl -b -p err -n 50 --no-pager`. The previous boot: `-b -1`.
-- Kernel (OOM kills, disks): `dmesg -T | tail -30` (may need sudo).
-- Files: `/var/log/syslog` or `/var/log/messages`.
+## Interpret
 
-## Any log file
+Quote the decisive line with its time and explain what it establishes. A first visible error can itself be a consequence of an earlier event outside the range. Correlate related records before assigning a cause. No match does not prove no failure occurred.
 
-- The end: `tail -n 50 <file>`.
-- Errors with context: `grep -n -i -E 'error|fail|fatal|panic' <file> | tail -20`, then `sed -n '<from>,<to>p' <file>` around a hit.
-- Count by kind: `grep -o -E 'ERROR [A-Za-z]+' <file> | sort | uniq -c | sort -rn | head`.
-- Compressed: `zgrep`, `zcat <file>.gz | tail`.
-
-Quote the one line that explains the failure, with its time, and say what it means. The first error is usually the cause; later ones follow from it.
+Preserve logs during investigation. After a user-run repair, check fresh records and the original operation rather than relying on an old error disappearing.

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 pub mod methods {
     /// [`OpenParams`] -> [`TermInfo`]. Runs the shell as a login shell (`-l`) on a new PTY.
     pub const OPEN: &str = "terminal.open";
-    /// Write user input (UTF-8 text, may contain control characters).
+    /// Write user input (UTF-8 by default; `base64: true` sends exact binary bytes).
     pub const WRITE: &str = "terminal.write";
     /// [`ResizeParams`] -> [`TermInfo`]: sets the PTY window size (the shell receives SIGWINCH).
     pub const RESIZE: &str = "terminal.resize";
@@ -106,6 +106,10 @@ pub struct OutputEvent {
     /// Sequence number of this chunk within the terminal (starts at 1, no gaps).
     #[serde(default)]
     pub seq: u64,
+    /// Exclusive byte offset since this PTY opened. Stable across plugin reconnects.
+    /// Absent on older implementations; consumers then use the legacy snapshot fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -165,6 +169,9 @@ pub struct TermInfo {
 pub struct WriteParams {
     pub term_id: String,
     pub data: String,
+    /// `data` is standard base64 rather than UTF-8 (legacy mouse reports, binary input).
+    #[serde(default)]
+    pub base64: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -184,6 +191,22 @@ pub struct ListResult {
     pub terminals: Vec<TermInfo>,
 }
 
+/// Request formatted state only for a terminal renderer. Agent snapshots remain plain text.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SnapshotParams {
+    pub term_id: String,
+    #[serde(default)]
+    pub restore: bool,
+}
+
+/// A terminal repaint followed by output strictly beyond `offset` (overlapping chunks are cut).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ScreenRestore {
+    /// Standard base64 terminal bytes: both screen buffers, cursor, input modes, pending sequence.
+    pub data: String,
+    pub offset: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Snapshot {
     pub term_id: String,
@@ -200,6 +223,11 @@ pub struct Snapshot {
     /// The program switched to the alternate screen (full-screen apps such as vim or less).
     #[serde(default)]
     pub alternate_screen: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore: Option<ScreenRestore>,
+    /// Whether this implementation understands `terminal.write {base64: true}`.
+    #[serde(default)]
+    pub input_base64: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -225,6 +253,9 @@ pub struct TermState {
     pub last_exit: Option<i32>,
     #[serde(default)]
     pub alternate_screen: bool,
+    /// A foreground terminal application owns input, including programs using the main screen.
+    #[serde(default)]
+    pub interactive: bool,
     /// idle | running | input (a program waits for input) | failed | bell
     #[serde(default)]
     pub attention: String,

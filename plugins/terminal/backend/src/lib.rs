@@ -27,6 +27,7 @@ pub mod client;
 pub mod command;
 pub mod complete;
 pub mod daemon;
+pub mod edit;
 pub mod files;
 pub mod habits;
 pub mod keychain;
@@ -35,6 +36,7 @@ pub mod lookup;
 pub mod marks;
 pub mod migrate;
 pub mod probe;
+mod screen;
 pub mod shell;
 pub mod store;
 pub mod threat;
@@ -44,7 +46,7 @@ use base64::Engine;
 use cc_protocol::contracts::terminal::{
     AskAnswerParams, AskForgetParams, AssessParams, Assessment, CompleteParams, Completions, ExitEvent, Habits, HabitsParams, HistogramParams, ListResult,
     OpenParams, OutputEvent, Place, PlaceList, ResizeParams, RunList, RunOutputParams, RunsParams, SandboxParams, Sandboxed, ScanParams, ScanResult,
-    ScriptFetchParams, Snapshot, StateParams, TermInfo, TermParams, TermState, WriteParams, topics,
+    ScriptFetchParams, Snapshot, SnapshotParams, StateParams, TermInfo, TermParams, TermState, WriteParams, topics,
 };
 use cc_protocol::{RpcError, codes, to_value};
 use client::Daemon;
@@ -356,14 +358,18 @@ impl Terminals {
     /// A message from the daemon (None: the connection ended).
     fn message(&self, message: Option<Message>) {
         match message {
-            Some(Message::Output { term_id, data, replay }) => {
+            Some(Message::Output { term_id, data, replay, offset, tty }) => {
                 let Ok(term) = self.get(&term_id) else { return };
                 let bytes = base64::engine::general_purpose::STANDARD.decode(&data).unwrap_or_default();
-                let events = lock(&term.tracker).feed(&bytes);
+                let events = {
+                    let mut tracker = lock(&term.tracker);
+                    if let Some(tty) = tty { tracker.set_tty(tty); }
+                    tracker.feed(&bytes)
+                };
                 self.emit_all(events);
                 if !replay {
                     let seq = term.seq.fetch_add(1, Ordering::SeqCst) + 1;
-                    if let Ok(value) = serde_json::to_value(OutputEvent { term_id, data, seq }) {
+                    if let Ok(value) = serde_json::to_value(OutputEvent { term_id, data, seq, offset }) {
                         (self.emit)(topics::OUTPUT, value);
                     }
                 }
@@ -511,7 +517,14 @@ impl Terminals {
             None => self.daemon().await?,
         };
         // Queued here, before any await: keystrokes reach the shell in the order they came.
-        let data = base64::engine::general_purpose::STANDARD.encode(params.data.as_bytes());
+        let data = if params.base64 {
+            // Validate before queueing; the daemon receives exactly the original bytes.
+            base64::engine::general_purpose::STANDARD.decode(&params.data)
+                .map_err(|_| RpcError::invalid_params("terminal input is not valid base64"))?;
+            params.data
+        } else {
+            base64::engine::general_purpose::STANDARD.encode(params.data.as_bytes())
+        };
         let answer = daemon.request(Op::Write { term_id: params.term_id, data });
         Daemon::answer::<Value>(answer).await.map(|_| ()).map_err(daemon_error)
     }
@@ -564,7 +577,7 @@ impl Terminals {
     pub async fn answer(&self, params: AskAnswerParams) -> Result<(), RpcError> {
         let ask = lock(&self.get(&params.term_id)?.tracker).state().ask;
         let secret = params.text.clone();
-        self.write(WriteParams { term_id: params.term_id, data: format!("{}\r", params.text) }).await?;
+        self.write(WriteParams { term_id: params.term_id, data: format!("{}\r", params.text), base64: false }).await?;
         if let Some(ask) = ask.filter(|ask| params.remember && ask.kind == "secret" && !secret.is_empty()) {
             run_blocking(move || keychain::set(&ask.key, &secret).map_err(|e| RpcError::new(codes::UNAVAILABLE, e))).await?;
         }
@@ -603,9 +616,16 @@ impl Terminals {
     }
 
     pub async fn snapshot(&self, term_id: &str) -> Result<Snapshot, RpcError> {
+        self.screen_snapshot(term_id, false).await
+    }
+
+    async fn screen_snapshot(&self, term_id: &str, restore: bool) -> Result<Snapshot, RpcError> {
         self.get(term_id)?;
         let daemon = self.daemon().await?;
-        daemon.call(Op::Snapshot { term_id: term_id.to_owned() }).await.map_err(daemon_error)
+        let mut snapshot: Snapshot = daemon.call(Op::Snapshot { term_id: term_id.to_owned(), restore }).await.map_err(daemon_error)?;
+        // Input is implemented by this plugin, including when an older daemon keeps live shells.
+        snapshot.input_base64 = true;
+        Ok(snapshot)
     }
 
     pub fn state(&self, term_id: &str) -> Result<TermState, RpcError> {
@@ -642,6 +662,19 @@ impl Terminals {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || {
             let mut assessment = assess::assess(&params.input, &assess::Shell { env: &env, cwd: &cwd }, params.pasted);
+            if let Some(query) = edit::query(&params.input) {
+                let path = edit::path(query);
+                // This metadata is for the Line, which opens a file without executing this text.
+                // Keep it ineligible for automatic read-only model checks. Command-service risk
+                // assessment continues to parse actual shell commands through assess::assess directly.
+                assessment.kind = "shell".into();
+                assessment.risk = "write".into();
+                assessment.safe = false;
+                assessment.reasons = vec!["opens CortexTerm editor".into()];
+                assessment.program = None;
+                assessment.native_view = Some("editor".into());
+                assessment.native_target = (!path.is_empty()).then(|| assess::expand(&path, &cwd).to_string_lossy().into_owned());
+            }
             if assessment.kind != "ask"
                 && let Some(store) = store
                 && !store.new_shapes(&assessment.text).is_empty()
@@ -667,17 +700,20 @@ impl Terminals {
         let (cwd, env) = self.shell_of(&params.term_id)?;
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || {
+            if edit::query(&params.line).is_some() {
+                return edit::complete(&params.line, &cwd);
+            }
             let cursor = params.cursor as usize;
             let suggestion = match &store {
                 Some(store) if cursor >= params.line.len() && !params.line.trim().is_empty() => {
-                    store.suggestion(&params.line, &cwd.to_string_lossy())
+                    store.suggestion(&params.line, &cwd.to_string_lossy(), &params.term_id)
                 }
                 _ => None,
             };
-            complete::complete(&params.line, cursor, &assess::Shell { env: &env, cwd: &cwd }, suggestion)
+            Ok(complete::complete(&params.line, cursor, &assess::Shell { env: &env, cwd: &cwd }, suggestion))
         })
         .await
-        .map_err(|e| RpcError::internal(format!("complete task failed: {e}")))
+        .map_err(|e| RpcError::internal(format!("complete task failed: {e}")))?
     }
 
     /// What CortexTerm knows about a folder: the commands used there and above it, and what was
@@ -758,8 +794,8 @@ impl Terminals {
             }
             methods::LIST => to_value(&self.list()),
             methods::SNAPSHOT => {
-                let p: TermParams = parse_params(params)?;
-                to_value(&self.snapshot(&p.term_id).await?)
+                let p: SnapshotParams = parse_params(params)?;
+                to_value(&self.screen_snapshot(&p.term_id, p.restore).await?)
             }
             methods::STATE => {
                 let p: StateParams = parse_params(params)?;
@@ -842,6 +878,7 @@ async fn tick(terms: Weak<Terminals>) {
             }
             let events = lock(&term.tracker).tick();
             terms.emit_all(events);
+            terms.save(&term);
             if !terms.guest {
                 terms.fill(&daemon, &term).await;
             }

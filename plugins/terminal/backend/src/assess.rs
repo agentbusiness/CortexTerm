@@ -475,7 +475,6 @@ struct Analysis {
     targets: Vec<Word>,
     /// The first command's program: name and resolved path.
     program: Option<String>,
-    native: Option<(String, Option<String>)>,
     first_done: bool,
 }
 
@@ -720,7 +719,7 @@ fn analyze_cmd(
             } else {
                 out.add(Risk::Read, "");
             }
-            note_first(out, name, shell, &[]);
+            note_first(out, name, shell);
             return;
         }
         "eval" => {
@@ -742,7 +741,7 @@ fn analyze_cmd(
         _ => {}
     }
 
-    note_first(out, name, shell, args);
+    note_first(out, name, shell);
     if !text.contains('/') && shell.resolve(text).is_none() {
         out.add(Risk::Unknown, format!("`{name}` not found"));
         return;
@@ -766,8 +765,8 @@ fn analyze_cmd(
     }
 }
 
-/// Record the first command's program and native view (once).
-fn note_first(out: &mut Analysis, name: &str, shell: &Shell, args: &[Word]) {
+/// Record the first command's program (once). Standard tool names always run the real tool.
+fn note_first(out: &mut Analysis, name: &str, shell: &Shell) {
     if out.first_done {
         return;
     }
@@ -778,18 +777,6 @@ fn note_first(out: &mut Analysis, name: &str, shell: &Shell, args: &[Word]) {
         _ => None,
     };
     out.program = Some(file.map_or_else(|| name.to_owned(), |path| path.to_string_lossy().into_owned()));
-    let positional: Vec<&str> = args.iter().map(|w| w.text.as_str()).filter(|t| !t.starts_with('-') && !t.starts_with('+')).collect();
-    let file = |text: Option<&&str>| text.map(|t| expand(t, shell.cwd).to_string_lossy().into_owned());
-    out.native = match name {
-        "nano" | "pico" | "vi" | "vim" | "nvim" | "edit" | "micro" => Some(("editor".into(), file(positional.first()))),
-        "top" | "htop" | "btop" => Some(("process".into(), None)),
-        "less" | "more" | "most" => Some(("viewer".into(), file(positional.first()))),
-        "man" => Some(("man".into(), positional.last().map(|t| (*t).to_owned()))),
-        "tail" if args.iter().any(|w| w.text == "-f" || w.text == "-F" || w.text.starts_with("--follow") || (w.text.starts_with('-') && !w.text.starts_with("--") && w.text.contains(['f', 'F']))) => {
-            Some(("viewer".into(), file(positional.last())))
-        }
-        _ => None,
-    };
 }
 
 fn short_flag(args: &[Word], letter: char) -> bool {
@@ -1328,10 +1315,6 @@ pub fn assess(input: &str, shell: &Shell, pasted: bool) -> Assessment {
     assessment.safe = risk == Risk::Read;
     assessment.reasons = out.reasons;
     assessment.program = out.program;
-    if let Some((view, target)) = out.native {
-        assessment.native_view = Some(view);
-        assessment.native_target = target;
-    }
     if matches!(risk, Risk::Write | Risk::Delete | Risk::Admin | Risk::Unknown | Risk::Network) && !out.targets.is_empty() {
         assessment.matches = matches(&out.targets, shell.cwd);
     }

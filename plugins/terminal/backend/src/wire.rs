@@ -16,7 +16,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 /// The daemon build: bump it whenever `daemon.rs` (or what it runs) changes.
-pub const DAEMON_VERSION: u32 = 2;
+pub const DAEMON_VERSION: u32 = 3;
 
 /// `$CORTEX_HOME`, else `~/.cortexterm`.
 pub fn home() -> PathBuf {
@@ -82,7 +82,7 @@ pub enum Op {
     /// the terminal. -> [`Record`] (with the exit)
     Close { term_id: String },
     /// -> `cc_protocol::contracts::terminal::Snapshot`
-    Snapshot { term_id: String },
+    Snapshot { term_id: String, #[serde(default)] restore: bool },
     /// How the terminal reads input now and who reads it. -> [`Tty`] (version 2 and later)
     Tty { term_id: String },
     /// Replace the terminal's opaque `meta`. -> null
@@ -121,6 +121,12 @@ pub struct Record {
 /// (echo off, line mode) from any other quiet command.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct Tty {
+    /// The kernel supplied the flags (a failed read is never interpreted as raw input).
+    #[serde(default)]
+    pub valid: bool,
+    /// A job other than the login shell owns the terminal foreground process group.
+    #[serde(default)]
+    pub foreground: bool,
     pub echo: bool,
     pub canonical: bool,
     /// The newest process of the foreground group (the one asking): `sudo`, `ssh`.
@@ -152,6 +158,10 @@ pub enum Message {
         data: String,
         #[serde(default)]
         replay: bool,
+        #[serde(default)]
+        offset: Option<u64>,
+        #[serde(default)]
+        tty: Option<Tty>,
     },
     Exit {
         term_id: String,

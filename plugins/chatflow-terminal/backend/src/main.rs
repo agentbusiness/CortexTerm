@@ -1,13 +1,17 @@
 //! `cc-chatflow-terminal`: CortexTerm's chat flow (`chatflow-terminal`, `chatflow@1`).
 //!
-//! One turn is one model call. The host gathers what it can decide from facts first (the shell's
-//! folder and last Runs, a failed Run's output, the machine's processes and ports when the
-//! question is about them), puts it before the user's text, streams the answer into the session
+//! A turn gathers facts and learned memory, then uses model calls and read-only checks. The shell's
+//! folder and last Runs, a failed Run's output, and the machine's processes and ports when the
+//! question is about them go before the user's text. The flow streams the answer into the session
 //! journal and, when the answer carries a ```sh block, journals that one command as a proposal
 //! together with the risk engine's assessment (`terminal.assess`). The model only proposes and
 //! explains; whether a command runs is the user's and the risk engine's call, never the model's.
 
 mod flow;
+mod config;
+mod routing;
+mod learning;
+mod replay;
 mod security;
 
 use cc_protocol::contracts::lifecycle::{Hello, ProbeCheck, ProbeReport};
@@ -44,11 +48,17 @@ impl Plugin for FlowPlugin {
         Box::pin(async move {
             let started = std::time::Instant::now();
             let check = match flow.prompts_present() {
-                Ok(()) => ProbeCheck { name: "prompts".into(), ok: true, detail: "ask, fix, explain and security prompts found".into(), ms: started.elapsed().as_millis() as u64 },
+                Ok(()) => ProbeCheck { name: "prompts".into(), ok: true, detail: "ask, fix, explain, security and learning prompts and schema found".into(), ms: started.elapsed().as_millis() as u64 },
                 Err(detail) => ProbeCheck { name: "prompts".into(), ok: false, detail, ms: started.elapsed().as_millis() as u64 },
             };
             Ok(ProbeReport::from_checks(vec![check]))
         })
+    }
+
+    fn activate(&self, ctx: Ctx) -> BoxFuture<'static, Result<(), RpcError>> {
+        self.flow.connect(ctx);
+        let flow = self.flow.clone();
+        Box::pin(async move { flow.activate(); Ok(()) })
     }
 
     fn shutdown(&self, _ctx: Ctx) -> BoxFuture<'static, ()> {

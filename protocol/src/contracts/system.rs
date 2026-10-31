@@ -8,7 +8,169 @@
 
 use serde::{Deserialize, Serialize};
 
+/// App-local protection configuration. It grants no operating-system privileges.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProtectionConfig {
+    pub packet_watch: bool,
+    pub deep_watch: bool,
+    pub investigate: bool,
+    pub imports: Vec<ProtectionImport>,
+}
+
+impl Default for ProtectionConfig {
+    fn default() -> Self {
+        Self { packet_watch: true, deep_watch: false, investigate: true, imports: Vec::new() }
+    }
+}
+
+/// Explicitly selected local sensor file: `suricata` (EVE JSON), `zeek` (JSON conn log).
+/// No network listener is opened and the file never constitutes trusted instructions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ProtectionImport {
+    pub kind: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ProtectionSensor {
+    pub id: String,
+    pub label: String,
+    /// starting | active | degraded | unavailable | disabled
+    pub state: String,
+    pub detail: String,
+    pub last_at: u64,
+    pub dropped: u64,
+}
+
+/// One observed fact. `subject` is an exact process incarnation, remote address or file identity;
+/// temporal proximity alone is never a causal link. No secret contents or raw packet payloads.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct SecurityObservation {
+    pub id: String,
+    pub at: u64,
+    pub source: String,
+    pub kind: String,
+    pub severity: String,
+    pub summary: String,
+    pub rule: String,
+    pub subject: String,
+    pub pid: Option<u32>,
+    /// Unix seconds, matching `Proc.started`; never infer identity from PID alone.
+    pub process_started: Option<u64>,
+    /// Native precision when available, Unix microseconds. Versions distinguish exec images.
+    pub process_started_us: Option<u64>,
+    pub process_version: Option<i32>,
+    pub parent_pid: Option<u32>,
+    pub executable: Option<String>,
+    pub path: Option<String>,
+    pub remote: Option<String>,
+    pub port: Option<u16>,
+    pub count: u64,
+}
+
+/// Model text must cite a nonempty subset of an incident's observation IDs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct SecurityClaim {
+    pub text: String,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct SecurityInvestigation {
+    /// queued | running | complete | unavailable | failed
+    pub state: String,
+    pub summary: Vec<SecurityClaim>,
+    pub alternatives: Vec<SecurityClaim>,
+    /// Facts gathered by the bounded read-only checks, with their own observation IDs.
+    #[serde(default)]
+    pub observations: Vec<SecurityObservation>,
+    pub unknowns: Vec<String>,
+    pub next_steps: Vec<String>,
+    pub checked_at: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct SecurityIncident {
+    pub id: String,
+    pub key: String,
+    pub first_at: u64,
+    pub last_at: u64,
+    pub title: String,
+    pub severity: String,
+    /// open | dismissed
+    pub state: String,
+    pub observations: Vec<SecurityObservation>,
+    pub investigation: Option<SecurityInvestigation>,
+    pub revision: u64,
+    #[serde(default)]
+    pub omitted_observations: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct SecurityException {
+    pub id: String,
+    pub incident_key: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub reason: String,
+    /// Exact observation fingerprints present when allowed; new behaviour is not covered.
+    #[serde(default)]
+    pub observation_keys: Vec<String>,
+    #[serde(default)]
+    pub max_severity: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ProtectionStatus {
+    pub at: u64,
+    pub config: ProtectionConfig,
+    pub sensors: Vec<ProtectionSensor>,
+    pub incidents: Vec<SecurityIncident>,
+    pub exceptions: Vec<SecurityException>,
+    /// An explicit user-run command; never executed by configuration or the model.
+    pub deep_capture_command: Option<String>,
+    /// Opens the verified signed installer; installation still requires the user's OS approval.
+    pub deep_install_command: Option<String>,
+    pub packet_capture_help: String,
+    pub visibility: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ProtectionAction {
+    pub id: String,
+    /// dismiss | reopen | allow_hour | revoke_exception | investigate | stop_process
+    pub action: String,
+    #[serde(default)]
+    pub confirm: bool,
+    /// Binds a destructive confirmation to exactly the incident the user reviewed.
+    #[serde(default)]
+    pub expected_revision: Option<u64>,
+    #[serde(default)]
+    pub expected_pid: Option<u32>,
+    #[serde(default)]
+    pub expected_process_started: Option<u64>,
+    #[serde(default)]
+    pub expected_process_started_us: Option<u64>,
+    #[serde(default)]
+    pub expected_process_version: Option<i32>,
+    #[serde(default)]
+    pub expected_executable: Option<String>,
+}
+
 pub mod methods {
+    /// Local protection: sensor health, configuration, incidents and scoped exceptions.
+    pub const PROTECTION_STATUS: &str = "system.protection.status";
+    /// `ProtectionConfig` -> `ProtectionStatus`. UI only; never starts a privileged command.
+    pub const PROTECTION_CONFIGURE: &str = "system.protection.configure";
+    /// `{id}` -> `SecurityIncident` (the bounded, evidence-bearing incident timeline).
+    pub const INCIDENT_GET: &str = "system.incident.get";
+    /// `ProtectionAction` -> `ProtectionStatus`. Mutations require a local user action.
+    pub const INCIDENT_ACT: &str = "system.incident.act";
     /// `{}` -> [`super::Metrics`]: the latest sample (sampled in the background).
     pub const METRICS: &str = "system.metrics";
     /// [`super::ProcessesParams`] -> [`super::ProcessList`].

@@ -3,8 +3,8 @@
 [plugin]
 id = "chatflow-terminal"
 name = "Terminal flow"
-version = "0.1.13"
-description = "The terminal chat flow: plain-language questions about the shell and the machine, one proposed command checked by the risk engine, explanations of commands, lines and processes, and fixes for failed Runs."
+version = "0.1.15"
+description = "Terminal assistance with compact task-skill selection, bounded read-only checks, configuration previews and user-run proposals, with graph-backed learning and recall."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
 

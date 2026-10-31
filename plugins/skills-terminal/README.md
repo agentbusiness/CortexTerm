@@ -1,37 +1,19 @@
-# Terminal skills (`skills-terminal`)
+# Terminal skills 0.1.8
 
-Terminal know-how for CortexTerm's model as one `skills@1` plugin (the `skills` family):
-`processes-and-ports`, `macos`, `networking`, `ssh`, `docker`, `logs`, `disk-cleanup` and
-`interactive-programs`. They are written for the terminal flow's tools: `run` only reads (no
-keyboard, stopped after 20 s, about 60 lines shown), and every change is a command the person runs.
-The terminal flow lists the summaries before each message and the model reads one with its `skill`
-tool.
+Compact task procedures for CortexTerm's Gemma E2B/E4B and borrowed Qwen. The library covers files, shells, Git, system services, networking, web deployments, databases, queues, search, cloud tools, business applications, AI services and configuration formats. [Workflow coverage](../../docs/terminal-skills/COVERAGE.md) maps the 100 research tasks to actual cards. Cards are source guidance; successful operation still requires real-app verification.
 
-One self-contained plugin folder, separable into its own repository (only `cc-protocol` and
-`cc-lang-kit` come from outside):
+## Loading and tools
 
-| Path | What |
-|---|---|
-| `plugin.toml` | identity, build command and output, `data/` as a backend asset, source location, verification commands |
-| `backend/` | Cargo workspace (depends on `cc-lang-kit` by path), binary `cc-skills-terminal`: category `skills-terminal`, contract `skills@1`, served by `cc_lang_kit::run_skills_plugin` |
-| `data/skills/` | the skills (`<name>.md`: line 1 the one-sentence summary of when to read it, a blank line, the Markdown body) |
+The terminal flow 0.1.15 keeps the catalog in the host, advertises at most five relevant cards and attaches a clear match before generation. Its `skill` tool can search for another task and read its full card. Lookups have their own budget. The model sees at most two active card bodies, not the whole library. See [loading and configuration behavior](../../docs/terminal-skills/README.md).
 
-## What it serves
+`run` is a bounded read-only check: no keyboard, 20 seconds, about 60 lines/4,000 bytes for the model. A refused command did not run. Changes remain user-run proposals under the terminal risk engine. The `config` tool can inspect a file or prepare a hash-bound exact-replacement preview; it cannot apply it. Native product validation and an observed health check establish the outcome.
 
-Methods are called on the category: `skills-terminal.describe` (id, name and every skill's name
-and summary) and `skills-terminal.skill` (`{name}` -> `{name, text}`, the whole file). Skills are
-written to [docs/SKILLS-BRIEF.md](../../docs/SKILLS-BRIEF.md): guidance first, as long as the procedure needs, only what improves the
-model's coding, CortexTerm's tools and URIs by their real names.
+## Package format
 
-## Build and run
+This is one existing `skills@1` plugin, category `skills-terminal`. `data/skills/<name>.md` uses a short plain situation summary on line 1, a blank line 2 and a self-contained Markdown procedure. Product/action names keep discovery specific. A concrete inspection, interpretation and verification matter more than a word-count target. The cards use the app's actual tool names and do not assume another coding agent's unrestricted tools.
 
-```sh
-cd backend && cargo build --release && cargo clippy --release --all-targets -- -D warnings
-cortex-pack build plugins/skills-terminal   # -> plugins/skills-terminal/target/skills-terminal-<version>-<target>.ccplugin
-```
+`skills-terminal.describe` lists names and summaries; `skills-terminal.skill {name}` returns one whole card. The backend uses `cc_lang_kit::run_skills_plugin`. `data/` remains a packaged backend asset. The existing conformance probe checks catalog/read identity, a summary/body and unknown-skill behavior. It does not prove small-model task performance. There is no enforced 16-skill ceiling or 250-word minimum.
 
-The frame runs it once installed (`cortex-pack build plugins/skills-terminal --install`). The probe runs
-`describe` (at least one skill), reads every skill back through `skill` (line 1 is the summary
-`describe` gave, a body follows) and asks for an unknown skill (`not_found`). The unit tests also
-hold the shipped skills to the brief's format (1-16 skills, a summary of at most 100 characters
-naming the situation, blank line 2, 250-3200 words, no links in prose).
+## Release verification
+
+The 0.1.8 work was requested without a build. Source/card inspection and temporary format checks were performed; no build, package installation, service changes or Gemma/Qwen app session was run. No repository test suite, check scripts or benchmark directory were added. Validate the release in the real app, including an 8 GB Mac, before claiming operational success. [Research sources](../../docs/terminal-skills/SOURCES.md) support maintenance of version-sensitive procedures.

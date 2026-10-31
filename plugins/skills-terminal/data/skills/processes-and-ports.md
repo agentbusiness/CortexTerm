@@ -1,32 +1,17 @@
-A process is slow, stuck, using too much CPU or memory, or holds a port; something must be stopped.
+Find a slow process or port owner and choose a scoped stop only when necessary.
 
-## Look first (with `run`)
+## Inspect
 
-- Busiest by CPU: `ps -axo pid,ppid,%cpu,%mem,rss,etime,comm -r | head -15` (macOS; `ps aux --sort=-%cpu | head` on Linux).
-- Busiest by memory: `ps -axo pid,rss,%mem,comm -m | head -15` (macOS; `--sort=-rss` on Linux). `rss` is in KB: divide by 1024 for MB.
-- One program by name: `pgrep -lf <name>`. Its full command line: `ps -o pid,etime,command -p <pid>`.
-- Who holds a port: `lsof -nP -iTCP:<port> -sTCP:LISTEN`. Every listening port: `lsof -nP -iTCP -sTCP:LISTEN`.
-- What a process has open: `lsof -p <pid> | head -40`.
-- Its children: `pgrep -P <pid> -l`.
+Use current metrics first. On macOS: `ps -axo pid,ppid,%cpu,%mem,rss,etime,comm -r | head -15`; on a compatible GNU ps use its supported sorting options. Check the actual tool on minimal Linux systems.
 
-Say what the process is (the app or tool it belongs to) before saying it is a problem. A busy `mds_stores`, `kernel_task` or `WindowServer` is macOS doing its work, not something to stop.
+For a port: `lsof -nP -iTCP:<port> -sTCP:LISTEN` or a relevant Linux ss query. For an observed PID: `ps -o pid,ppid,etime,command -p <pid>`. Avoid exposing credential arguments. Explain the owning application and service before calling its process a problem.
 
-## Stopping one (theirs to run, in a ```sh block)
+## Propose
 
-1. Ask it to quit: `kill <pid>` (SIGTERM). It can save and clean up.
-2. Only if it is still there after a few seconds: `kill -9 <pid>`. Say that unsaved work in it is lost.
-3. By name: `pkill -x <name>`. Show `pgrep -lx <name>` first so they see what it matches.
-4. A process of another user or root needs `sudo`.
+Recheck identity immediately before a stop; PIDs can be reused. The person may send SIGTERM first so the process can clean up. SIGKILL is a later explicit action that can lose work. A supervised service may restart: use its service manager rather than repeatedly killing children.
 
-A service started by launchd or systemd comes back after a kill: stop the service instead (`brew services stop <name>`, `launchctl bootout gui/$(id -u)/<label>`, `sudo systemctl stop <unit>`).
+## Interpret and verify
 
-## Exit codes in a failed Run
+Exit 127 suggests command resolution failed. Exit 126 can involve executable permissions, format or interpreter problems; inspect the actual error before suggesting chmod. Exit 137 indicates SIGKILL, not its cause. Check memory evidence before naming OOM.
 
-| Exit | Meaning |
-|---|---|
-| 1, 2 | failure, usage error (grep: 1 = no match) |
-| 126 | not executable: `chmod +x`, or a CRLF line ending in the script |
-| 127 | command not found: not installed or not on PATH (`command -v <name>`) |
-| 130 | stopped with Ctrl-C |
-| 137 | killed: out of memory, or `kill -9` |
-| 141 | the reader (`head`) stopped early: usually harmless |
+After a stop or repair, inspect the intended process or port and repeat the affected operation. Do not claim success from disappearance alone.

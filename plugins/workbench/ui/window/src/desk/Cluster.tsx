@@ -1,7 +1,7 @@
 /** Machine picker and the cluster page. Layout is this window's local, database-backed UI state. */
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties, KeyboardEvent, PointerEvent, ReactNode } from 'react';
-import { Caret, ComputerScope, useShared } from '@cortex/sdk';
+import { Caret, ComputerScope, Menu, useShared } from '@cortex/sdk';
 import { GB } from './api';
 import { MachineReadings, useMetrics } from './Sidebar';
 import { useMachineAlerts } from './machine-data';
@@ -55,16 +55,22 @@ export function ComputerPicker({ computers, node, colors, onSelect, onCluster }:
   computers: Computer[]; node: string; colors: Record<string, string>;
   onSelect: (node: string) => void; onCluster: () => void;
 }) {
+  const selected = computers.find((computer) => computer.node === node);
+  const machineLabel = (computer: Computer) => `${computer.name}${computer.node ? computer.reachable ? ' · MESH' : ' · OFFLINE' : ' · LOCAL'}`;
   return <div className="ct-computer-controls">
-    <label className="ct-computer-picker" style={colorStyle(colors[colorKey(node)])}>
-      <span className="ct-computer-color" aria-hidden />
-      <select aria-label="Machine for all side panes" value={node} onChange={(event) => onSelect(event.target.value)}>
-        {computers.map((computer) => <option key={computer.node} value={computer.node}>
-          {computer.name}{computer.node ? computer.reachable ? ' · MESH' : ' · OFFLINE' : ' · LOCAL'}
-        </option>)}
-      </select>
-      <Caret dir="down" />
-    </label>
+    <div className="ct-computer-picker" style={colorStyle(colors[colorKey(node)])}>
+      <Menu
+        className="ct-computer-trigger"
+        title="Machine for all side panes"
+        label={<><span className="ct-computer-color" aria-hidden /><span className="ct-computer-label">{selected ? machineLabel(selected) : 'Choose machine'}</span></>}
+        items={computers.map((computer) => ({
+          key: computer.node,
+          label: machineLabel(computer),
+          selected: computer.node === node,
+          onSelect: () => onSelect(computer.node),
+        }))}
+      />
+    </div>
     <button type="button" className="ct-cluster-toggle" aria-label="Open cluster overview" title="Cluster overview" onClick={onCluster}>
       <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.2" aria-hidden>
         <rect x="1.5" y="1.5" width="5" height="5" /><rect x="9.5" y="1.5" width="5" height="5" />

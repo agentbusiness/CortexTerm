@@ -15,7 +15,7 @@ name = "cc-system"
 path = "src/main.rs"
 
 [dependencies]
-cc-protocol = { path = "../../../protocol", features = ["system", "notify", "memory", "terminal", "service"] }
+cc-protocol = { path = "../../../protocol", features = ["system", "notify", "memory", "terminal", "service", "model"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
