@@ -10,7 +10,8 @@
 //! - A version that cannot start (the frame's check refused it and the previous one keeps running)
 //!   is not tried again; the popup and Settings > Plugins say so with the reason (`failed`).
 //! - A build of the user's own (`+dev.` version) is left alone; Settings > Plugins shows it.
-//! - A newer frame is downloaded and staged; it runs from the next start ("Restart to update").
+//! - A newer frame is downloaded and staged; the app restarts onto it by itself as soon as nothing
+//!   runs (no conversation, no command in a terminal), and the card says what it waits for.
 //! - A reset (`update.reset`, Settings > Plugins) puts every plugin back to the latest at once,
 //!   the user's own builds and changes included, after one confirmation.
 //!
@@ -68,6 +69,8 @@ const UPDATES: &str = "updates";
 const UPDATES_DAYS: u32 = 365;
 /// The frame's row in the round.
 const FRAME: &str = "frame";
+/// How long the card says the app restarts before it does.
+const RESTART_NOTICE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -81,12 +84,13 @@ pub struct Config {
 
 impl Config {
     /// `[plugin.updater.config]`: `enabled` (default true), `repo` (default the official one) or
-    /// `catalog_url`, `check_every_s` (default 3600).
+    /// `catalog_url`, `check_every_s` (default 3600), `auto_restart` (default true: restart onto a
+    /// staged frame once nothing runs; the frame turns it off when it never runs a staged one).
     pub fn from_value(value: &Value) -> Config {
         let repo = value.get("repo").and_then(Value::as_str).filter(|repo| !repo.is_empty()).unwrap_or(release::DEFAULT_REPO);
         Config {
             enabled: value.get("enabled").and_then(Value::as_bool).unwrap_or(true),
-            auto_restart: value.get("auto_restart").and_then(Value::as_bool).unwrap_or(false),
+            auto_restart: value.get("auto_restart").and_then(Value::as_bool).unwrap_or(true),
             development: value.get("development").and_then(Value::as_bool).unwrap_or(false),
             development_build: value.get("development_build").and_then(Value::as_str).map(|s| s.as_bytes().to_vec()),
             catalog_url: value
@@ -606,6 +610,8 @@ impl Updater {
             for (item, _) in &packages {
                 outcomes.push(self.record(&item.plugin, &item.release, "reset", "Your changes are dropped and the package installed."));
             }
+            // Written now, so the next process reads them back from the graph.
+            self.graph.flush().await;
             let together = install_many(&ctx, packages.iter().map(|(_, package)| package.as_path()).collect()).await;
             match together {
                 Ok(Placed::Now) => {}
@@ -871,15 +877,16 @@ impl Updater {
         false
     }
 
-    /// Restart only after catalog installation and foreground/command work have settled.
+    /// Restart onto a staged frame by itself once nothing runs and no update is being applied. The
+    /// card says what it waits for, and that the app restarts, a few seconds before it does.
     async fn restart_when_ready(&self) -> Result<(), RpcError> {
         if !self.config().auto_restart || self.checking.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        let outcome = tokio::time::timeout(Duration::from_secs(20), self.restart_when_ready_inner()).await
-            .unwrap_or_else(|_| Err(RpcError::internal("runner activity check timed out; update restart deferred")));
+        let outcome = tokio::time::timeout(Duration::from_secs(30), self.restart_when_ready_inner()).await
+            .unwrap_or_else(|_| Err(RpcError::internal("the activity check timed out; the update restart waits")));
         self.checking.store(false, Ordering::SeqCst);
-        if outcome.is_err() { self.state("idle", "Runner update restart deferred until activity can be checked and work has settled."); }
+        if outcome.is_err() { self.state("idle", "The restart for the update waits until activity can be checked and work has settled."); }
         if self.again.swap(false, Ordering::SeqCst) { self.wake.notify_one(); }
         outcome
     }
@@ -898,30 +905,68 @@ impl Updater {
         if !local && (config.development || staged.staged.is_none()) {
             return Ok(());
         }
-        if self.run_going(ctx).await {
+        if let Some(reason) = self.busy(ctx).await? {
+            self.restart_waits(reason);
             return Ok(());
         }
+        self.restart_waits("");
+        self.state("restarting", "Restarting CortexTerm to finish the update.");
+        tokio::time::sleep(RESTART_NOTICE).await;
+        // Something may have started while the card said so.
+        if let Some(reason) = self.busy(ctx).await? {
+            self.state("idle", "");
+            self.restart_waits(reason);
+            return Ok(());
+        }
+        ctx.call(frame_methods::UPDATE_RESTART, json!({})).await?;
+        Ok(())
+    }
+
+    /// What keeps the app from restarting now, in words; `None` when nothing runs. The shells
+    /// themselves survive a restart (`cortexd` keeps them); a command running in one does not wait.
+    async fn busy(&self, ctx: &Ctx) -> Result<Option<&'static str>, RpcError> {
+        if self.run_going(ctx).await {
+            return Ok(Some("a conversation is running"));
+        }
         let list: PluginListResult = call(ctx, frame_methods::PLUGINS_LIST, json!({})).await?;
-        if list.plugins.iter().any(|plugin| plugin.category == "terminal" && plugin.state == "active") {
+        let active = |category: &str| list.plugins.iter().any(|plugin| plugin.category == category && plugin.state == "active");
+        if active("terminal") {
             let jobs: Value = call(ctx, "terminal.command.jobs.list", json!({})).await?;
             let jobs = jobs.get("jobs").and_then(Value::as_array).ok_or_else(|| RpcError::internal("terminal jobs did not answer with a job list"))?;
             if jobs.iter().any(|job| matches!(job["state"].as_str(), Some("waiting" | "running"))) {
-                return Ok(());
+                return Ok(Some("a command is running"));
+            }
+            let terminals: Value = call(ctx, "terminal.list", json!({})).await?;
+            let terminals = terminals.get("terminals").and_then(Value::as_array).ok_or_else(|| RpcError::internal("the terminal did not answer with a terminal list"))?;
+            for terminal in terminals.iter().filter(|terminal| terminal["alive"].as_bool() == Some(true)) {
+                let state: Value = call(ctx, "terminal.state", json!({ "term_id": terminal["term_id"] })).await?;
+                if state["running"].is_object() || state["interactive"].as_bool() == Some(true) || state["alternate_screen"].as_bool() == Some(true) {
+                    return Ok(Some("a command is running in a terminal"));
+                }
             }
         }
-        if list.plugins.iter().any(|plugin| plugin.category == "system" && plugin.state == "active") {
+        if active("system") {
             // Scheduled runs keep their due time until they finish. Wait for due work to finish
             // (or catch up) before restarting the plugin that owns it.
             let schedules: Value = call(ctx, "system.schedule.list", json!({})).await?;
             let schedules = schedules.get("schedules").and_then(Value::as_array).ok_or_else(|| RpcError::internal("system schedules did not answer with a schedule list"))?;
             let now = now_ms();
             if schedules.iter().any(|job| job["enabled"].as_bool().unwrap_or(true) && job["next"].as_u64().is_some_and(|next| next != 0 && next <= now)) {
-                return Ok(());
+                return Ok(Some("a scheduled job is due"));
             }
         }
-        self.state("restarting", "Restarting the background runner to apply its update.");
-        ctx.call(frame_methods::UPDATE_RESTART, json!({})).await?;
-        Ok(())
+        Ok(None)
+    }
+
+    /// Say on the card what the restart waits for (published only when it changes).
+    fn restart_waits(&self, reason: &str) {
+        if self.status().restart.as_ref().is_some_and(|restart| restart.waiting != reason) {
+            self.with_status(|status| {
+                if let Some(restart) = status.restart.as_mut() {
+                    restart.waiting = reason.into();
+                }
+            });
+        }
     }
 
     /// Split what differs from the latest: what applies now, and what asks the user. A build of
@@ -1091,7 +1136,8 @@ impl Updater {
             return Ok(());
         }
         let staged: FrameStatus = call(ctx, frame_methods::UPDATE_STATUS, json!({})).await.map_err(|e| e.message)?;
-        let restart = Some(FrameUpdate { running: running.to_owned(), staged: frame.version.clone() });
+        let waiting = self.status().restart.map(|restart| restart.waiting).unwrap_or_default();
+        let restart = Some(FrameUpdate { running: running.to_owned(), staged: frame.version.clone(), waiting });
         if staged.staged.as_deref() == Some(frame.version.as_str()) {
             self.with_status(|status| status.restart = restart);
             return Ok(());

@@ -109,9 +109,11 @@ export function ResetAll() {
       void planned.refresh();
     }
   };
+  // Always closable: a reset runs on in the updater, and the status line shows where it ends.
   const close = () => {
-    if (phase === 'resetting') return;
     setOpen(false);
+    setStarted(null);
+    if (phase === 'resetting') setPhase('ready');
   };
   const closeRef = useRef(close);
   closeRef.current = close;
@@ -161,7 +163,7 @@ export function ResetAll() {
         )}
         {state === 'differs' && (
           <>
-            {blocked.length > 0 && <span className="t">Restart CortexTerm to update {blocked.length} plugin{blocked.length === 1 ? '' : 's'}. They need the newer frame.</span>}
+            {blocked.length > 0 && <span className="t">{blocked.length} plugin{blocked.length === 1 ? ' updates' : 's update'} after CortexTerm restarts onto the newer frame, by itself when nothing runs.</span>}
             {differ.length > 0 && <span className="t">{differ.length === 1 ? '1 plugin differs' : `${differ.length} plugins differ`} from {source}: {some(differ)}.{ownBuilds.length ? ` ${ownBuilds.length === 1 ? 'It is a build of yours' : `${ownBuilds.length} are builds of yours`}, left alone.` : ''}</span>}
             {changedOnes.length > 0 && <span className={differ.length > 0 ? 'cx-settings-line' : 't'}>{changedOnes.length === 1 ? '1 plugin carries' : `${changedOnes.length} plugins carry`} your changes: {some(changedOnes)}.</span>}
           </>
@@ -188,7 +190,7 @@ export function ResetAll() {
             <div className="sheet-h">
               <span className="ap">Reset plugins to their release or bundled build</span>
               <span className="grow" />
-              <button className="detent" type="button" data-action="reset-close" disabled={phase === 'resetting'} onClick={close}>Close</button>
+              <button className="detent" type="button" data-action="reset-close" onClick={close}>Close</button>
             </div>
             <div className="sheet-b">
               {phase === 'ready' && !plan && !planned.error && <p className="hint">Reading what every plugin should run…</p>}
@@ -284,7 +286,7 @@ function CheckUpdates({ unmatched, offline }: { unmatched: number; offline: bool
     : (data.waiting?.length ?? 0) > 0 ? 'Updates wait for the running work to end'
     : (data.pending?.length ?? 0) > 0 ? 'Updates wait for your answer'
     : failed > 0 ? `${failed === 1 ? '1 update' : `${failed} updates`} could not be installed`
-    : data.restart ? 'Restart to finish the update'
+    : data.restart ? 'CortexTerm restarts by itself to finish the update when nothing runs'
     : offline ? 'No official release available; compared with bundled builds'
     : unmatched > 0 ? `No updates found. ${unmatched} plugin${unmatched === 1 ? ' has' : 's have'} no matching release.`
     : 'Everything is up to date';

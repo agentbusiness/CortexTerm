@@ -38,8 +38,13 @@ impl Snapshot {
                 name: process.name().to_string_lossy().into_owned(),
                 cwd: process.cwd().map(Path::to_path_buf).unwrap_or_default(),
             });
-            for path in open_files(pid.as_u32()) {
-                snapshot.open.push((path, index));
+            // The Virtualization framework's VM process keeps read-only handles on whatever a
+            // guest touched through a shared folder; only what it writes (its disk) is use.
+            let shares = snapshot.processes[index].name == "com.apple.Virtualization.VirtualMachine";
+            for (path, writes) in open_files(pid.as_u32()) {
+                if writes || !shares {
+                    snapshot.open.push((path, index));
+                }
             }
         }
         snapshot
@@ -61,7 +66,8 @@ impl Snapshot {
                 }
             }
         }
-        for (file, index) in &self.open {
+        let open_ok = recipe.is_some_and(|r| r.open_ok);
+        for (file, index) in self.open.iter().filter(|_| !open_ok) {
             if file.starts_with(path) {
                 let process = &self.processes[*index];
                 add(format!("{} (pid {}) has files open", process.name, process.pid));
@@ -102,15 +108,20 @@ fn locked(file: &Path) -> bool {
     !taken
 }
 
+/// The regular files `pid` has open, each with whether it may write to it.
 #[cfg(target_os = "macos")]
-fn open_files(pid: u32) -> Vec<PathBuf> {
+fn open_files(pid: u32) -> Vec<(PathBuf, bool)> {
     use std::ffi::CStr;
     // <sys/proc_info.h>: PROC_PIDLISTFDS lists `struct proc_fdinfo {int32 fd; uint32 type}`;
-    // PROC_PIDFDVNODEPATHINFO fills `struct vnode_fdinfowithpath`: proc_fileinfo (24 bytes),
-    // vnode_info (152 bytes), then the path (MAXPATHLEN).
+    // PROC_PIDFDVNODEPATHINFO fills `struct vnode_fdinfowithpath`: proc_fileinfo (24 bytes, its
+    // `fi_openflags` first), vnode_info (152 bytes: vinfo_stat (136), then `vi_type`), then the
+    // path (MAXPATHLEN).
     const PROC_PIDLISTFDS: i32 = 1;
     const PROC_PIDFDVNODEPATHINFO: i32 = 2;
     const PROX_FDTYPE_VNODE: u32 = 1;
+    const FWRITE: u32 = 2;
+    const TYPE_AT: usize = 24 + 136;
+    const VREG: i32 = 1;
     const PATH_AT: usize = 24 + 152;
     const INFO_SIZE: usize = PATH_AT + 1024;
     unsafe extern "C" {
@@ -139,10 +150,15 @@ fn open_files(pid: u32) -> Vec<PathBuf> {
         if read as usize != INFO_SIZE {
             continue;
         }
+        let word = |at: usize| [info[at], info[at + 1], info[at + 2], info[at + 3]];
+        if i32::from_ne_bytes(word(TYPE_AT)) != VREG {
+            continue;
+        }
+        let writes = u32::from_ne_bytes(word(0)) & FWRITE != 0;
         if let Ok(path) = CStr::from_bytes_until_nul(&info[PATH_AT..]) {
             let path = path.to_string_lossy();
             if path.starts_with('/') {
-                paths.push(PathBuf::from(path.as_ref()));
+                paths.push((PathBuf::from(path.as_ref()), writes));
             }
         }
     }
@@ -150,8 +166,10 @@ fn open_files(pid: u32) -> Vec<PathBuf> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn open_files(pid: u32) -> Vec<PathBuf> {
+fn open_files(pid: u32) -> Vec<(PathBuf, bool)> {
     std::fs::read_dir(format!("/proc/{pid}/fd"))
-        .map(|entries| entries.flatten().filter_map(|entry| std::fs::read_link(entry.path()).ok()).filter(|p| p.is_absolute()).collect())
+        .map(|entries| {
+            entries.flatten().filter_map(|entry| std::fs::read_link(entry.path()).ok()).filter(|p| p.is_absolute()).map(|p| (p, true)).collect()
+        })
         .unwrap_or_default()
 }

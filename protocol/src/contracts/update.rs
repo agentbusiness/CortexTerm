@@ -120,6 +120,10 @@ pub struct DismissParams {
 pub struct FrameUpdate {
     pub running: String,
     pub staged: String,
+    /// What the automatic restart waits for, in words ("a command is running"); empty when
+    /// nothing holds it back.
+    #[serde(default)]
+    pub waiting: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

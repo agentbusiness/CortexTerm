@@ -214,7 +214,8 @@ pub fn checks(discovery: crate::filesystem::Shared) -> Part {
     part
 }
 
-/// medium, or high (with why) when what it starts is unsigned, quarantined, hidden or temporary.
+/// medium, or high (with why) when what it starts is unsigned, quarantined, hidden or temporary;
+/// info (Apple) or low (a named developer) when the program's signature and seal check out.
 fn judge(item: &Item) -> (&'static str, String) {
     if item.target.is_empty() {
         return ("medium", String::new());
@@ -237,7 +238,12 @@ fn judge(item: &Item) -> (&'static str, String) {
     if sig.unsigned() {
         return ("high", format!(" (the program is {})", if sig.status == "adhoc" { "only ad-hoc signed" } else { "not signed" }));
     }
-    ("medium", String::new())
+    // An app adding its own helper, its seal intact, is the app updating itself.
+    match codesign::vouched(target).as_deref() {
+        Some("Apple") => ("info", " (Apple's own, its seal intact)".into()),
+        Some(by) => ("low", format!(" (signed by {by}, its seal intact)")),
+        None => ("medium", String::new()),
+    }
 }
 
 /// A fingerprint of a file: its SHA-256, or its size and time for a folder or an unreadable file.

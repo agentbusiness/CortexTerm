@@ -185,6 +185,10 @@ async fn serve(cli: Cli, mut config: Config, home: Home) -> Result<(), String> {
             "development": std::env::var("CORTEX_NO_HANDOVER").is_ok_and(|value| value == "1"),
             "development_build": std::env::var_os("CORTEXTERM_DEV_ROOT").and_then(|root| std::fs::read_to_string(std::path::PathBuf::from(root).join("build/.runner-restart")).ok()),
         }));
+    } else if !update::hands_over() {
+        // This frame never runs a staged one: restarting onto it would start this frame again.
+        let updater = config.overrides.entry("updater".into()).or_default();
+        updater.config = config::merge_config(&updater.config, &serde_json::json!({ "auto_restart": false }));
     }
     let machine = tokio::task::spawn_blocking(machine::measure).await.map_err(|e| e.to_string())?;
     // Only one CortexTerm runs: the home lock kept a second frame out; what a frame that died

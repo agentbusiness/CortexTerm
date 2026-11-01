@@ -1,6 +1,6 @@
 //! Cleaning one item, checked again just before: the path is still there, is not a link, belongs
-//! to this user, lies in the home or temporary folders and outside the places that are never
-//! touched, git tracks nothing in it, and no program uses it now. Then, by its `how`:
+//! to this user, lies on the scanned disk (not one of its top folders) and outside the places
+//! that are never touched, git tracks nothing in it, and no program uses it now. Then, by its `how`:
 //!
 //! - `delete`: removed (regenerable things only);
 //! - `trash`: moved to the Trash, so it can be put back;
@@ -26,18 +26,9 @@ pub const NEVER: &[&str] = &[
     "~/Library/Keychains", "~/Library/Mail", "~/Library/Messages", "~/Library/Mobile Documents",
     "~/Library/CloudStorage", "~/Library/Photos", "~/Pictures/Photos Library.photoslibrary",
     "~/Library/Application Support/MobileSync", "~/.cortexterm", "~/.cortexcode", "~/.cortex-models",
+    // Package managers' installs: their own clean commands handle them.
+    "/opt/homebrew", "/usr/local/Cellar", "/usr/local/Homebrew", "/usr/local/Caskroom", "/nix",
 ];
-
-fn allowed_roots(home: &Path) -> Vec<PathBuf> {
-    let mut roots = vec![home.to_path_buf(), PathBuf::from("/private/tmp"), PathBuf::from("/tmp")];
-    if let Ok(tmp) = std::env::var("TMPDIR") {
-        roots.push(PathBuf::from(tmp.trim_end_matches('/')));
-        if let Ok(real) = std::fs::canonicalize(&tmp) {
-            roots.push(real);
-        }
-    }
-    roots
-}
 
 /// Why `path` may not be touched, or Ok.
 pub fn guard(path: &Path, home: &Path) -> Result<(), String> {
@@ -45,11 +36,12 @@ pub fn guard(path: &Path, home: &Path) -> Result<(), String> {
     if meta.file_type().is_symlink() {
         return Err("it is a symbolic link now".into());
     }
-    if meta.uid() != unsafe { libc::getuid() } {
+    if meta.uid() != walk::uid() {
         return Err("it belongs to another user".into());
     }
-    if path == home || !allowed_roots(home).iter().any(|root| path.starts_with(root) && path != root) {
-        return Err("it is outside the home and temporary folders".into());
+    let roots = walk::roots(home);
+    if home.starts_with(path) || roots.iter().any(|root| root.starts_with(path)) || !roots.iter().any(|root| path.starts_with(root)) {
+        return Err("it is not inside a folder the scan reads".into());
     }
     if NEVER.iter().any(|never| path.starts_with(recipes::expand(never, home)) || recipes::expand(never, home).starts_with(path)) {
         return Err("this place is never cleaned".into());
@@ -167,12 +159,13 @@ fn clone_copies(item: &Item, home: &Path) -> Result<Done, String> {
     Ok(Done { freed })
 }
 
-/// The tool's own command, split on spaces after `{path}` / `{project}` are filled in as whole
-/// arguments; no shell. Ten minutes at most.
+/// The tool's own command, split on spaces after `{path}`, `{name}` (the path's last part) and
+/// `{project}` are filled in as whole arguments; no shell. Ten minutes at most.
 fn command(recipe: &Recipe, path: &Path, project: Option<&Path>) -> Result<Done, String> {
     let before = walk::measure(path).bytes;
     let mut words = recipe.command.split_whitespace().map(|word| match word {
         "{path}" => path.to_string_lossy().into_owned(),
+        "{name}" => path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
         "{project}" => project.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
         other => other.to_owned(),
     });

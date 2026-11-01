@@ -67,6 +67,21 @@ fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
+/// Who vouches for a file: the app or other bundle it is part of (or the file itself), signed by
+/// Apple or a named developer, with its seal intact (`codesign --verify --strict`, slow). The
+/// signer ("Apple", the certificate or the team), or `None`. Blocking.
+pub fn vouched(path: &Path) -> Option<String> {
+    const BUNDLES: [&str; 7] = ["app", "framework", "bundle", "plugin", "xpc", "appex", "kext"];
+    let owner = path.ancestors().find(|dir| dir.extension().and_then(|e| e.to_str()).is_some_and(|e| BUNDLES.contains(&e))).unwrap_or(path);
+    let sig = check(owner);
+    if sig.status != "signed" || (!sig.apple && sig.team_id.is_empty()) {
+        return None;
+    }
+    let target = owner.display().to_string();
+    run("/usr/bin/codesign", &["--verify", "--strict", &target], Duration::from_secs(20)).ok().filter(|out| out.ok)?;
+    Some(if sig.apple { "Apple".into() } else if sig.authority.is_empty() { sig.team_id } else { sig.authority })
+}
+
 /// The signature of a program or app bundle (`codesign`, fast). Blocking.
 pub fn check(path: &Path) -> Signature {
     let when = mtime(path);

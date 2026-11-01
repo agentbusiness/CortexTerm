@@ -970,6 +970,7 @@ fn skill_checks(part: &mut Part, discovery: &crate::filesystem::Discovery) {
     }
     let mut guard = true;
     let mut scanned = 0;
+    let mut steps = Vec::new();
     for path in &files {
         let Some(text) = read_text(path, part) else { continue };
         let shell = shell_of(&text);
@@ -995,20 +996,44 @@ fn skill_checks(part: &mut Part, discovery: &crate::filesystem::Discovery) {
         } else {
             local_scan(&shell)
         };
-        if threats.is_empty() {
+        // A skill is a document: install and build steps (run from a temp folder, curl into a
+        // shell) are normal in developer docs. Only what an attack skill does to this Mac alerts.
+        let attacks: Vec<_> = threats.iter().filter(|t| ATTACKS.contains(&t.0.as_str())).collect();
+        if attacks.is_empty() {
+            if !threats.is_empty() {
+                steps.push(path);
+            }
             continue;
         }
-        let severity = if threats.iter().any(|t| t.1 == "high") { "high" } else { "medium" };
-        let rules: Vec<String> = threats.iter().map(|t| t.0.clone()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
-        let what: Vec<String> = threats.iter().map(|t| format!("{}.", t.2.trim().trim_end_matches('.'))).collect::<std::collections::BTreeSet<_>>().into_iter().take(3).collect();
+        let rules: Vec<String> = attacks.iter().map(|t| t.0.clone()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+        let what: Vec<String> = attacks.iter().map(|t| format!("{}.", t.2.trim().trim_end_matches('.'))).collect::<std::collections::BTreeSet<_>>().into_iter().take(3).collect();
         part.add(
-            severity,
+            "high",
             "agent",
-            format!("The agent skill {} tells its reader to run commands the paste guard flags ({}): {}", tilde(path), rules.join(", "), what.join(" ")),
+            format!("The agent skill {} tells its reader to run commands that steal or hand over this Mac ({}): {}", tilde(path), rules.join(", "), what.join(" ")),
             None,
             SOURCE_SKILLS,
         );
         part.about("Skill", path.display().to_string());
     }
+    if !steps.is_empty() {
+        let names: Vec<String> = steps.iter().take(3).map(|path| tilde(path)).collect();
+        let more = if steps.len() > 3 { format!(" and {} more", steps.len() - 3) } else { String::new() };
+        part.add(
+            "info",
+            "agent",
+            format!("{} include install or build steps (running from a temporary folder, a download into a shell): {}{more}. Normal in developer docs; nothing in them steals or hands over this Mac.", plural(steps.len(), "agent skill", "agent skills"), names.join(", ")),
+            None,
+            SOURCE_SKILLS,
+        );
+    }
     part.checked.push(format!("agent skills through the {} ({})", if guard { "paste guard" } else { "local rules" }, plural(scanned, "file", "files")));
 }
+
+/// What an attack skill makes its agent do to this Mac: steal passwords, keychains or secrets,
+/// hand over control, run a hidden payload, hide text from the person, or turn protection off.
+const ATTACKS: [&str; 16] = [
+    "fake-password-prompt", "password-check", "keychain-read", "keychain-dump", "keychain-unlock", "reverse-shell",
+    "decode-to-shell", "base64-to-shell", "secrets-sent", "upload-exfil-host", "security-off", "hidden-text",
+    "zero-width", "direction-marks", "terminal-codes", "lookalike-domain",
+];

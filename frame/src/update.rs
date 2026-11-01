@@ -162,6 +162,11 @@ pub fn mark_good(root: &Path) {
     write_state(root, &state);
 }
 
+/// Whether this frame runs a staged one at its next start (a restart can update it).
+pub fn hands_over() -> bool {
+    !NO_HANDOVER.load(Ordering::Relaxed)
+}
+
 /// The staged frame the next start runs, if any. Plugin packages wait for that start
 /// (`units::install`): swapped into this frame, they would race the restart.
 pub fn restart_pending(root: &Path) -> Option<String> {

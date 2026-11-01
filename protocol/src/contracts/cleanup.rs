@@ -1,7 +1,7 @@
-//! `cleanup@1`: disk space this computer can get back. A scan walks the home folder (and the
-//! user's temporary folders) for what the cleanup recipes know: build output, package and tool
-//! caches, AI agents' leftovers, temporary files, big folders untouched for months and large
-//! files kept twice. Each find is a [`Item`] with what it is, how it comes back, and whether a
+//! `cleanup@1`: disk space this computer can get back. A scan walks the whole disk (every folder
+//! of the data volume this user can read) for what the cleanup recipes know: build output,
+//! package, app and tool caches, AI agents' leftovers, temporary files, big folders untouched for
+//! months and large files kept twice. Only this user's files are offered. Each find is a [`Item`] with what it is, how it comes back, and whether a
 //! program is using it right now.
 //!
 //! The person decides per item: clean it, keep it (intended: never scanned again), or not now
@@ -54,7 +54,7 @@ pub struct ScanParams {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Progress {
     pub scan: String,
-    /// `places` (known locations), `walk` (the home folder), `duplicates`, `checks` (who uses what).
+    /// `places` (known locations), `walk` (the disk), `duplicates`, `checks` (who uses what).
     pub phase: String,
     pub files: u64,
     pub bytes: u64,
@@ -114,8 +114,9 @@ pub struct Item {
     /// `regenerable` (comes back by itself or with `regenerate`), `review` (the person's files,
     /// or not known: only moved to the Trash, and never by the AI alone).
     pub safety: String,
-    /// `open`, `in_use` (a program uses it now), `warm` (changed in the last hours), `kept`,
-    /// `later`, `cleaned`.
+    /// `open`, `in_use` (a program uses it now), `warm` (changed in the last two days, or the
+    /// current build of a project being worked on: only the person cleans it), `kept`, `later`,
+    /// `cleaned`.
     pub state: String,
     /// Who uses it: `cargo (pid 4182)`, `a build lock is held`.
     #[serde(default)]

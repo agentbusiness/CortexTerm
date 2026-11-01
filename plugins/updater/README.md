@@ -23,7 +23,12 @@ Updates from the official releases (`docs/RELEASES.md`).
 - **The user's own builds** (`+dev.` versions from `cortex-pack build --install`) are left alone;
   Settings > Plugins names them, and the reset replaces them.
 - **The frame.** A newer frame (with its window code, and Electron when that changed) is downloaded
-  and staged (`frame.update.stage`); the band says *Restart to update* (`frame.update.restart`).
+  and staged (`frame.update.stage`). The app then restarts onto it by itself (`frame.update.restart`)
+  as soon as nothing runs: no conversation, no command job, no command or full-screen program in a
+  terminal (`terminal.list`, `terminal.state`), no due schedule. The shells stay open (`cortexd`
+  keeps them). The card at the bottom right says the new version is ready and what the restart
+  waits for, shows *Restarting* five seconds before it happens, and has *Restart now*. A frame that
+  never runs a staged one (`--config`, `CORTEX_NO_HANDOVER=1`) turns the automatic restart off.
 - A plugin built with a newer frame than the one running (`min_frame`) waits for the frame update.
 - **Reset all plugins** (Settings > Plugins, after a confirmation that lists what it does to each
   plugin): every installed plugin back to its official release. The user's edits to the plugin's
@@ -48,6 +53,7 @@ no build, install or live verification.
 enabled = true                      # false: never look
 repo = "agentbusiness/CortexTerm"   # or catalog_url = "https://..."
 check_every_s = 3600
+auto_restart = true                 # false: wait for Restart now on the card
 ```
 
 ## Methods (`update@1`)
@@ -62,6 +68,6 @@ check_every_s = 3600
 
 ## Runner behavior (0.1.15)
 
-Frame 0.1.12's `--runner` profile keeps the updater enabled and supplies `auto_restart=true`. The background loop checks every five seconds for a staged core update and waits for update operations, AI runs, terminal command jobs, due schedules and active system/terminal calls before requesting a restart. PTY shells stay in `cortexd`. Desktop launches retain their explicit restart behavior.
+Frame 0.1.12's `--runner` profile keeps the updater enabled and supplies `auto_restart=true`. The background loop checks every five seconds for a staged core update and waits for update operations, AI runs, terminal command jobs, due schedules and active system/terminal calls before requesting a restart. PTY shells stay in `cortexd`. From updater 0.1.18 the desktop restarts by itself the same way (`auto_restart` defaults to true).
 
 A development runner receives `development=true` and the frame's initial build marker. The updater watches the checkout's successful core-build marker instead of installing official releases over local plugins; a changed core restarts onto the checkout's own binary. See [the runner documentation](../../RUNNER.md).
