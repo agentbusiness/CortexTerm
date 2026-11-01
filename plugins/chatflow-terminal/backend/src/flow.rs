@@ -1406,7 +1406,10 @@ impl Flow {
     /// through the injection guard.
     async fn security_facts(&self) -> Vec<String> {
         let mut lines = Vec::new();
-        if let Some(report) = self.fact("system.sweep", json!({})).await {
+        let report = self.fact("system.sweep", json!({})).await;
+        if report.as_ref().is_some_and(|report| report["at"].as_u64().unwrap_or(0) == 0) {
+            lines.push("No security sweep has run yet, so nothing is known about findings.".to_owned());
+        } else if let Some(report) = report {
             let open: Vec<&Value> = report["findings"].as_array().into_iter().flatten().filter(|f| f["ignored"].as_bool() != Some(true)).collect();
             let at = report["at"].as_u64().unwrap_or(0);
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(at);

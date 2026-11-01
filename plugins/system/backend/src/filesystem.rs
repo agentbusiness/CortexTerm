@@ -9,6 +9,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 pub struct Walk {
     roots: Vec<PathBuf>,
@@ -17,7 +18,15 @@ pub struct Walk {
     seen: HashSet<(u64, u64)>,
     pub skipped: Vec<String>,
     unread: Unread,
+    /// When the current stretch of work began (see [`WORK`]).
+    slice: Instant,
 }
+
+/// A walk, and what its caller does with each file, works this long and then rests [`REST`]: about
+/// a quarter of one core, so a whole-disk sweep stays out of the person's way however idle the Mac
+/// is.
+const WORK: Duration = Duration::from_millis(50);
+const REST: Duration = Duration::from_millis(150);
 
 /// How many unreadable paths a sweep names; the rest are counted, so a whole-disk walk's record
 /// stays small enough to keep.
@@ -58,6 +67,7 @@ impl Walk {
             seen: HashSet::new(),
             skipped: Vec::new(),
             unread: Unread::default(),
+            slice: Instant::now(),
         }
     }
 
@@ -97,6 +107,10 @@ impl Iterator for Walk {
     type Item = (PathBuf, Metadata);
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.slice.elapsed() >= WORK {
+            std::thread::sleep(REST);
+            self.slice = Instant::now();
+        }
         loop {
             if self.cancelled.load(Ordering::Relaxed) {
                 self.skipped

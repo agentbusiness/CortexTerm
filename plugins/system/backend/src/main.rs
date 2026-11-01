@@ -1179,18 +1179,11 @@ async fn dispatch(shared: Arc<Shared>, method: &str, params: Value) -> Result<Va
             lock(&shared.alerts).act(&id, &action).map_err(RpcError::invalid_params)?;
             Ok(json!({"ok": true}))
         }
+        // Reading never starts a sweep (it scans the whole disk): with none yet, `at` is 0.
         methods::SWEEP => {
             graph::wait_ready(Duration::from_secs(20)).await;
             let report = lock(&shared.findings).last.clone();
-            if report.at != 0 {
-                return to_value(&shared.marked(report));
-            }
-            drop(shared.sweep_lock.lock().await);
-            let report = lock(&shared.findings).last.clone();
-            if report.at != 0 {
-                return to_value(&shared.marked(report));
-            }
-            to_value(&shared.run_sweep().await)
+            to_value(&shared.marked(report))
         }
         methods::SWEEP_RUN => to_value(&shared.run_sweep().await),
         methods::CHECK => to_value(&shared.check(parse_params(params)?).await?),

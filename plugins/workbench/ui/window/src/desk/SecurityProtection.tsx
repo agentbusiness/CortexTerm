@@ -339,8 +339,7 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
   const loadSlow = useCallback(async () => {
     const currentGeneration = generation.current;
     const current = () => mounted.current && currentGeneration === generation.current;
-    // Each shows as it arrives: the chart is quick, while the first sweep read runs the sweep when
-    // there was none yet (minutes, so no 20 s limit).
+    // Each shows as it arrives. Reading the sweep never runs one (SWEEP NOW does).
     const chart = rpc<History>('system.security.history', { days })
       .then((value) => { if (current()) { setHistory(value); setChartProblem(null); } })
       .catch((cause) => { if (current()) setChartProblem(errorMessage(cause)); });
