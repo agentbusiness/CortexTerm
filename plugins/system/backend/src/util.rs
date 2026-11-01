@@ -10,9 +10,13 @@ pub fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
-/// Run `f` on a thread of its own at background priority, so a long check stays out of the way:
-/// on a Mac the background QoS class (efficiency cores, throttled disk reads), on Linux the
-/// lowest nice. None when the thread could not start or `f` panicked.
+/// One background job at a time, so a sweep uses about one core however many checks it has.
+static BACKGROUND: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Run `f` on a thread of its own at background priority, after any other background job, so a
+/// long check stays out of the way: on a Mac the background QoS class (efficiency cores,
+/// throttled disk reads), on Linux the lowest nice. None when the thread could not start or `f`
+/// panicked.
 pub async fn background<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
@@ -26,6 +30,7 @@ pub async fn background<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'stati
             unsafe {
                 libc::nice(19);
             }
+            let _turn = BACKGROUND.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let _ = tx.send(f());
         })
         .ok()?;

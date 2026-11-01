@@ -165,6 +165,7 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
   const [detailProblem, setDetailProblem] = useState<Record<string, string>>({});
   const [report, setReport] = useState<SweepReport | null>(null);
   const [history, setHistory] = useState<History | null>(null);
+  const [chartProblem, setChartProblem] = useState<string | null>(null);
   const [days, setDays] = useState(7);
   const [tab, setTab] = useState<'open' | 'decided'>('open');
   const [selected, setSelected] = useState('');
@@ -219,7 +220,7 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
     busyRef.current = false;
     statusRef.current = null;
     setStatus(null); setLoading(true); setActionUncertain(false); setLoadProblem(null); setActionProblem(null); setBusy(null);
-    setDetails(new Map()); setDetailProblem({}); setConfirmStop(null); setReport(null); setHistory(null); setSelected(''); setDeciding(false); setAsked(new Set());
+    setDetails(new Map()); setDetailProblem({}); setConfirmStop(null); setReport(null); setHistory(null); setChartProblem(null); setSelected(''); setDeciding(false); setAsked(new Set());
     setImportPath(''); setTimelineLimits({}); setFocusedEvidence({});
     let timer: ReturnType<typeof setTimeout> | undefined;
     const poll = async () => {
@@ -337,15 +338,16 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
   // The sweep and the chart change slowly: read them on open, every minute and after a decision.
   const loadSlow = useCallback(async () => {
     const currentGeneration = generation.current;
-    // The first read runs the sweep when there was none yet: minutes, so no 20 s limit.
-    const [sweep, chart] = await Promise.allSettled([
-      client.call<SweepReport>('system.sweep', {}),
-      rpc<History>('system.security.history', { days }),
-    ]);
-    if (!mounted.current || currentGeneration !== generation.current) return;
-    if (sweep.status === 'fulfilled') setReport(sweep.value);
-    else setActionProblem(`The security sweep could not be read: ${errorMessage(sweep.reason)}`);
-    if (chart.status === 'fulfilled') setHistory(chart.value);
+    const current = () => mounted.current && currentGeneration === generation.current;
+    // Each shows as it arrives: the chart is quick, while the first sweep read runs the sweep when
+    // there was none yet (minutes, so no 20 s limit).
+    const chart = rpc<History>('system.security.history', { days })
+      .then((value) => { if (current()) { setHistory(value); setChartProblem(null); } })
+      .catch((cause) => { if (current()) setChartProblem(errorMessage(cause)); });
+    const sweep = client.call<SweepReport>('system.sweep', {})
+      .then((value) => { if (current()) setReport(value); })
+      .catch((cause) => { if (current()) setActionProblem(`The security sweep could not be read: ${errorMessage(cause)}`); });
+    await Promise.all([chart, sweep]);
   }, [client, rpc, days]);
 
   useEffect(() => {
@@ -461,7 +463,7 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
         <span className="grow" />
         {[1, 7, 30].map((value) => <button key={value} type="button" className={`ct-seg${days === value ? ' on' : ''}`} onClick={() => setDays(value)}>{value === 1 ? '24 H' : `${value} D`}</button>)}
       </div>
-      <Chart history={history} highlight={highlight} label={item?.title} />
+      <Chart history={history} problem={chartProblem} highlight={highlight} label={item?.title} />
     </div>
 
     <div className="ct-sec-body">
@@ -828,7 +830,8 @@ function precedent(report: SweepReport | null, item: Item): { verdict: string; c
 }
 
 /** New findings per bucket, one line per priority; the selected item's buckets shaded. */
-function Chart({ history, highlight, label }: { history: History | null; highlight: number[]; label?: string }) {
+function Chart({ history, problem, highlight, label }: { history: History | null; problem: string | null; highlight: number[]; label?: string }) {
+  if (!history && problem) return <div className="ct-sec-chart"><p className="ct-asec-note ct-warn">The chart could not be read: {problem}</p></div>;
   if (!history || history.series.length === 0) return <div className="ct-sec-chart"><p className="ct-asec-note">{history ? 'Nothing recorded yet.' : 'Loading…'}</p></div>;
   const n = history.series.length;
   const max = Math.max(1, ...history.series.flat());

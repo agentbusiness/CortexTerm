@@ -143,7 +143,7 @@ pub async fn feed_within(
     };
     match fetched {
         Ok(bytes) => {
-            docs::put(name, url, bytes.clone(), now_ms());
+            docs::put(name, bytes.clone(), now_ms());
             Ok((bytes, None))
         }
         Err(error) => match docs::get(name).await {
@@ -152,19 +152,6 @@ pub async fn feed_within(
         },
     }
 }
-
-/// The software feeds' document names and addresses (what `migrate` moves in), the
-/// end-of-life lists aside (`eol-<product>.json`, from endoflife.date).
-pub const FEEDS: &[(&str, &str)] = &[
-    ("sofa-macos.json", SOFA_MACOS),
-    ("sofa-safari.json", SOFA_SAFARI),
-    (KEV_FILE, KEV),
-    ("electron.json", ELECTRON),
-    ("chrome-stable.json", CHROME),
-    ("firefox.json", FIREFOX),
-    ("homebrew-casks.json", CASKS),
-    ("malicious-extensions.csv", MALEXT),
-];
 
 fn take(part: &mut Part, label: &str, result: Result<(Vec<u8>, Option<u64>), String>) -> Option<Vec<u8>> {
     match result {
