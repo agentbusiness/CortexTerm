@@ -1,4 +1,4 @@
-//! Free threat-intelligence and lookup lists, kept as documents in the graph (`docs`): refreshed
+//! Free threat-intelligence and lookup lists, kept as cache files (`docs`): refreshed
 //! at most once a day (the larger tables once a week), used from the stored copy when offline.
 //!
 //! - threat lists (IPs and CIDRs): FireHOL level 1, abuse.ch Feodo Tracker, Spamhaus DROP, the Tor
@@ -59,11 +59,6 @@ pub fn protection_health() -> Vec<cc_protocol::contracts::system::ProtectionSens
     }).collect()
 }
 
-/// The list's address, by document name.
-pub fn url_of(name: &str) -> Option<&'static str> {
-    THREATS.iter().chain([&ASN, &OUI]).find(|f| f.file == name).map(|f| f.url)
-}
-
 /// Download the lists that are missing or stale. True when one changed. Failures keep the
 /// stored copy.
 pub async fn refresh() -> bool {
@@ -76,7 +71,7 @@ pub async fn refresh() -> bool {
         match client.get(feed.url).send().await {
             Ok(response) if response.status().is_success() => match response.bytes().await {
                 Ok(bytes) if bytes.len() > 64 => {
-                    docs::put(feed.file, feed.url, bytes.to_vec(), now_ms());
+                    docs::put(feed.file, bytes.to_vec(), now_ms());
                     changed = true;
                 }
                 _ => tracing::info!("feed {}: empty download", feed.name),

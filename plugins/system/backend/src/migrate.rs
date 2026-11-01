@@ -1,6 +1,6 @@
 //! Once: what earlier versions kept as files in the data folder (`sweep.json`, `ignored.json`,
 //! `alerts.json`, `schedules.json`, `traces.json`, `netwatch.json`, `netdigest.json`, `lan.json`,
-//! `persistence.json`, `agents.json`, `ports.json`, `cve/`, `feeds/`, `deep/`) is moved into the
+//! `persistence.json`, `agents.json`, `ports.json`, `cve/`, `deep/`) is moved into the
 //! graph, in the shapes the modules load, and the files are deleted once memory took every write.
 //! The secret keys (`keys/`) are moved into the Keychain by `keys::import_files`.
 
@@ -14,9 +14,6 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-/// Feeds earlier versions kept that nothing reads any more.
-const RETIRED_FEEDS: &[&str] = &["cisa-kev.json", "cisa-kev-v2.json"];
 
 #[derive(Default, Debug)]
 pub struct Moved {
@@ -52,36 +49,7 @@ pub async fn run() -> Moved {
         moved.files.push(file);
     };
 
-    // Feeds, with the time each was fetched.
-    for entry in std::fs::read_dir(dir.join("feeds")).into_iter().flatten().flatten() {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if RETIRED_FEEDS.contains(&name.as_str()) || name.ends_with(".tmp") || name.ends_with(".part") {
-            count("old feed files dropped", 1, path, &mut moved);
-            continue;
-        }
-        let url = crate::feeds::url_of(&name)
-            .map(str::to_owned)
-            .or_else(|| crate::inventory::FEEDS.iter().find(|(n, _)| *n == name).map(|(_, u)| (*u).to_owned()))
-            .or_else(|| name.strip_prefix("eol-").and_then(|r| r.strip_suffix(".json")).map(|p| format!("https://endoflife.date/api/{p}.json")));
-        let Some(url) = url else {
-            tracing::warn!("migrate: feeds/{name} is not a known list; it is left as it is");
-            continue;
-        };
-        let fetched = std::fs::metadata(&path).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64).unwrap_or(0);
-        let Ok(bytes) = std::fs::read(&path) else { continue };
-        let size = bytes.len();
-        if let Some(batches) = crate::docs::batches(&name, &url, &bytes, fetched) {
-            for batch in batches {
-                graph::put(batch);
-            }
-            count("feeds", 1, path, &mut moved);
-            *moved.counts.entry("feed bytes").or_default() += size;
-        }
-    }
-
     // The lists first: the network baseline below names each network's owner from them.
-    graph::flush(Duration::from_secs(300)).await;
     let _ = crate::docs::load_index().await;
 
     // The last sweep, then the findings the person ignored.
