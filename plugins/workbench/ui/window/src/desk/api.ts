@@ -422,3 +422,19 @@ export function shortPath(path: string, home: string): string {
 export function quote(word: string): string {
   return /^[\w@%+=:,./~-]+$/.test(word) ? word : `'${word.replace(/'/g, `'\\''`)}'`;
 }
+
+export interface SecurityObservation {
+  id: string; at: number; source: string; kind: string; severity: string; summary: string; rule: string; subject: string;
+  pid?: number | null; process_started?: number | null; parent_pid?: number | null; executable?: string | null;
+  process_started_us?: number | null; process_version?: number | null;
+  path?: string | null; remote?: string | null; port?: number | null; count: number;
+}
+export interface SecurityClaim { text: string; evidence: string[] }
+export interface SecurityInvestigation {
+  state: string; summary: SecurityClaim[]; alternatives: SecurityClaim[]; unknowns: string[]; next_steps: string[];
+  checked_at: number; error?: string | null; observations: SecurityObservation[];
+}
+export interface SecurityIncident {
+  id: string; key: string; first_at: number; last_at: number; title: string; severity: string; state: string;
+  observations: SecurityObservation[]; investigation?: SecurityInvestigation | null; revision: number; omitted_observations?: number;
+}

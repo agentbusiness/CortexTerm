@@ -118,7 +118,7 @@ Once installed, everything works offline.
 
 | Project | Holds |
 |---|---|
-| `db` | the app's records (`src/app.rs`): `(:Project)-[:HAS_SESSION]->(:Session)`, `(:Session)-[:CHILD_OF]->(:Session)`, their fields as properties (a deleted project stays, retired, for `memory.app.deleted`), the stream `app.sessions` of session changes, and `(:Project)-[:AT]->(:Folder {key: root})-[:IN]->(:Folder)…` up to the home folder (written through `memory.graph.put` when a project is put, and for every project at start); the journal streams `session.<id>` that frames before the move to journal files wrote (read once by the frame to move them into `<home>/journal/<id>.jsonl`, then dropped); settings (`src/settings.rs`) as a tree, `(:Settings {scope})-[:HAS_SECTION]->(:SettingSection)-[:HAS_SETTING]->(:Setting {typed value})` per scope (`global`, or a project id linked by `HAS_SETTINGS`), an object value a section, a list of anything but strings or numbers a section with `list: true` and members named `0`, `1`, …, and every change in the stream `settings`; the terminal's graph (below); global rules and style, the code-graph registry (`ProjectEntry`), global notes. Never one of the app's projects. |
+| `db` | the app's records (`src/app.rs`): `(:Project)-[:HAS_SESSION]->(:Session)`, `(:Session)-[:CHILD_OF]->(:Session)`, their fields as properties (a deleted project stays, retired, for `memory.app.deleted`), and `(:Project)-[:AT]->(:Folder {key: root})-[:IN]->(:Folder)…` up to the home folder (written through `memory.graph.put` when a project is put, and for every project at start); the journal streams `session.<id>` that frames before the move to journal files wrote (read once by the frame to move them into `<home>/journal/<id>.jsonl`, then dropped); settings (`src/settings.rs`) as a tree, `(:Settings {scope})-[:HAS_SECTION]->(:SettingSection)-[:HAS_SETTING]->(:Setting {typed value})` per scope (`global`, or a project id linked by `HAS_SETTINGS`), an object value a section, a list of anything but strings or numbers a section with `list: true` and members named `0`, `1`, …; the terminal's graph (below); global rules and style, the code-graph registry (`ProjectEntry`), global notes. Never one of the app's projects. |
 | `cc_p_<hash(project id)>` | one per repository: the code graph, its work state and its notes |
 | `cc_w_<hash(project, path)>` | one per attached agent workspace (see below) |
 | `traces` | traces of processes (`src/traces.rs`): one topic `trace.<id>` per trace kept 7 days, `Trace` nodes with the tree's temporal CPU, memory, GPU and disk writes and a list of the first error lines (`errors`), and a graph of programs, folders, hosts and ports. Written and read only through `memory.trace.*`; apart from memory, because traces are lent over the mesh. |
@@ -148,8 +148,7 @@ Every statement names its layers (`USE LAYER … WRITE LAYER …`):
   trace step, the innermost symbol covering the line, else the file; `IN_PACKAGE` the `Dependency` a
   quick fix upgrades; `FIXED_IN` a `Session`), `Security:Audit` (`src/security.rs`: a finding's
   trace, quick fix and history are `SecurityTraceStep` (`HAS_STEP`), `SecurityQuickFix`
-  (`QUICK_FIX`) and `SecurityStatusChange` (`CHANGED`) nodes, every status move also in the stream
-  `security.status`; indexes `security_finding_id`, `security_finding_status`, `security_audit_id`).
+  (`QUICK_FIX`) and `SecurityStatusChange` (`CHANGED`) nodes; indexes `security_finding_id`, `security_finding_status`, `security_audit_id`).
   No property holds JSON text: what an earlier version kept so is moved into nodes when read
   (settings, projects, sessions, trace errors) or at the record's next write (findings, contract
   lineage).

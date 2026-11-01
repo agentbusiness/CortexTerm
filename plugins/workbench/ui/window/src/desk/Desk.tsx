@@ -269,9 +269,9 @@ export function Desk() {
   }
   const selectedComputer = machineOptions.find((computer) => computer.node === (sideNode ?? ''))!;
   const cluster = useClusterLayout(machineOptions);
-  const { alerts: localAlerts } = useMachineAlerts(null);
+  const { needing: openAlerts } = useMachineAlerts(null);
   const sideAlerts = useMachineAlerts(sideNode);
-  const sideAlertCount = sideAlerts.alerts.filter((alert) => !alert.dismissed && alert.severity !== 'info').length;
+  const sideAlertCount = sideAlerts.needing;
   const details = sideDetails[sideNode ?? ''] ?? {};
   const sideRun = details.run ?? '', sidePid = details.pid ?? 0, sideTrace = details.trace ?? '';
   const setSideRun = useCallback((run: string) => setSideDetails((current) => ({ ...current, [sideNode ?? '']: { ...current[sideNode ?? ''], run } })), [sideNode, setSideDetails]);
@@ -465,7 +465,6 @@ export function Desk() {
   // --- attention -------------------------------------------------------------------------------
   const everyPane = doc.desks.flatMap((entry) => entry.panes.map((pane) => ({ desk: entry, pane, attention: live.attention(pane) })));
   const needsYou = everyPane.filter((entry) => NEEDS_YOU.has(entry.attention));
-  const openAlerts = localAlerts.filter((alert) => !alert.dismissed && alert.severity !== 'info');
   const back = useRef<{ desk: string; pane: string } | null>(null);
 
   const jumpNext = useCallback(() => {
@@ -593,7 +592,7 @@ export function Desk() {
     <>
       <span className="grow" />
       {needsYou.length > 0 && <button type="button" className="detent warn ct-band-action" onClick={jumpNext} title="Next that needs you (⌘J)">{needsYou.length} NEED YOU</button>}
-      {openAlerts.length > 0 && <button type="button" className="detent warn ct-band-action" onClick={openAlertsPane}>{openAlerts.length} ALERT{openAlerts.length > 1 ? 'S' : ''}</button>}
+      {openAlerts > 0 && <button type="button" className="detent warn ct-band-action" onClick={openAlertsPane}>{openAlerts} ALERT{openAlerts > 1 ? 'S' : ''}</button>}
       <span className={`ct-band-note ct-band-model${model?.extra?.source === 'borrowed' ? ' blue' : ''}`} title={modelProblem ?? modelLabel(model, modelProblem)}>{modelLabel(model, modelProblem)}</span>
       <button type="button" className="detent ct-band-gear" onClick={() => setSettings((open) => (open === null ? '' : null))} title="Settings (⌘,)" aria-label="Settings">
         <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
