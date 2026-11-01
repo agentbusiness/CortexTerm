@@ -23,7 +23,7 @@ interface Plan { steps: PlannedStep[]; freed: number }
 interface Applied { outcomes: { id: string; ok: boolean; freed: number; detail: string }[]; freed: number }
 
 const KINDS: [string, string][] = [['build', 'BUILD'], ['cache', 'CACHES'], ['agent', 'AGENTS'], ['duplicate', 'DUPES'], ['temp', 'TEMP'], ['model', 'MODELS'], ['stale', 'FORGOTTEN'], ['trash', 'TRASH']];
-const PHASES: Record<string, string> = { places: 'KNOWN PLACES', walk: 'HOME FOLDER', duplicates: 'DUPLICATES', checks: 'WHO USES WHAT' };
+const PHASES: Record<string, string> = { places: 'KNOWN PLACES', walk: 'THE DISK', duplicates: 'DUPLICATES', checks: 'WHO USES WHAT' };
 const HOW: Record<string, string> = { delete: 'DELETED, COMES BACK', trash: 'TO THE TRASH', command: "TOOL'S OWN CLEAN", clone: 'COPIES BECOME CLONES', empty: 'EMPTIED FOR GOOD' };
 
 function size(bytes: number) {

@@ -1,14 +1,19 @@
-//! A Rust `target` folder of a project in use: what cargo will not use again. Measured at scan
-//! time and worked out afresh just before a clean, so a build in between is respected.
+//! A Rust `target` folder of a project in use: what its latest builds no longer use. Worked out
+//! at scan time and again just before a clean, so a build in between is respected.
 //!
 //! - A profile (`debug`, `release`, `<triple>/debug`…) not built for 30 days while another one
 //!   was goes whole.
-//! - In `deps`, `build`, `.fingerprint` and `incremental`, cargo names each unit
-//!   `<name>-<16 hex hash>`. When a name has more than one hash, a hash not built within 30 days
-//!   of that name's newest one is an older build (other features, another rustc) and goes.
-//! - In `incremental/<crate>-<hash>/`, rustc's older `s-…` sessions go; the newest one stays.
+//! - Otherwise cargo's own record decides. Each unit has a `.fingerprint/<package>-<hash>/`
+//!   folder whose JSON lists the fingerprints of the units it was built from, and whose hash file
+//!   holds its own (16 hex digits of the little-endian bytes). The latest build of each of the
+//!   project's own packages (per profile, target kind and profile settings, so `cargo check` and
+//!   `cargo build` both stay) is followed through those links; a unit none of them reaches is
+//!   an earlier build (a version bump, other features, an older rustc, a removed dependency) and
+//!   its files in `deps`, `build`, `examples` and `.fingerprint` go. A build script's compiled
+//!   program stays with its package's run.
+//! - In `incremental/<crate>-<id>/`, rustc's older `s-…` sessions go; the newest one stays.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -21,6 +26,10 @@ fn mtime_ms(path: &Path) -> u64 {
 
 fn children(dir: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(dir).map(|e| e.flatten().map(|e| e.path()).collect()).unwrap_or_default()
+}
+
+fn name(path: &Path) -> String {
+    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 /// The profile folders: those holding a `.fingerprint` folder, one or two levels down.
@@ -48,27 +57,117 @@ fn unit(name: &str) -> Option<(String, String)> {
     (hash.len() == 16 && hash.chars().all(|c| c.is_ascii_hexdigit())).then(|| (base.to_owned(), hash.to_owned()))
 }
 
-/// Older hashes of the same unit name inside one folder.
-fn older_units(dir: &Path, out: &mut Vec<PathBuf>) {
-    let mut names: HashMap<String, HashMap<String, (u64, Vec<PathBuf>)>> = HashMap::new();
-    for path in children(dir) {
-        let Some(file) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
-        let Some((base, hash)) = unit(&file) else { continue };
-        let entry = names.entry(base).or_default().entry(hash).or_default();
-        entry.0 = entry.0.max(mtime_ms(&path));
-        entry.1.push(path);
+/// The packages of the project: its own and its workspace members' (`dir` and `dir/*` entries).
+fn packages(project: &Path) -> HashSet<String> {
+    let read = |dir: &Path| -> Option<toml::Table> { std::fs::read_to_string(dir.join("Cargo.toml")).ok()?.parse().ok() };
+    let package = |table: &toml::Table| table.get("package")?.get("name")?.as_str().map(str::to_owned);
+    let mut out = HashSet::new();
+    let Some(top) = read(project) else { return out };
+    out.extend(package(&top));
+    let members = top.get("workspace").and_then(|w| w.get("members")).and_then(|m| m.as_array()).cloned().unwrap_or_default();
+    for member in members.iter().filter_map(|m| m.as_str()) {
+        let dirs = match member.strip_suffix("/*") {
+            Some(parent) => children(&project.join(parent)),
+            None => vec![project.join(member)],
+        };
+        out.extend(dirs.iter().filter_map(|dir| read(dir)).filter_map(|t| package(&t)));
     }
-    for hashes in names.values() {
-        if hashes.len() < 2 {
-            continue;
-        }
-        let newest = hashes.values().map(|(at, _)| *at).max().unwrap_or(0);
-        for (at, paths) in hashes.values() {
-            if *at + OLDER < newest {
-                out.extend(paths.iter().cloned());
+    out
+}
+
+struct Unit {
+    profile: usize,
+    package: String,
+    hash: String,
+    /// The fingerprints it was built from.
+    deps: Vec<u64>,
+    /// Its target kinds (`bin-cc-system`, `lib-serde`…) with their profile settings' hash.
+    kinds: Vec<(String, u64)>,
+    built_ms: u64,
+}
+
+fn read_unit(dir: &Path, profile: usize, own: &mut Vec<u64>) -> Option<Unit> {
+    let (package, hash) = name(dir).rsplit_once('-').map(|(p, h)| (p.to_owned(), h.to_owned()))?;
+    if hash.len() != 16 {
+        return None;
+    }
+    let mut unit = Unit { profile, package, hash, deps: Vec::new(), kinds: Vec::new(), built_ms: 0 };
+    for file in children(dir) {
+        let file_name = name(&file);
+        if let Some(kind) = file_name.strip_suffix(".json") {
+            let Ok(text) = std::fs::read_to_string(&file) else { continue };
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+            for dep in json["deps"].as_array().into_iter().flatten() {
+                unit.deps.extend(dep.get(3).and_then(|v| v.as_u64()));
+            }
+            unit.kinds.push((kind.to_owned(), json["profile"].as_u64().unwrap_or(0)));
+            unit.built_ms = unit.built_ms.max(mtime_ms(&file));
+        } else if !file_name.starts_with("dep-") && !file_name.starts_with("output-") && file_name != "invoked.timestamp" {
+            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            let hex = text.trim();
+            if let (16, Ok(value)) = (hex.len(), u64::from_str_radix(hex, 16)) {
+                // The file holds the bytes little-endian first.
+                own.push(value.swap_bytes());
             }
         }
     }
+    Some(unit)
+}
+
+/// Per profile, the unit hashes the latest builds no longer reach. A profile where none of the
+/// project's packages was built is left alone.
+fn unused_units(project: &Path, profiles: &[PathBuf]) -> Vec<HashSet<String>> {
+    let mut unused = vec![HashSet::new(); profiles.len()];
+    let packages = packages(project);
+    if packages.is_empty() {
+        return unused;
+    }
+    let mut units: Vec<Unit> = Vec::new();
+    let mut by_fingerprint: HashMap<u64, usize> = HashMap::new();
+    for (index, profile) in profiles.iter().enumerate() {
+        for dir in children(&profile.join(".fingerprint")) {
+            let mut own = Vec::new();
+            if let Some(unit) = read_unit(&dir, index, &mut own) {
+                by_fingerprint.extend(own.into_iter().map(|fp| (fp, units.len())));
+                units.push(unit);
+            }
+        }
+    }
+    // The latest build of each (profile, package, kind, settings); one not built for 30 days
+    // while the same kind was built with other settings is old too.
+    let mut latest: HashMap<(usize, &str, &str, u64), (u64, usize)> = HashMap::new();
+    let mut newest: HashMap<(usize, &str, &str), u64> = HashMap::new();
+    for (i, unit) in units.iter().enumerate().filter(|(_, u)| packages.contains(&u.package)) {
+        for (kind, settings) in &unit.kinds {
+            let slot = latest.entry((unit.profile, &unit.package, kind, *settings)).or_insert((unit.built_ms, i));
+            if unit.built_ms > slot.0 {
+                *slot = (unit.built_ms, i);
+            }
+            let top = newest.entry((unit.profile, &unit.package, kind)).or_default();
+            *top = (*top).max(unit.built_ms);
+        }
+    }
+    let mut stack: Vec<usize> = latest
+        .iter()
+        .filter(|((profile, package, kind, _), (at, _))| at + OLDER >= newest[&(*profile, *package, *kind)])
+        .map(|(_, (_, i))| *i)
+        .collect();
+    let mut live = vec![false; units.len()];
+    while let Some(i) = stack.pop() {
+        if std::mem::replace(&mut live[i], true) {
+            continue;
+        }
+        stack.extend(units[i].deps.iter().filter_map(|fp| by_fingerprint.get(fp)));
+    }
+    let live_packages: HashSet<(usize, &str)> = units.iter().zip(&live).filter(|(_, l)| **l).map(|(u, _)| (u.profile, u.package.as_str())).collect();
+    let built: HashSet<usize> = units.iter().zip(&live).filter(|(u, l)| **l && packages.contains(&u.package)).map(|(u, _)| u.profile).collect();
+    for (unit, live) in units.iter().zip(&live) {
+        let script = unit.kinds.iter().any(|(kind, _)| kind.starts_with("build-script-build"));
+        if !live && built.contains(&unit.profile) && !(script && live_packages.contains(&(unit.profile, unit.package.as_str()))) {
+            unused[unit.profile].insert(unit.hash.clone());
+        }
+    }
+    unused
 }
 
 /// rustc's older incremental sessions (`s-…` folders and their `.lock` files).
@@ -93,18 +192,28 @@ fn older_sessions(incremental: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Everything in `target` cargo will not use again.
+/// Everything in `target` the latest builds no longer use.
 pub fn cargo(target: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let profiles: Vec<(u64, PathBuf)> = profiles(target).into_iter().map(|p| (built_ms(&p), p)).collect();
-    let newest = profiles.iter().map(|(at, _)| *at).max().unwrap_or(0);
-    for (at, profile) in &profiles {
-        if *at + OLDER < newest {
-            out.push(profile.clone());
-            continue;
+    let all = profiles(target);
+    let built: Vec<u64> = all.iter().map(|p| built_ms(p)).collect();
+    let newest = built.iter().copied().max().unwrap_or(0);
+    let mut current = Vec::new();
+    for (profile, at) in all.into_iter().zip(built) {
+        if at + OLDER < newest {
+            out.push(profile);
+        } else {
+            current.push(profile);
         }
-        for sub in ["deps", "build", ".fingerprint", "incremental"] {
-            older_units(&profile.join(sub), &mut out);
+    }
+    let project = target.parent().unwrap_or(target);
+    for (profile, unused) in current.iter().zip(unused_units(project, &current)) {
+        for sub in ["deps", "build", "examples", ".fingerprint"] {
+            for path in children(&profile.join(sub)) {
+                if unit(&name(&path)).is_some_and(|(_, hash)| unused.contains(&hash)) {
+                    out.push(path);
+                }
+            }
         }
         older_sessions(&profile.join("incremental"), &mut out);
     }

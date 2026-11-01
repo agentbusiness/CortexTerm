@@ -30,6 +30,9 @@ pub struct Recipe {
     pub min_mb: Option<u64>,
     pub xcode: bool,
     pub worktree: bool,
+    /// The command cleans through the program that uses the place (Docker), so its open files
+    /// do not stop it.
+    pub open_ok: bool,
 }
 
 impl Recipe {
@@ -96,10 +99,12 @@ pub fn load() -> Result<Vec<Recipe>, String> {
     Ok(file.recipe.into_iter().filter(|r| !r.id.is_empty()).collect())
 }
 
-/// `~`, `$TMPDIR` and `$UID` expanded.
+/// `~`, `$TMPDIR` (its real path: `/private/var/folders/…` on macOS, as the walk meets it) and
+/// `$UID` expanded.
 pub fn expand(path: &str, home: &Path) -> PathBuf {
     let uid = unsafe { libc::getuid() }.to_string();
     let tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
+    let tmp = std::fs::canonicalize(&tmp).map(|p| p.to_string_lossy().into_owned()).unwrap_or(tmp);
     let path = path.replace("$UID", &uid).replace("$TMPDIR", tmp.trim_end_matches('/'));
     match path.strip_prefix('~') {
         Some(rest) => home.join(rest.trim_start_matches('/')),

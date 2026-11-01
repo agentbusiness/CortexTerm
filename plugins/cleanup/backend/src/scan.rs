@@ -1,4 +1,4 @@
-//! One scan: the recipes' fixed places, the walk of the home folder, the duplicate search, then
+//! One scan: the recipes' fixed places, the walk of the whole disk, the duplicate search, then
 //! the checks that make a find an [`Item`]: age and size, who uses it, git, and for a project
 //! still worked on, only its older builds. Runs on a low-priority thread pool.
 
@@ -6,6 +6,7 @@ use crate::inuse::Snapshot;
 use crate::recipes::{self, Recipe};
 use crate::walk::{self, Agg, Counters, Raw, Walk};
 use crate::{dupes, git, stale};
+use rayon::prelude::*;
 use cc_protocol::contracts::cleanup::{Item, Progress};
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
@@ -73,20 +74,29 @@ pub fn run(input: Input, live: &Live) -> Result<Output, String> {
     for never in crate::clean::NEVER {
         skip.insert(recipes::expand(never, home));
     }
+    // Each start of the walk is read once, by its own walk.
+    let roots = walk::roots(home);
+    skip.extend(roots.iter().cloned());
     let walker = Walk::new(home, &recipes, &skip, &live.counters);
     let mut raws: Vec<Raw> = Vec::new();
 
     live.phase("places");
+    // A wide place (`~/Library/Caches/*`) leaves what a more particular recipe reads to it.
+    let roots_of: Vec<(usize, PathBuf)> =
+        recipes.iter().enumerate().flat_map(|(i, r)| r.paths.iter().map(move |e| (i, recipes::root_of(e, home)))).collect();
     for (index, recipe) in recipes.iter().enumerate() {
         for entry in &recipe.paths {
             for place in recipes::places(entry, home) {
                 if input.skip.contains(&place) || live.counters.stop.load(Ordering::Relaxed) {
                     continue;
                 }
+                if roots_of.iter().any(|(other, root)| *other != index && root.starts_with(&place)) {
+                    continue;
+                }
                 let mut agg = match std::fs::symlink_metadata(&place) {
                     Ok(meta) if meta.is_dir() => {
                         let mut w = Walk::new(home, &[], &skip, &live.counters);
-                        w.dev = meta.dev();
+                        w.devs = vec![meta.dev()];
                         let agg = w.walk(&place, 0, true, recipe.kind == "model");
                         walker.big.lock().unwrap_or_else(|e| e.into_inner()).extend(walk::take_big(&w));
                         agg
@@ -103,7 +113,9 @@ pub fn run(input: Input, live: &Live) -> Result<Output, String> {
     }
 
     live.phase("walk");
-    walker.walk(home, 0, false, true);
+    roots.par_iter().for_each(|root| {
+        walker.walk(root, walk::depth(root), false, true);
+    });
     raws.extend(std::mem::take(&mut *walker.found.lock().unwrap_or_else(|e| e.into_inner())));
 
     live.phase("duplicates");
@@ -181,6 +193,10 @@ fn item(raw: &Raw, recipe: Option<&Recipe>, snapshot: &Snapshot, input: &Input, 
     if input.skip_ids.contains(&path) {
         return None;
     }
+    // Another user's (or the system's) files are counted, never offered: this user cannot clean them.
+    if std::fs::symlink_metadata(&raw.path).map_or(true, |meta| meta.uid() != walk::uid()) {
+        return None;
+    }
     let (title, kind, safety, why, regenerate, id, min_bytes, min_age) = match recipe {
         Some(r) => (r.title.clone(), r.kind.clone(), r.safety.clone(), r.why.clone(), r.regenerate.clone(), r.id.clone(), r.min_bytes(), r.min_age_days),
         None => (
@@ -208,22 +224,28 @@ fn item(raw: &Raw, recipe: Option<&Recipe>, snapshot: &Snapshot, input: &Input, 
     }
     let active = project.map(|p| project_active_ms(p, &input.runs)).unwrap_or(0).max(agg.newest_ms) + ACTIVE_DAYS * DAY_MS > now;
     let mut scope = "whole";
+    let mut current = false;
     let mut users;
     if recipe.is_some_and(|r| r.stale == "cargo") && active {
-        // Only what cargo will not use again: a running build's lock, or a file open in it, stops it.
+        // Only what the latest builds no longer use; a running build's lock, or a file open in
+        // it, stops it. With nothing old, the whole folder is offered as the current build.
         let parts = stale::cargo(&raw.path);
-        agg = parts.iter().map(|p| walk::measure(p)).fold(Agg::default(), |mut sum, a| {
+        let old = parts.iter().map(|p| walk::measure(p)).fold(Agg::default(), |mut sum, a| {
             sum.bytes += a.bytes;
             sum.files += a.files;
             sum.newest_ms = sum.newest_ms.max(a.newest_ms);
             sum
         });
-        if agg.bytes < min_bytes {
-            return None;
+        if old.bytes >= min_bytes {
+            agg = old;
+            scope = "stale";
+            why = format!("Earlier builds the latest ones no longer use ({} parts); the current build stays.", parts.len());
+            users = snapshot.users(&raw.path, None, recipe);
+        } else {
+            current = true;
+            why = "The current build of a project you are working on: cleaning it means cargo builds all of it again.".into();
+            users = snapshot.users(&raw.path, project, recipe);
         }
-        scope = "stale";
-        why = format!("Older builds cargo will not use again ({} parts); the current build stays.", parts.len());
-        users = snapshot.users(&raw.path, None, recipe);
     } else {
         users = snapshot.users(&raw.path, project, recipe);
     }
@@ -232,7 +254,7 @@ fn item(raw: &Raw, recipe: Option<&Recipe>, snapshot: &Snapshot, input: &Input, 
     }
     let state = if !users.is_empty() {
         "in_use"
-    } else if scope == "whole" && kind != "trash" && agg.newest_ms + WARM_DAYS * DAY_MS > now {
+    } else if current || (scope == "whole" && kind != "trash" && agg.newest_ms + WARM_DAYS * DAY_MS > now) {
         "warm"
     } else {
         "open"

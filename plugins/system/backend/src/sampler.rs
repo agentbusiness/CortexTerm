@@ -568,7 +568,10 @@ impl Sampler {
                 fresh_ports.push(port);
             }
             self.watch.ports.seen.insert(key.clone(), now);
-            if fresh && port.public && !self.watch.ports_baseline {
+            // Apple's own services (Handoff, AirPlay, sharing) open ports as part of their job;
+            // they are recorded with the rest, not alerted.
+            let apple = || exe_of.get(&port.pid).is_some_and(|exe| !exe.is_empty() && crate::codesign::check(std::path::Path::new(exe)).apple);
+            if fresh && port.public && !self.watch.ports_baseline && !apple() {
                 found.push(Candidate {
                     key: format!("port:{key}"),
                     alert: Alert {

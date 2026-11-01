@@ -1,7 +1,10 @@
-//! The parallel walk. Sizes are bytes on disk (allocated blocks), a hard-linked file counted once,
-//! symbolic links never followed, and the walk stays on the home folder's volume. A folder a
-//! recipe recognises is measured whole and not looked into further; a folder the person keeps is
-//! not read at all, which is what makes "keep" save scanning time.
+//! The parallel walk of the whole disk: every folder of the data volume this user can read (on
+//! macOS the places `/usr/share/firmlinks` names: `/Users`, `/Applications`, `/Library`, `/opt`,
+//! `/private`, `/usr/local`…; elsewhere `/` and the home folder's volume). Sizes are bytes on disk
+//! (allocated blocks), a hard-linked file counted once, symbolic links never followed, other
+//! volumes never entered. A folder a recipe recognises is measured whole and not looked into
+//! further; a folder the person keeps is not read at all, which is what makes "keep" save
+//! scanning time. Only this user's files become finds: the rest is counted, not offered.
 
 use crate::recipes::Recipe;
 use rayon::prelude::*;
@@ -64,7 +67,9 @@ pub struct Counters {
 
 pub struct Walk<'a> {
     pub home: &'a Path,
-    pub dev: u64,
+    /// The volumes the walk may enter.
+    pub devs: Vec<u64>,
+    uid: u32,
     pub recipes: &'a [Recipe],
     /// Not read at all: kept and postponed items, and the recipes' fixed places.
     pub skip: &'a HashSet<PathBuf>,
@@ -89,12 +94,42 @@ fn private_folder(name: &str) -> bool {
         || [".photoslibrary", ".musiclibrary", ".tvlibrary", ".app", ".fcpbundle", ".band", ".logicx"].iter().any(|s| name.ends_with(s))
 }
 
+/// Where the walk starts: the data volume's places, each read as the path people know it by.
+pub fn roots(home: &Path) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = std::fs::read_to_string("/usr/share/firmlinks")
+        .map(|text| text.lines().filter_map(|line| line.split('\t').next()).map(PathBuf::from).collect())
+        .unwrap_or_default();
+    // `/Volumes` holds other disks' mount points.
+    roots.retain(|root| root != Path::new("/Volumes") && root.is_dir());
+    if roots.is_empty() {
+        roots.push(PathBuf::from("/"));
+    }
+    let dev = |p: &Path| std::fs::metadata(p).map(|m| m.dev()).ok();
+    if !roots.iter().any(|root| home.starts_with(root) && dev(root) == dev(home)) {
+        roots.push(home.to_path_buf());
+    }
+    roots
+}
+
+/// A path's depth below `/` (`/Users/ana` is 2).
+pub fn depth(path: &Path) -> usize {
+    path.components().count().saturating_sub(1)
+}
+
+pub fn uid() -> u32 {
+    // SAFETY: getuid cannot fail.
+    unsafe { libc::getuid() }
+}
+
 impl<'a> Walk<'a> {
     pub fn new(home: &'a Path, recipes: &'a [Recipe], skip: &'a HashSet<PathBuf>, counters: &'a Counters) -> Self {
-        let dev = std::fs::metadata(home).map(|m| m.dev()).unwrap_or(0);
+        let mut devs: Vec<u64> = roots(home).iter().filter_map(|root| std::fs::metadata(root).ok()).map(|m| m.dev()).collect();
+        devs.sort_unstable();
+        devs.dedup();
         Self {
             home,
-            dev,
+            devs,
+            uid: uid(),
             recipes,
             skip,
             counters,
@@ -105,7 +140,7 @@ impl<'a> Walk<'a> {
         }
     }
 
-    /// One folder and everything below. `depth` is the folder's depth below home (home is 0);
+    /// One folder and everything below. `depth` is the folder's depth below `/` ([`depth`]);
     /// `measure` only counts (inside an item), `big` collects large files for the duplicates.
     pub fn walk(&self, dir: &Path, depth: usize, measure: bool, big: bool) -> Agg {
         let mut agg = Agg::default();
@@ -136,7 +171,7 @@ impl<'a> Walk<'a> {
             agg.newest_ms = agg.newest_ms.max(mtime_ms(&meta));
             self.counters.files.fetch_add(1, Ordering::Relaxed);
             self.counters.bytes.fetch_add(bytes, Ordering::Relaxed);
-            if big && meta.len() >= BIG_FILE && kind.is_file() {
+            if big && meta.len() >= BIG_FILE && kind.is_file() && meta.uid() == self.uid {
                 self.big.lock().unwrap_or_else(|e| e.into_inner()).push(Big {
                     path: entry.path(),
                     len: meta.len(),
@@ -156,14 +191,14 @@ impl<'a> Walk<'a> {
 
     fn folder(&self, folder: &Path, parent: &str, depth: usize, measure: bool, big: bool) -> Agg {
         let Ok(meta) = std::fs::symlink_metadata(folder) else { return Agg::default() };
-        if meta.dev() != self.dev {
+        if !self.devs.contains(&meta.dev()) {
             return Agg::default();
         }
         if measure {
             return self.walk(folder, depth, true, big);
         }
         let name = folder.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        if self.skip.contains(folder) || private_folder(&name) || (depth == 1 && name == "Library") {
+        if self.skip.contains(folder) || private_folder(&name) {
             return Agg::default();
         }
         if let Some(found) = self.recognise(folder, &name, parent) {
@@ -171,7 +206,9 @@ impl<'a> Walk<'a> {
         }
         let agg = self.walk(folder, depth, false, big);
         let old = now_ms().saturating_sub(STALE_DAYS * 86_400_000);
-        if (2..=4).contains(&depth) && !agg.has_item && agg.bytes >= STALE_BYTES && agg.newest_ms > 0 && agg.newest_ms < old {
+        // Three to six levels below `/`, never a folder right in the home (Documents, Movies…).
+        let stale = (3..=6).contains(&depth) && folder.parent() != Some(self.home) && meta.uid() == self.uid;
+        if stale && !agg.has_item && agg.bytes >= STALE_BYTES && agg.newest_ms > 0 && agg.newest_ms < old {
             self.stale.lock().unwrap_or_else(|e| e.into_inner()).push((folder.to_path_buf(), agg));
         }
         agg
@@ -184,7 +221,7 @@ impl<'a> Walk<'a> {
                 continue;
             }
             let Some(project) = recipe.project_of(folder) else { continue };
-            if !recipe.beside_ok(&project) || crate::git::tracked(folder) || (recipe.ignored && crate::git::ignored(folder) == Some(false)) {
+            if !recipe.beside_ok(&project) || crate::git::tracked(folder) || (recipe.ignored && crate::git::ignored(folder) != Some(true)) {
                 continue;
             }
             let targets: Vec<PathBuf> = if recipe.each {
@@ -221,7 +258,7 @@ pub fn measure(path: &Path) -> Agg {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => {
             let mut walk = walk;
-            walk.dev = meta.dev();
+            walk.devs = vec![meta.dev()];
             walk.walk(path, 0, true, false)
         }
         Ok(meta) if !meta.file_type().is_symlink() => Agg { bytes: meta.blocks() * 512, files: 1, newest_ms: mtime_ms(&meta), has_item: false },

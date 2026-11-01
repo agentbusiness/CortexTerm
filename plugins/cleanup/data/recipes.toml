@@ -1,21 +1,23 @@
 # What the cleanup scan knows (plugins/cleanup/README.md). Each recipe finds one kind of thing:
 #
-#   names    folder names met while walking the home folder. "a/b" is a folder b inside a folder a.
+#   names    folder names met while walking the disk. "a/b" is a folder b inside a folder a.
 #            The folder's project is its parent (for "a/b", a's parent).
 #   beside   with names: the project holds one of these files ("*.csproj" matches by suffix).
 #   inside   with names: the folder holds one of these.
 #   paths    fixed places ("~", "$TMPDIR" and "$UID" are expanded). A last component "*" makes each
-#            entry its own item.
+#            entry its own item. A wide place leaves what another recipe's place holds to it.
 #   kind     build | cache | agent | temp | model | trash (contracts/cleanup.rs)
 #   safety   regenerable: comes back by itself or with `regenerate`, deleted outright.
 #            review: the person's files or history, moved to the Trash, never cleaned by the AI.
-#   command  run instead of deleting ({path}, {project}); no shell.
+#   command  run instead of deleting ({path}, {name}: its last part, {project}); no shell.
+#   open_ok  the command cleans through the program using the place, so open files do not stop it.
 #   programs these programs working inside the project mean it is in use.
 #   apps     these programs running at all mean it is in use.
 #   each     with names: every entry of the folder is its own item.
 #   locks    files under the item a running tool holds a lock on (a build in progress).
 #   stale    "cargo": while the project is active, only older builds go (README).
-#   ignored  in a git repository the folder must be ignored by git (ambiguous names).
+#   ignored  the folder must be in a git repository that ignores it (ambiguous names; a package's own
+#            dist outside a repository stays).
 #   min_age_days  offered only when nothing inside changed for this long.
 #   min_mb   offered only from this size (20 when absent).
 #   xcode    read DerivedData's info.plist for its project.
@@ -29,7 +31,7 @@ title = "Rust build output"
 kind = "build"
 safety = "regenerable"
 names = ["target"]
-beside = ["Cargo.toml"]
+beside = ["Cargo.toml", "Cargo.lock"]
 regenerate = "cargo build"
 programs = ["cargo", "rustc", "rust-analyzer", "bacon", "cargo-watch"]
 locks = ["debug/.cargo-lock", "release/.cargo-lock"]
@@ -421,6 +423,53 @@ paths = ["~/.lmstudio/models/*", "~/.cache/lm-studio/models/*"]
 apps = ["LM Studio"]
 min_age_days = 30
 why = "Models downloaded in LM Studio."
+
+# ---- Wide places: every app's cache ------------------------------------------------------------
+
+[[recipe]]
+id = "app-caches"
+title = "App cache"
+kind = "cache"
+safety = "regenerable"
+paths = ["~/Library/Caches/*"]
+min_mb = 50
+regenerate = "the app fills it again as it needs"
+why = "An app's cache folder; macOS treats these as disposable and the app rebuilds what it needs."
+
+[[recipe]]
+id = "xdg-cache"
+title = "Tool cache"
+kind = "cache"
+safety = "regenerable"
+paths = ["~/.cache/*"]
+min_mb = 100
+min_age_days = 7
+regenerate = "the tool downloads or builds it again"
+why = "A command-line tool's cache folder (~/.cache); the tool makes it again."
+
+[[recipe]]
+id = "docker-data"
+title = "Docker images, containers and build cache"
+kind = "cache"
+safety = "review"
+paths = ["~/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw", "~/.docker/desktop/vms/0/data/Docker.raw"]
+command = "docker system prune --all --force"
+open_ok = true
+min_mb = 1024
+regenerate = "docker pull and docker build"
+why = "Docker Desktop's disk. Cleaning removes stopped containers, unused images, networks and the build cache; running containers and volumes stay. Docker gives the space back to macOS over the next minutes."
+
+[[recipe]]
+id = "rustup-toolchains"
+title = "Rust toolchain"
+kind = "cache"
+safety = "review"
+paths = ["~/.rustup/toolchains/*"]
+command = "rustup toolchain uninstall {name}"
+min_mb = 200
+min_age_days = 30
+regenerate = "rustup installs it again when a project asks for it"
+why = "An installed Rust compiler version, not updated for a month. Projects pin theirs in rust-toolchain.toml; check that none of yours still names it."
 
 # ---- Temporary files and the Trash --------------------------------------------------------------
 

@@ -450,9 +450,9 @@ impl Watch {
         let odd_place = ["/tmp/", "/private/tmp/", "/var/tmp/", "/private/var/tmp/", "/Users/Shared/"].iter().any(|p| exe.starts_with(p))
             || exe.starts_with("/private/var/folders/") && !exe.contains(".app/")
             || exe.starts_with(&format!("{home}/Downloads/"));
-        // This app's own bundle (CortexTerm and the plugins it ships).
+        // This app's own bundle (CortexTerm and the plugins it ships), and the Cortex apps' homes.
         let own = std::env::current_exe().ok().map(|p| p.display().to_string()).and_then(|p| p.find(".app/").map(|end| p[..end + 5].to_owned()));
-        let built_here = ["/target/debug/", "/target/release/", "/DerivedData/", "/.cortexterm/", "/.cargo/bin/", "/node_modules/"]
+        let built_here = ["/target/debug/", "/target/release/", "/DerivedData/", "/.cortexterm/", "/.cortexcode/", "/.cargo/bin/", "/node_modules/"]
             .iter()
             .any(|p| exe.contains(p))
             || own.is_some_and(|own| exe.starts_with(&own));
@@ -687,17 +687,21 @@ impl Watch {
                         && !MAJOR.contains(&owner.asn)
                     {
                         starts.clear();
-                        found.push(candidate(
-                            format!("network:beacon:{}:{}", info.key, flow.remote),
-                            "warn",
-                            format!(
-                                "{who} opens a new connection to {to} like clockwork, about every {} (regularity {:.0}%); malware calls home this way.",
-                                crate::util::duration_text(every),
-                                score * 100.0
-                            ),
-                            *pid,
-                            &info.exe,
-                        ));
+                        let every = crate::util::duration_text(every);
+                        // Signed software and what was built here check in on a timer all the time;
+                        // a beacon alerts when nothing vouches for the program.
+                        let unvouched = (info.unsigned && !info.built_here) || info.quarantined || info.odd_place;
+                        if unvouched {
+                            found.push(candidate(
+                                format!("network:beacon:{}:{}", info.key, flow.remote),
+                                "warn",
+                                format!("{who} opens a new connection to {to} like clockwork, about every {every} (regularity {:.0}%); malware calls home this way.", score * 100.0),
+                                *pid,
+                                &info.exe,
+                            ));
+                        } else {
+                            note(&info.app, "network", "info", format!("{} checks in with {} about every {every}, a timer like most signed software has.", info.app, owner.label()));
+                        }
                     }
                 }
             }

@@ -1,7 +1,7 @@
 /**
- * workbench.band@1 — updates. In the band only "Restart to update" when a newer frame is staged; it is
- * the band's first item (order 10), so it takes the empty middle and the card at the right stays put.
- * At the bottom right: the round, every update of a check together, one row per plugin with where
+ * workbench.band@1 — updates, drawn at the bottom right (nothing in the band itself). A newer frame
+ * staged: a card says it is ready and that the app restarts by itself once nothing runs (what it
+ * waits for, then "Restarting"), with Restart now. Above it: the round, every update of a check together, one row per plugin with where
  * it stands; it leaves by itself a few seconds after the last one is done (a failure stays until
  * hidden). Below it, one question at a time: a plugin the user changed that has a newer version,
  * until answered (use the newer version and drop the changes, or keep theirs; Settings > History
@@ -25,7 +25,7 @@ interface Status {
   state: string;
   detail?: string;
   error?: string | null;
-  restart?: { running: string; staged: string } | null;
+  restart?: { running: string; staged: string; waiting?: string } | null;
   pending?: Pending[];
   waiting?: string[];
   recent?: Applied[];
@@ -134,8 +134,11 @@ function Updates() {
     const timer = setTimeout(() => redraw((n) => n + 1), Math.max(0, last + SHOWN_MS - Date.now()) + 50);
     return () => clearTimeout(timer);
   }, [stays, last]);
+  const [restartHidden, setRestartHidden] = useState<string | null>(null);
   if (!data) return null;
   const showRound = rows.length > 0 && hidden !== signature && (stays || Date.now() - last < SHOWN_MS);
+  const restarting = data.state === 'restarting';
+  const restart = data.restart && (restarting || restartHidden !== data.restart.staged) ? data.restart : null;
 
   const act = async (key: string, method: string, params: object) => {
     setBusy(key);
@@ -150,12 +153,31 @@ function Updates() {
     }
   };
 
-  const band = data.restart ? (
-    <button className="detent cx-status cx-attn" type="button" disabled={busy === 'restart'}
-      title={`CortexTerm ${data.restart.staged} is ready (running ${data.restart.running}). Restarting stops every run and the window, then starts again.`}
-      onClick={() => void act('restart', 'update.restart', {})}>
-      Restart to update
-    </button>
+  const ready = restart || restarting ? (
+    <div className="sheet" role="status" aria-live="polite" style={{ width: '100%', minHeight: 0 }}>
+      <div className="sheet-h">
+        <span className="lbl grow">{restart ? <>CortexTerm <span className="num">{short(restart.staged)}</span> is ready</> : 'Updating CortexTerm'}</span>
+        {!restarting && restart && <button className="detent" type="button" onClick={() => setRestartHidden(restart.staged)}>Hide</button>}
+      </div>
+      <div className="sheet-b">
+        <p>
+          {restarting
+            ? 'Restarting now to finish the update.'
+            : restart?.waiting
+              ? `It restarts by itself when nothing runs; now ${restart.waiting}.`
+              : 'It restarts by itself when nothing runs.'}
+          {' '}Your terminals stay open.
+        </p>
+        {failure && <p className="cx-attn">{failure}</p>}
+      </div>
+      <div className="sheet-f">
+        <span className="grow" />
+        <button className="detent send" type="button" disabled={restarting || busy !== null} data-action="restart"
+          onClick={() => void act('restart', 'update.restart', {})}>
+          {restarting ? 'Restarting…' : 'Restart now'}
+        </button>
+      </div>
+    </div>
   ) : null;
 
   const ask = data.pending?.[0];
@@ -164,10 +186,10 @@ function Updates() {
   const source = ask?.from === 'app' ? 'the build this app came with' : 'the official release';
   return (
     <>
-      {band}
-      {(showRound || ask || broke) && createPortal(
+      {(showRound || ready || ask || broke) && createPortal(
       <div data-slot={owner.slot} data-plugin-id={owner.pluginId} data-portal="updates" style={{ position: 'fixed', right: 16, bottom: 16, zIndex: 89, width: 'min(400px, calc(100% - 32px))', maxHeight: 'calc(100vh - 32px)', display: 'flex', flexDirection: 'column', gap: 8, overflowY: 'auto' }}>
       {showRound && <Round rows={rows} onHide={() => setHidden(signature)} />}
+      {ready}
       {ask ? (
         <div className="sheet" role="dialog" aria-modal="false" aria-labelledby="updater-ask-title" style={{ width: '100%', minHeight: 0 }}>
           <div className="sheet-h">
