@@ -7,6 +7,7 @@
 
 use cc_protocol::contracts::system::KeysStatus;
 
+#[cfg(target_os = "macos")]
 pub const SERVICE: &str = "CortexTerm security keys";
 /// The keys, as the Keychain accounts and `system.keys.set` name them.
 pub const NAMES: [&str; 2] = ["virustotal", "abusech"];

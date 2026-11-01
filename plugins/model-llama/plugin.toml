@@ -3,7 +3,7 @@
 [plugin]
 id = "model-llama"
 name = "Model (Gemma on llama.cpp)"
-version = "0.1.5"
+version = "0.1.6"
 description = "Gemma 4 (tag office) on upstream llama.cpp's llama-server with Metal and MTP drafts: E4B above 8 GB, E2B on 8 GB Macs. One model per machine: while another app on this Mac (CortexCode) offers a model through the mesh, calls are borrowed from it and Gemma stays unloaded; an app about to load another kind of model asks Gemma to yield (model.yield)."
 license = "UNLICENSED"
 platforms = ["macos"]

@@ -26,7 +26,10 @@ fn main() {
     match build() {
         Ok(path) => println!("cargo:rustc-env=CC_NOTIFY_HELPER_BUILD=built:{}", path.display()),
         Err(reason) => {
-            println!("cargo:warning=notification app not built ({reason}); cc-notify will deliver through osascript only");
+            // Elsewhere there is no app to build: only a macOS build without it is worth a warning.
+            if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+                println!("cargo:warning=notification app not built ({reason}); cc-notify will deliver through osascript only");
+            }
             println!("cargo:rustc-env=CC_NOTIFY_HELPER_BUILD=absent:{reason}");
         }
     }

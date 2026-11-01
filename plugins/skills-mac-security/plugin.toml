@@ -7,7 +7,7 @@
 [plugin]
 id = "skills-mac-security"
 name = "Mac security"
-version = "0.1.5"
+version = "0.1.6"
 description = "Security know-how for the model: check the Mac on request, look up a CVE, explain a finding, and calm, ordered steps after a suspected hack."
 license = "UNLICENSED"
 platforms = ["macos"]
