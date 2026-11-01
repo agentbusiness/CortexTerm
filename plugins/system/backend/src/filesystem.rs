@@ -2,7 +2,7 @@
 //! No project-name, depth or count cutoff. Device/pseudo filesystems are not file scan targets.
 
 use crate::sweep::Part;
-use crate::util::{home, tilde};
+use crate::util::{home, plural, tilde};
 use std::collections::{BTreeSet, HashSet};
 use std::fs::{Metadata, ReadDir};
 use std::os::unix::fs::MetadataExt;
@@ -16,6 +16,37 @@ pub struct Walk {
     cancelled: Arc<AtomicBool>,
     seen: HashSet<(u64, u64)>,
     pub skipped: Vec<String>,
+    unread: Unread,
+}
+
+/// How many unreadable paths a sweep names; the rest are counted, so a whole-disk walk's record
+/// stays small enough to keep.
+const NAMED: usize = 20;
+
+/// Paths a walk or scan could not read: the first few named, the rest counted.
+#[derive(Default)]
+pub struct Unread {
+    named: Vec<String>,
+    more: usize,
+}
+
+impl Unread {
+    pub fn add(&mut self, line: String) {
+        if self.named.len() < NAMED {
+            self.named.push(line);
+        } else {
+            self.more += 1;
+        }
+    }
+
+    /// The named lines, then one line counting the rest under `what`.
+    pub fn lines(self, what: &str) -> Vec<String> {
+        let mut lines = self.named;
+        if self.more > 0 {
+            lines.push(format!("{what}: {} more could not be read", plural(self.more, "path", "paths")));
+        }
+        lines
+    }
 }
 
 impl Walk {
@@ -26,6 +57,7 @@ impl Walk {
             cancelled: Arc::new(AtomicBool::new(false)),
             seen: HashSet::new(),
             skipped: Vec::new(),
+            unread: Unread::default(),
         }
     }
 
@@ -42,9 +74,7 @@ impl Walk {
                 self.seen.insert((meta.dev(), meta.ino()));
                 self.stack.push((path.to_path_buf(), read));
             }
-            Err(error) => self
-                .skipped
-                .push(format!("filesystem: {}: {error}", tilde(path))),
+            Err(error) => self.unread.add(format!("filesystem: {}: {error}", tilde(path))),
         }
     }
 
@@ -53,6 +83,13 @@ impl Walk {
         if let Ok(meta) = std::fs::metadata(path) {
             self.seen.insert((meta.dev(), meta.ino()));
         }
+    }
+
+    /// What the walk left out: why it stopped early, then the paths it could not read.
+    pub fn gaps(self) -> Vec<String> {
+        let mut gaps = self.skipped;
+        gaps.extend(self.unread.lines("filesystem"));
+        gaps
     }
 }
 
@@ -70,10 +107,8 @@ impl Iterator for Walk {
                 match read.next() {
                     Some(Ok(entry)) => entry.path(),
                     Some(Err(error)) => {
-                        self.skipped.push(format!(
-                            "filesystem directory entry in {}: {error}",
-                            tilde(dir)
-                        ));
+                        let line = format!("filesystem directory entry in {}: {error}", tilde(dir));
+                        self.unread.add(line);
                         continue;
                     }
                     None => {
@@ -88,8 +123,8 @@ impl Iterator for Walk {
             let canonical = match path.canonicalize() {
                 Ok(path) => path,
                 Err(error) => {
-                    self.skipped
-                        .push(format!("filesystem: {}: {error}", tilde(&path)));
+                    self.unread
+                        .add(format!("filesystem: {}: {error}", tilde(&path)));
                     continue;
                 }
             };
@@ -102,8 +137,8 @@ impl Iterator for Walk {
             let meta = match std::fs::metadata(&path) {
                 Ok(meta) => meta,
                 Err(error) => {
-                    self.skipped
-                        .push(format!("filesystem: {}: {error}", tilde(&path)));
+                    self.unread
+                        .add(format!("filesystem: {}: {error}", tilde(&path)));
                     continue;
                 }
             };
@@ -248,7 +283,7 @@ impl Discovery {
                 }
             }
         }
-        found.skipped = walk.skipped;
+        found.skipped = walk.gaps();
         found
     }
 

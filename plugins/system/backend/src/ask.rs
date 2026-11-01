@@ -298,7 +298,7 @@ pub async fn weakness_text(words: &str) -> (String, i32) {
         return (format!("macsec: no kind of flaw matches \"{words}\". Known: {}, or a CWE id.\n", known.join(", ")), 2);
     }
     let rows = match graph::query_all(
-        "MATCH (a:Advisory)-[e:AFFECTS]->(t) OPTIONAL MATCH (r:Repo)-[:DEPENDS_ON]->(t) \
+        "MATCH (a:Advisory)-[e:AFFECTS]->(t) WHERE t.ended_ms IS NULL OPTIONAL MATCH (r:Repo)-[:DEPENDS_ON]->(t) \
          RETURN a.key, a.title, a.cwe, a.kev, t.key, e.verdict, e.version, e.fixed_in, e.fix, collect(r.key)",
         json!({}),
     )
