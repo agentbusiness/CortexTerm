@@ -194,7 +194,7 @@ pub mod methods {
     pub const ALERTS: &str = "system.alerts";
     /// `{id, action}` -> `{ok}`: `dismiss` | `snooze` (1 h) | `ignore_kind` for an alert.
     pub const ALERT_ACT: &str = "system.alert.act";
-    /// `{}` -> [`super::SweepReport`]: the last security sweep (runs one if none yet).
+    /// `{}` -> [`super::SweepReport`]: the last security sweep (`at` 0: none yet; reading never runs one).
     pub const SWEEP: &str = "system.sweep";
     /// `{}` -> [`super::SweepReport`]: run the sweep now.
     pub const SWEEP_RUN: &str = "system.sweep.run";
