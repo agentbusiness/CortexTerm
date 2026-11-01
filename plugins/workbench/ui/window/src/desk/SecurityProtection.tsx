@@ -87,8 +87,6 @@ const STAGES: [string, string, string[]][] = [
 /** An advisory id in a finding's words. */
 const ADVISORY = /\b(CVE-\d{4}-\d{4,}|GHSA(?:-[0-9a-z]{4}){3}|RUSTSEC-\d{4}-\d{4}|PYSEC-\d{4}-\d+|GO-\d{4}-\d+|MAL-\d{4}-\d+)\b/i;
 /** Lets the admin group read the packet capture devices until the next restart. */
-/** Questions the ask box offers; a click asks it. */
-const EXAMPLES = ['Am I vulnerable to SQL injection?', 'What changed this week?'];
 const GRANT_BPF = 'sudo chgrp admin /dev/bpf* && sudo chmod g+r /dev/bpf*';
 const SYSTEM_PATH = /^\/(System|usr|bin|sbin)\//;
 /** The outermost app or bundle a path is in, else the path. */
@@ -173,8 +171,6 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
   const [openCheck, setOpenCheck] = useState('');
   const [coverage, setCoverage] = useState(false);
   const [sweeping, setSweeping] = useState(false);
-  const [question, setQuestion] = useState('');
-  const [answer, setAnswer] = useState<{ question: string; text: string } | null>(null);
   const [granting, setGranting] = useState(false);
   const [reported, setReported] = useState('');
   const [copies, setCopies] = useState<{ id: string; report?: CveReport; problem?: string } | null>(null);
@@ -224,7 +220,7 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
     busyRef.current = false;
     statusRef.current = null;
     setStatus(null); setLoading(true); setActionUncertain(false); setLoadProblem(null); setActionProblem(null); setBusy(null);
-    setDetails(new Map()); setDetailProblem({}); setConfirmStop(null); setReport(null); setHistory(null); setSelected(''); setDeciding(false);
+    setDetails(new Map()); setDetailProblem({}); setConfirmStop(null); setReport(null); setHistory(null); setSelected(''); setDeciding(false); setAsked(new Set());
     setImportPath(''); setTimelineLimits({}); setFocusedEvidence({}); setCopied(null); setCopyProblem(null);
     let timer: ReturnType<typeof setTimeout> | undefined;
     const poll = async () => {
@@ -373,6 +369,9 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
 
   const items = useMemo(() => itemsOf(report, incidents, machineAlerts.alerts), [report, incidents, machineAlerts.alerts]);
   const shown = items.filter((item) => (tab === 'open') === item.open);
+  // The worst open issues not asked about yet, each as a question a click asks in the chat.
+  const [asked, setAsked] = useState<Set<string>>(() => new Set());
+  const questions = items.filter((entry) => entry.open && !asked.has(entry.key)).slice(0, 3);
   const item = items.find((entry) => entry.key === selected);
   const openCount = items.filter((entry) => entry.open).length;
   const urgent = items.filter((entry) => entry.open && priority(entry.severity) === 'ACT NOW').length;
@@ -416,20 +415,8 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
     finally { if (mounted.current) setSweeping(false); }
   };
 
-  /** A question about a kind of flaw is answered here from the security memory (`macsec weakness`);
-   *  anything else goes to the computer's assistant. */
-  const submitQuestion = async (said = question) => {
-    const text = said.trim();
-    if (!text) return;
-    setQuestion(''); setAnswer(null);
-    try {
-      const result = await client.call<{ text: string; exit_code: number }>('system.ask', { args: ['weakness', ...text.split(/\s+/)] });
-      if (result.exit_code === 0) { if (mounted.current) setAnswer({ question: text, text: result.text }); return; }
-    } catch { /* the assistant answers instead */ }
-    onAsk(text, 'ask');
-  };
-
   const ask = (entry: Item, intent: 'ask' | 'fix') => {
+    setAsked((done) => new Set(done).add(entry.key));
     if (entry.kind === 'sweep') {
       const worst = entry.findings[0];
       if (!worst) return;
@@ -464,20 +451,10 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
       <span className="grow" />
       <button type="button" className="detent sm" disabled={sweeping} title={report?.at ? `Last sweep ${ago(report.at)}` : 'The daily sweep has not run yet'} onClick={() => void runSweep()}>{sweeping ? 'SWEEPING…' : 'SWEEP NOW'}</button>
     </header>
-    <form className="ct-sec-ask" onSubmit={(event) => { event.preventDefault(); void submitQuestion(); }}>
+    {questions.length > 0 && <nav className="ct-sec-ask" aria-label="Ask the assistant">
       <span className="ct-label">ASK</span>
-      <input type="text" value={question} spellCheck={false} placeholder="Type a question about this computer's security, then Return" aria-label="Ask about this computer's security" onChange={(event) => setQuestion(event.target.value)} />
-      {!question && EXAMPLES.map((example) => <button key={example} type="button" className="ct-seg" title="Ask this now" onClick={() => void submitQuestion(example)}>{example}</button>)}
-    </form>
-
-    {answer && <div className="ct-sec-answer" role="status">
-      <div className="ct-sec-detail-head"><h3 dir="auto">{answer.question}</h3><span className="ct-label ct-faint">FROM THIS COMPUTER'S SECURITY MEMORY</span></div>
-      <pre dir="auto">{answer.text}</pre>
-      <div className="ct-protection-actions">
-        <button type="button" className="detent sm warn" onClick={() => { onAsk(answer.question, 'ask'); setAnswer(null); }}>A · CONTINUE IN CHAT</button>
-        <button type="button" className="detent sm" onClick={() => setAnswer(null)}>CLOSE</button>
-      </div>
-    </div>}
+      {questions.map((entry) => <button key={entry.key} type="button" title="Asks the assistant in the chat" onClick={() => ask(entry, 'ask')}>{questionOf(entry)}</button>)}
+    </nav>}
     {loadProblem && <p className="ct-asec-note ct-warn" role="status">Protection status could not be refreshed: {loadProblem}. {status ? 'The last known status is shown.' : 'Monitoring coverage is unknown.'}</p>}
     {stale && !hasProblem && <p className="ct-asec-note ct-warn" role="status">This status is more than 30 seconds old.</p>}
     {actionProblem && <p className="ct-asec-note ct-warn" role="alert">{actionProblem}</p>}
@@ -833,6 +810,15 @@ function itemsOf(report: SweepReport | null, incidents: SecurityIncident[], aler
     items.push({ key: alert.id, kind: 'alert', title: alert.text, where: '', text: alert.kind, severity: alert.severity, open: true, last: alert.at, count: 1, findings: [], alert });
   }
   return items.sort((a, b) => Number(b.open) - Number(a.open) || rank(a.severity) - rank(b.severity) || b.last - a.last);
+}
+
+/** An open issue as the question a person would ask about it. */
+function questionOf(entry: Item): string {
+  const cve = /CVE-\d{4}-\d+/.exec(entry.title)?.[0];
+  if (cve) return `How do I fix ${cve}?`;
+  if (entry.kind === 'incident') return `Is this an attack: ${entry.title}?`;
+  if (entry.kind === 'sweep') return `What should I do about ${entry.title}?`;
+  return `What does this mean: ${entry.title}?`;
 }
 
 /** A group's findings by the check that found them, worst first: one line per check, not one per file. */

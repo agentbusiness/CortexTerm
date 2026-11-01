@@ -36,16 +36,20 @@ const APART: Duration = Duration::from_secs(7);
 const BY: &str = "cve-watch";
 const SUFFIX: &str = " affects this Mac";
 
-/// Run the watch for as long as the plugin runs. `ctx` reaches the graph; `fire` raises an alert.
-pub async fn run(ctx: impl Fn() -> Option<Ctx>, fire: impl Fn(Candidate)) {
+/// Run the watch for as long as the plugin runs. `ctx` reaches the graph; `fire` raises an alert;
+/// `resolve` closes the alerts of an advisory that no longer affects this Mac.
+pub async fn run(ctx: impl Fn() -> Option<Ctx>, fire: impl Fn(Candidate), resolve: impl Fn(&str)) {
     tokio::time::sleep(FIRST).await;
     while !crate::graph::wait_ready(Duration::from_secs(3600)).await {}
     loop {
         if let Some(ctx) = ctx() {
             match round(&ctx).await {
-                Ok(found) => {
+                Ok((found, gone)) => {
                     for candidate in found {
                         fire(candidate);
+                    }
+                    for id in gone {
+                        resolve(&format!("cve:{id}"));
                     }
                 }
                 Err(error) => tracing::info!("cve watch: {error}"),
@@ -55,8 +59,9 @@ pub async fn run(ctx: impl Fn() -> Option<Ctx>, fire: impl Fn(Candidate)) {
     }
 }
 
-/// One round: what to look at, each looked at, the graph brought up to date.
-async fn round(ctx: &Ctx) -> Result<Vec<Candidate>, String> {
+/// One round: what to look at, each looked at, the graph brought up to date. The new alerts, and
+/// the advisories that no longer affect this Mac.
+async fn round(ctx: &Ctx) -> Result<(Vec<Candidate>, Vec<String>), String> {
     let known = known(ctx).await?;
     let before: BTreeSet<String> = crate::graph::query("MATCH (a:Advisory)-[e:AFFECTS]->() WHERE e.verdict = 'affected' RETURN DISTINCT a.key", json!({}))
         .await?
@@ -89,6 +94,7 @@ async fn round(ctx: &Ctx) -> Result<Vec<Candidate>, String> {
     }
 
     let mut found = Vec::new();
+    let mut gone = Vec::new();
     let mut affected = BTreeSet::new();
     for (looked, id) in ids.iter().take(MOST).enumerate() {
         if looked > 0 {
@@ -100,6 +106,9 @@ async fn round(ctx: &Ctx) -> Result<Vec<Candidate>, String> {
             batch.record(&report);
         }
         let fact = known.iter().find(|(known_id, _)| known_id == id).map(|(_, item)| item);
+        if matches!(report.verdict.as_str(), "fixed" | "not-affected") {
+            gone.push(id.clone());
+        }
         if report.verdict == "affected" {
             affected.insert(id.clone());
             if !before.contains(id) && fact.is_none() {
@@ -122,7 +131,7 @@ async fn round(ctx: &Ctx) -> Result<Vec<Candidate>, String> {
         }
     }
     tracing::info!("cve watch: {} advisories looked at, {} affect this Mac, {} new", ids.len().min(MOST), affected.len(), found.len());
-    Ok(found)
+    Ok((found, gone))
 }
 
 /// The facts earlier versions of the watch wrote that are still live: (advisory id, item).
