@@ -82,10 +82,6 @@ pub fn write_changes(graph: &Graph, old: &Settings, new: &Settings) {
     if old.conflicts != new.conflicts {
         live.insert("conflicts".into(), json!(new.conflicts));
     }
-    if !live.is_empty() {
-        nodes.push(graph::node(LIVE.0, LIVE.1, live));
-        edges.push(graph::edge(LIVE, "ON", graph::machine()));
-    }
     for pr in &new.shared {
         if old.shared.iter().any(|known| known == pr) {
             continue;
@@ -98,7 +94,13 @@ pub fn write_changes(graph: &Graph, old: &Settings, new: &Settings) {
             ("ms", json!(pr.ms)),
         ]);
         nodes.push(graph::node(PULL_REQUEST, &pr.url, props));
-        edges.push(graph::edge((PULL_REQUEST, &pr.url), "ON", graph::machine()));
+        // A pull request shares the live folder's changes (the folder's node comes with it).
+        edges.push(graph::edge((PULL_REQUEST, &pr.url), "FROM", graph::at(LIVE.0, LIVE.1)));
+        live.entry("update").or_insert_with(|| json!(new.update));
+    }
+    if !live.is_empty() {
+        nodes.push(graph::node(LIVE.0, LIVE.1, live));
+        edges.push(graph::edge(LIVE, "ON", graph::machine()));
     }
     graph.put(nodes, edges);
     let gone: Vec<_> = old.shared.iter().filter(|pr| !new.shared.iter().any(|kept| kept.url == pr.url)).map(|pr| graph::at(PULL_REQUEST, &pr.url)).collect();

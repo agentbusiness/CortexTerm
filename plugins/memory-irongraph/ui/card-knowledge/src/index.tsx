@@ -6,7 +6,7 @@
  */
 
 import { useState } from 'react';
-import { definePlugin, errorMessage, ServiceProblem, useClient, useHost, useQuery, useSelection } from '@cortex/sdk';
+import { definePlugin, errorMessage, Menu, ServiceProblem, useClient, useHost, useQuery, useSelection } from '@cortex/sdk';
 import './index.css';
 
 interface KnowledgeLink { rel: string; target: string; id?: string; name?: string }
@@ -17,6 +17,8 @@ interface KnowledgeItem {
 }
 
 const TABS: Array<[string, string]> = [['concept', 'Concepts'], ['fact', 'Facts'], ['decision', 'Decisions'], ['hypothesis', 'Theories'], ['question', 'Questions']];
+/** One of a tab's things: Facts → Fact, Theories → Theory. */
+const kindName = (label: string) => label.replace(/s$/, '').replace('Theorie', 'Theory');
 const LIVE = (state: string) => state !== 'withdrawn' && state !== 'superseded';
 
 function dateOf(item: KnowledgeItem): string {
@@ -76,9 +78,7 @@ function KnowledgeSection() {
               setAdding(false);
             });
           }}>
-            <select aria-label="Kind" value={draft.kind} onChange={(event) => setDraft({ ...draft, kind: event.target.value })}>
-              {TABS.map(([kind, label]) => <option key={kind} value={kind}>{label.replace(/s$/, '').replace('Theorie', 'Theory')}</option>)}
-            </select>
+            <Menu label="Kind" value={kindName(TABS.find(([kind]) => kind === draft.kind)?.[1] ?? draft.kind)} items={TABS.map(([kind, label]) => ({ key: kind, label: kindName(label), selected: kind === draft.kind, onSelect: () => setDraft({ ...draft, kind }) }))} />
             <input aria-label="Name" placeholder="Name (a few words)" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} />
             <textarea aria-label="Text" placeholder="One or two sentences" rows={2} value={draft.text} onChange={(event) => setDraft({ ...draft, text: event.target.value })} />
             <div className="cx-kn-acts"><button type="submit" className="detent tiny" disabled={busy !== null}>Keep</button></div>

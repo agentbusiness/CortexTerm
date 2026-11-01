@@ -1,6 +1,7 @@
 //! Downloaded lists kept whole as documents in the graph: `(:Feed {key: name, url, fetched_ms,
 //! bytes, encoding, parts, body})-[:ON]->(:Machine)`. A list larger than one part (1 MB of text)
-//! is split at line ends into `(:FeedPart {key: name#n, n, fetched_ms, body})-[:OF]->(:Feed)`; a
+//! is split at line ends into `(:FeedPart {key: name#n, n, fetched_ms, body})-[:OF]->(:Feed)`
+//! (parts a shorter copy no longer has are retired); a
 //! binary one (the gzip'd IP-to-network table) is kept as base64. A copy read once stays in RAM
 //! (the big IP table is not kept: its parsed tables are).
 
@@ -20,8 +21,8 @@ pub struct Doc {
     pub bytes: Arc<Vec<u8>>,
 }
 
-/// name -> when the stored copy was fetched (0: none stored).
-static INDEX: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+/// name -> when the stored copy was fetched (0: none stored) and its parts.
+static INDEX: Mutex<Option<HashMap<String, (u64, u64)>>> = Mutex::new(None);
 static CACHE: Mutex<Option<HashMap<String, Doc>>> = Mutex::new(None);
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -30,8 +31,8 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// Which lists the graph holds and their age (once, at start).
 pub async fn load_index() -> Result<usize, String> {
-    let rows = graph::query("MATCH (f:Feed) WHERE f.state IS NULL OR f.state <> 'gone' RETURN f.key, f.fetched_ms", json!({})).await?;
-    let index: HashMap<String, u64> = rows.iter().map(|row| (graph::text(&row[0]), graph::number(&row[1]))).collect();
+    let rows = graph::query("MATCH (f:Feed) WHERE f.state IS NULL OR f.state <> 'gone' RETURN f.key, f.fetched_ms, f.parts", json!({})).await?;
+    let index: HashMap<String, (u64, u64)> = rows.iter().map(|row| (graph::text(&row[0]), (graph::number(&row[1]), graph::number(&row[2])))).collect();
     let count = index.len();
     *lock(&INDEX) = Some(index);
     Ok(count)
@@ -39,7 +40,7 @@ pub async fn load_index() -> Result<usize, String> {
 
 /// When the stored copy was fetched (None: there is none, or memory is not loaded yet).
 pub fn fetched(name: &str) -> Option<u64> {
-    lock(&INDEX).as_ref()?.get(name).copied().filter(|at| *at > 0)
+    lock(&INDEX).as_ref()?.get(name).map(|(at, _)| *at).filter(|at| *at > 0)
 }
 
 /// The stored copy (async).
@@ -84,10 +85,14 @@ pub fn get_blocking(name: &str) -> Option<Doc> {
 pub fn put(name: &str, url: &str, bytes: Vec<u8>, fetched_ms: u64) {
     let size = bytes.len();
     if let Some(batches) = batches(name, url, &bytes, fetched_ms) {
+        let parts = if batches.len() > 1 { batches.len() as u64 - 1 } else { 0 };
         for batch in batches {
             graph::put(batch);
         }
-        lock(&INDEX).get_or_insert_with(HashMap::new).insert(name.to_owned(), fetched_ms);
+        let old = lock(&INDEX).get_or_insert_with(HashMap::new).insert(name.to_owned(), (fetched_ms, parts)).map_or(0, |(_, parts)| parts);
+        if old > parts {
+            graph::retire((parts..old).map(|n| r("FeedPart", format!("{name}#{n}"))).collect(), "the list is shorter now");
+        }
     }
     let mut cache = lock(&CACHE);
     let cache = cache.get_or_insert_with(HashMap::new);

@@ -4,7 +4,7 @@
 
 use crate::{flow::Flow, replay, security};
 use cc_protocol::contracts::frame::{JournalEntry, JournalReadResult, SessionListResult, kinds};
-use cc_protocol::contracts::memory::{KnowledgeItem, KnowledgeListResult, KnowledgeSearchResult, methods as memory};
+use cc_protocol::contracts::memory::{KnowledgeItem, KnowledgeListResult, KnowledgeSearchResult, StreamReadResult, methods as memory};
 use cc_protocol::contracts::model::{ChatMessage, ChatParams, ChatResult, Priority, Sampling, Thinking, tags};
 use cc_protocol::contracts::{mesh::methods as mesh, now_ms};
 use cc_protocol::{RpcError, codes, parse_params};
@@ -21,9 +21,19 @@ pub const CONTEXT: &str = "terminal_learning_context";
 pub const SNAPSHOT: &str = "terminal_learning_snapshot";
 pub const BINDING: &str = "terminal_proposal_run";
 pub const OUTCOME: &str = "terminal_proposal_outcome";
+/// One record per episode: the model request it was answered from and the memory shown in it.
+const EPISODES: &str = "terminal.episodes";
 const MAX_BACKLOG: usize = 8;
 const MAX_LESSONS: usize = 4;
 const MAX_FACTS: usize = 4;
+const MAX_PREFERENCES: usize = 4;
+/// A pass that fails this often is set aside, so one bad episode cannot stall the rest.
+pub const MAX_ATTEMPTS: u64 = 3;
+/// After this, nothing can change an episode any more: its correction (30 min), its outcome (10
+/// min after the proposal) and the rerun of what failed (10 min after that) are all in.
+const SETTLE_MS: u64 = 40 * 60 * 1000;
+/// A rerun of the failing command proves a fix made by another program within this time.
+const RERUN_MS: u64 = 10 * 60 * 1000;
 
 pub struct Learner {
     wake: Notify,
@@ -37,6 +47,7 @@ impl Learner {
         tokio::spawn(async move {
             // Activation must finish before the first RPC. The timer also retries failed writes
             // and recovers a command outcome whose event arrived while this plugin was down.
+            let mut migrated = false;
             loop {
                 tokio::select! {
                     _ = task.stop.cancelled() => break,
@@ -49,6 +60,12 @@ impl Learner {
                 }
                 let Some(flow) = flow.upgrade() else { break };
                 let Some(cancel) = flow.learning_token() else { continue };
+                if !migrated {
+                    match migrate(&flow).await {
+                        Ok(()) => migrated = true,
+                        Err(error) => tracing::warn!(%error, "terminal learning records not migrated yet"),
+                    }
+                }
                 // Shutdown cancels the registered token. Let the call unwind and release its
                 // lease rather than dropping the future in the middle of a model stream.
                 let outcome = cycle(&flow, &cancel).await;
@@ -101,8 +118,10 @@ pub struct Recall {
 }
 
 /// Only the folder and its ancestors match a local lesson; path prefixes such as /api2 do not.
-fn in_scope(item: &KnowledgeItem, cwd: &str) -> bool {
-    item.aliases.iter().filter_map(|a| a.strip_prefix("folder:")).all(|folder| Path::new(cwd).starts_with(folder))
+/// A lesson learned in several folders holds in each of them.
+pub fn in_scope(item: &KnowledgeItem, cwd: &str) -> bool {
+    let mut folders = item.aliases.iter().filter_map(|a| a.strip_prefix("folder:")).peekable();
+    (folders.peek().is_none() || folders.any(|folder| Path::new(cwd).starts_with(folder)))
         && item.aliases.iter().filter_map(|a| a.strip_prefix("os:")).all(|os| os == std::env::consts::OS)
 }
 
@@ -177,43 +196,36 @@ pub fn failure_key(command: &str, output: &str) -> String {
 pub async fn recall(flow: &Flow, question: &str, cwd: &str, failed_id: Option<&str>) -> Result<Recall, RpcError> {
     let mut recalled = Recall::default();
     if let Some(id) = failed_id {
-        let run = rows(flow, "MATCH (r:CommandRun {key: $id}) RETURN r.command, r.exit_code", json!({"id": id}), 1).await?;
-        if let Some(row) = run.first()
-            && row.get(1).and_then(Value::as_i64).is_some_and(|code| code != 0)
+        let mut run: Option<(String, i64)> = rows(flow, "MATCH (r:CommandRun {key: $id}) RETURN r.command, r.exit_code", json!({"id": id}), 1)
+            .await?
+            .first()
+            .and_then(|row| Some((row.first()?.as_str()?.to_owned(), row.get(1)?.as_i64()?)));
+        // A Run that just finished may still wait in the terminal's outbox: the terminal has it.
+        if run.is_none()
+            && let Ok(list) = flow.ctx()?.call("terminal.runs", json!({"failed_only": true, "limit": 50})).await
         {
-            let output = flow.ctx()?.call("terminal.run.output", json!({"run_id": id, "from": -60, "count": 60})).await?;
-            recalled.failure = failure_key(row.first().and_then(Value::as_str).unwrap_or(""), &output_text(&output));
+            run = list["runs"].as_array().into_iter().flatten().find(|r| r["id"] == id).and_then(|r| Some((r["command"].as_str()?.to_owned(), r["exit_code"].as_i64()?)));
+        }
+        if let Some((command, code)) = run
+            && code != 0
+            && let Ok(output) = flow.ctx()?.call("terminal.run.output", json!({"run_id": id, "from": -60, "count": 60})).await
+        {
+            recalled.failure = failure_key(&command, &output_text(&output));
         }
     }
     let facts: KnowledgeListResult = parse_params(flow.ctx()?.call(memory::KNOWLEDGE_LIST, json!({"kind": "fact"})).await?)?;
-    for item in facts
+    // The nearest folder's facts first (this folder's before its parents'), newest first within it.
+    let mut places: Vec<(usize, &KnowledgeItem)> = facts
         .items
         .iter()
-        .filter(|item| {
-            item.name.strip_prefix("place ").and_then(|name| name.split_once(": ")).is_some_and(|(folder, _)| Path::new(cwd).starts_with(folder))
-                && in_scope(item, cwd)
-                && security::guarded_reasons(&item.text).is_none()
+        .filter_map(|item| {
+            let (folder, _) = item.name.strip_prefix("place ")?.split_once(": ")?;
+            (Path::new(cwd).starts_with(folder) && in_scope(item, cwd) && security::guarded_reasons(&item.text).is_none()).then_some((folder.len(), item))
         })
-        .take(MAX_FACTS)
-    {
+        .collect();
+    places.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.updated_ms.cmp(&a.1.updated_ms)));
+    for (_, item) in places.into_iter().take(MAX_FACTS) {
         recalled.shown.push(shown(item, ""));
-    }
-    let mut candidates: HashMap<String, KnowledgeItem> = HashMap::new();
-    let searched = flow.ctx()?.call(memory::KNOWLEDGE_SEARCH, json!({"text": cut(question, 1000), "kind": "lesson", "limit": 16})).await;
-    match searched.and_then(parse_params::<KnowledgeSearchResult>) {
-        Ok(searched) => {
-            for item in searched.items.into_iter().filter(|item| item.score.unwrap_or(0.0) >= 0.35 && in_scope(item, cwd) && security::guarded_reasons(&item.text).is_none()) {
-                candidates.insert(item.id.clone(), item);
-            }
-        }
-        Err(error) => tracing::debug!(%error, "meaning search unavailable; folder facts and failure-key recall remain available"),
-    }
-    if !recalled.failure.is_empty() {
-        let keyed: KnowledgeListResult = parse_params(flow.ctx()?.call(memory::KNOWLEDGE_LIST, json!({"kind": "lesson"})).await?)?;
-        for mut item in keyed.items.into_iter().filter(|item| item.aliases.contains(&recalled.failure) && in_scope(item, cwd) && security::guarded_reasons(&item.text).is_none()) {
-            item.score = Some(2.0);
-            candidates.insert(item.id.clone(), item);
-        }
     }
     let scores = match scores(flow).await {
         Ok(scores) => scores,
@@ -222,8 +234,37 @@ pub async fn recall(flow: &Flow, question: &str, cwd: &str, failed_id: Option<&s
             return Ok(recalled);
         }
     };
-    let mut candidates: Vec<_> = candidates.into_values().collect();
-    candidates.retain(|item| !scores.get(&item.id).is_some_and(|score| score.hurt > score.helped && score.hurt + score.helped >= 3));
+    let usable = |item: &KnowledgeItem| in_scope(item, cwd) && security::guarded_reasons(&item.text).is_none() && !harmful(scores.get(&item.id));
+    let lessons: KnowledgeListResult = parse_params(flow.ctx()?.call(memory::KNOWLEDGE_LIST, json!({"kind": "lesson"})).await?)?;
+    // A standing preference holds whatever the question is about. The pass that distilled a
+    // lesson says what it is anchored to.
+    let preferences: HashSet<String> = rows(flow, "MATCH (p:TerminalLearningPass {anchor: 'preference'})-[:DISTILLED]->(k:Knowledge) RETURN DISTINCT k.id", json!({}), 5000)
+        .await?
+        .into_iter()
+        .filter_map(|row| row.first()?.as_str().map(str::to_owned))
+        .collect();
+    for item in lessons.items.iter().filter(|item| preferences.contains(&item.id) && usable(item)).take(MAX_PREFERENCES) {
+        recalled.shown.push(shown(item, ""));
+    }
+    let mut candidates: HashMap<String, KnowledgeItem> = HashMap::new();
+    // The question, with what failed: an automatic fix turn's question says little by itself.
+    let query = if recalled.failure.is_empty() { cut(question, 1000) } else { format!("{}\n{}", cut(question, 800), recalled.failure) };
+    let searched = flow.ctx()?.call(memory::KNOWLEDGE_SEARCH, json!({"text": query, "kind": "lesson", "limit": 16})).await;
+    match searched.and_then(parse_params::<KnowledgeSearchResult>) {
+        Ok(searched) => {
+            for item in searched.items.into_iter().filter(|item| item.score.unwrap_or(0.0) >= 0.35 && usable(item)) {
+                candidates.insert(item.id.clone(), item);
+            }
+        }
+        Err(error) => tracing::debug!(%error, "meaning search unavailable; folder facts and failure-key recall remain available"),
+    }
+    if !recalled.failure.is_empty() {
+        for mut item in lessons.items.into_iter().filter(|item| item.aliases.contains(&recalled.failure) && usable(item)) {
+            item.score = Some(2.0);
+            candidates.insert(item.id.clone(), item);
+        }
+    }
+    let mut candidates: Vec<_> = candidates.into_values().filter(|item| !recalled.shown.iter().any(|shown| shown.id == item.id)).collect();
     candidates.sort_by(|a, b| {
         let rank = |item: &KnowledgeItem| item.score.unwrap_or(0.0) + scores.get(&item.id).map_or(0.0, |s| 0.05 * (s.helped.min(5) as f64 - s.hurt.min(5) as f64));
         rank(b).total_cmp(&rank(a)).then_with(|| a.id.cmp(&b.id))
@@ -247,15 +288,35 @@ pub async fn at_failure(flow: &Flow, key: &str, cwd: &str, already: &[Shown]) ->
                 && in_scope(item, cwd)
                 && security::guarded_reasons(&item.text).is_none()
                 && !already.iter().any(|shown| shown.id == item.id)
-                && !scores.get(&item.id).is_some_and(|s| s.hurt > s.helped && s.hurt + s.helped >= 3)
+                && !harmful(scores.get(&item.id))
         })
         .take(2)
         .map(|item| shown(item, key))
         .collect())
 }
 
+/// A memory item as the model sees it, with how old it is (old memory may no longer hold).
 fn shown(item: &KnowledgeItem, failure: &str) -> Shown {
-    Shown { id: item.id.clone(), name: item.name.clone(), text: cut(&item.text, 600), kind: item.kind.clone(), failure: failure.into(), index: 0 }
+    let text = match age(item.updated_ms) {
+        Some(age) => format!("{} (saved {age})", cut(&item.text, 580)),
+        None => cut(&item.text, 600),
+    };
+    Shown { id: item.id.clone(), name: item.name.clone(), text, kind: item.kind.clone(), failure: failure.into(), index: 0 }
+}
+
+/// "today", "yesterday", "5 days ago", "3 months ago".
+pub fn age(at_ms: u64) -> Option<String> {
+    if at_ms == 0 {
+        return None;
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    let days = now.saturating_sub(at_ms) / 86_400_000;
+    Some(match days {
+        0 => "today".into(),
+        1 => "yesterday".into(),
+        2..=59 => format!("{days} days ago"),
+        _ => format!("{} months ago", days / 30),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -265,6 +326,8 @@ pub struct Episode {
     pub seq: u64,
     pub ts_ms: u64,
     pub question: String,
+    /// The automatic follow-up to a command the user ran, not their own words.
+    pub continuing: bool,
     pub intent: String,
     pub cwd: String,
     pub term_id: String,
@@ -281,6 +344,8 @@ pub struct Episode {
     pub outcome_command: String,
     pub outcome_exit: Option<i64>,
     pub outcome_failure: String,
+    /// The command that failed passed again soon after the outcome (a fix by another program).
+    pub rerun_ok: bool,
     pub check_repair: bool,
     pub correction: String,
     pub correction_seq: u64,
@@ -291,15 +356,22 @@ impl Episode {
         format!("{}/{}", self.session, self.run)
     }
     fn revision(&self) -> String {
-        format!("{}/{}/{}/{}", self.key(), self.outcome_id, self.outcome_exit.map_or("pending".into(), |c| c.to_string()), self.correction_seq)
+        let rerun = if self.rerun_ok { "/rerun" } else { "" };
+        format!("{}/{}/{}/{}{rerun}", self.key(), self.outcome_id, self.outcome_exit.map_or("pending".into(), |c| c.to_string()), self.correction_seq)
     }
     pub fn verified_fix(&self) -> bool {
         let program = command_family(&self.outcome_command);
-        self.outcome_exit == Some(0) && !program.is_empty() && self.failure.starts_with(&format!("failed {program} "))
+        self.outcome_exit == Some(0) && !program.is_empty() && (self.rerun_ok || self.failure.starts_with(&format!("failed {program} ")))
+    }
+    /// Nothing can change it any more.
+    fn ripe(&self) -> bool {
+        now_ms().saturating_sub(self.ts_ms.max(self.proposal_ms)) >= SETTLE_MS
     }
 }
 
-/// Serial passes are bounded so a large history cannot monopolize the shared model.
+/// Serial passes are bounded so a large history cannot monopolize the shared model. Each session
+/// keeps where its settled episodes end, and, once all are settled, the journal revision: a
+/// journal unchanged since is not read again.
 async fn cycle(flow: &Flow, cancel: &CancellationToken) -> Result<(), RpcError> {
     let listed: SessionListResult = parse_params(flow.ctx()?.call("frame.session.list", json!({})).await?)?;
     let mut sessions: Vec<_> = listed.sessions.into_iter().filter(|s| s.flow == "terminal").collect();
@@ -307,9 +379,19 @@ async fn cycle(flow: &Flow, cancel: &CancellationToken) -> Result<(), RpcError> 
     let mut taken = 0;
     for session in sessions {
         check_cancel(cancel)?;
+        let mark = rows(flow, "MATCH (s:TerminalLearningSession {key: $key}) RETURN s.rev, s.settled_seq", json!({"key": session.id}), 1).await?;
+        let settled_seq = mark.first().and_then(|r| r.get(1)).and_then(Value::as_u64).unwrap_or(0);
+        if let Some(rev) = mark.first().and_then(|r| r.first()).and_then(Value::as_u64) {
+            let head: JournalReadResult = parse_params(flow.ctx()?.call("frame.journal.read", json!({"session_id": session.id, "from": u64::MAX})).await?)?;
+            if head.rev == rev {
+                continue;
+            }
+        }
         let read: JournalReadResult = parse_params(flow.ctx()?.call("frame.journal.read", json!({"session_id": session.id})).await?)?;
         let mut seen = HashSet::new();
-        for entry in read.entries.iter().rev().filter(|e| e.kind == kinds::STATUS && matches!(field(&e.data, "state"), "done" | "failed" | "cancelled")) {
+        // The earliest episode that can still change.
+        let mut open = u64::MAX;
+        for entry in read.entries.iter().rev().filter(|e| e.seq > settled_seq && e.kind == kinds::STATUS && matches!(field(&e.data, "state"), "done" | "failed" | "cancelled")) {
             let run = field(&entry.data, "run_id");
             if run.is_empty() || !seen.insert(run.to_owned()) {
                 continue;
@@ -318,27 +400,53 @@ async fn cycle(flow: &Flow, cancel: &CancellationToken) -> Result<(), RpcError> 
             resolve_outcome(flow, &mut episode, &read.entries).await?;
             let key = episode.key();
             let revision = episode.revision();
-            let done = rows(flow, "MATCH (p:TerminalLearningPass {key: $key}) RETURN p.state", json!({"key": revision}), 1).await?;
-            if done.first().and_then(|r| r.first()).and_then(Value::as_str) == Some("done") {
+            let pass = rows(flow, "MATCH (p:TerminalLearningPass {key: $key}) RETURN p.state, p.attempts", json!({"key": revision}), 1).await?;
+            let state = pass.first().and_then(|r| r.first()).and_then(Value::as_str).unwrap_or("");
+            let attempts = pass.first().and_then(|r| r.get(1)).and_then(Value::as_u64).unwrap_or(0);
+            if !episode.ripe() {
+                open = open.min(entry.seq);
+            }
+            if state == "done" || attempts >= MAX_ATTEMPTS {
                 continue;
             }
+            open = open.min(entry.seq);
             check_cancel(cancel)?;
-            persist_episode(flow, &episode).await?;
-            learn_episode(flow, &episode, cancel).await?;
+            let learned = async {
+                persist_episode(flow, &episode).await?;
+                learn_episode(flow, &episode, cancel).await
+            }
+            .await;
+            match learned {
+                Ok(()) => tracing::debug!(episode = %key, "terminal learning pass kept"),
+                Err(error) if error.code == codes::CANCELLED || cancel.is_cancelled() => return Err(error),
+                Err(error) => {
+                    // Kept with its count; the next cycle goes on to the other episodes.
+                    tracing::warn!(episode = %key, %error, attempt = attempts + 1, "terminal learning pass failed");
+                    put(
+                        flow,
+                        vec![json!({"label": "TerminalLearningPass", "key": revision, "props": {"state": "failed", "attempts": attempts + 1, "error": cut(&error.message, 300), "updated_ms": now_ms()}})],
+                        vec![edge("TerminalLearningPass", &revision, "FROM", "TerminalEpisode", &key)],
+                    )
+                    .await?;
+                }
+            }
             taken += 1;
-            tracing::debug!(episode = %key, "terminal learning pass kept");
             if taken >= MAX_BACKLOG {
-                withdraw_harmful(flow).await?;
+                settle_lessons(flow).await?;
                 flow.wake_learning();
                 return Ok(());
             }
         }
+        let props = if open == u64::MAX {
+            json!({"settled_seq": read.entries.last().map_or(0, |e| e.seq), "rev": read.rev})
+        } else {
+            json!({"settled_seq": open - 1})
+        };
+        put(flow, vec![json!({"label": "TerminalLearningSession", "key": session.id, "props": props})], vec![edge("TerminalLearningSession", &session.id, "OF", "Session", &session.id)]).await?;
     }
     check_cancel(cancel)?;
-    withdraw_harmful(flow).await?;
-    replay::one(flow, cancel).await?;
-    check_cancel(cancel)?;
-    night_report(flow).await
+    settle_lessons(flow).await?;
+    replay::one(flow, cancel).await
 }
 
 fn episode(session: &str, run: &str, entries: &[JournalEntry]) -> Option<Episode> {
@@ -377,8 +485,9 @@ fn episode(session: &str, run: &str, entries: &[JournalEntry]) -> Option<Episode
         seq: user.seq,
         ts_ms: user.ts_ms,
         question: cut(field(&user.data, "text"), 3000),
+        continuing: user.data.get("continuing").and_then(Value::as_bool) == Some(true),
         intent: field(&user.data, "intent").into(),
-        cwd: value("cwd").as_str().unwrap_or("").into(),
+        cwd: folder_key(value("cwd").as_str().unwrap_or("")),
         term_id: field(&user.data, "term_id").into(),
         failure: value("failure").as_str().unwrap_or("").into(),
         answer: cut(mine.iter().rev().find(|e| e.kind == kinds::ASSISTANT_MESSAGE).map(|e| field(&e.data, "text")).unwrap_or(""), 4000),
@@ -401,6 +510,7 @@ fn episode(session: &str, run: &str, entries: &[JournalEntry]) -> Option<Episode
         outcome_command: String::new(),
         outcome_exit: None,
         outcome_failure: String::new(),
+        rerun_ok: false,
         check_repair,
         correction: next.map(|e| cut(field(&e.data, "text"), 2000)).unwrap_or_default(),
         correction_seq: next.map_or(0, |e| e.seq),
@@ -447,33 +557,65 @@ async fn resolve_outcome(flow: &Flow, episode: &mut Episode, entries: &[JournalE
             episode.outcome_id = id.into();
         }
     }
+    let mut outcome_ms = 0;
     if !episode.outcome_id.is_empty() {
-        let found = rows(flow, "MATCH (r:CommandRun {key: $id}) RETURN r.command, r.exit_code", json!({"id": episode.outcome_id}), 1).await?;
+        let found = rows(flow, "MATCH (r:CommandRun {key: $id}) RETURN r.command, r.exit_code, r.started_ms", json!({"id": episode.outcome_id}), 1).await?;
         if let Some(row) = found.first() {
             episode.outcome_command = row.first().and_then(Value::as_str).unwrap_or("").into();
             episode.outcome_exit = row.get(1).and_then(Value::as_i64).or(episode.outcome_exit);
+            outcome_ms = row.get(2).and_then(Value::as_u64).unwrap_or(0);
         }
     }
-    if episode.outcome_exit.is_some_and(|code| code != 0) && !episode.outcome_id.is_empty() {
-        let output = flow.ctx()?.call("terminal.run.output", json!({"run_id": episode.outcome_id, "from": -60, "count": 60})).await?;
+    // A Run recorded on another machine has no output here: the outcome stays without its key.
+    if episode.outcome_exit.is_some_and(|code| code != 0)
+        && !episode.outcome_id.is_empty()
+        && let Ok(output) = flow.ctx()?.call("terminal.run.output", json!({"run_id": episode.outcome_id, "from": -60, "count": 60})).await
+    {
         episode.outcome_failure = failure_key(&episode.outcome_command, &output_text(&output));
+    }
+    // A fix by another program (`brew install openssl` for a failing `cargo build`) is proven
+    // when the next run of the failing program, soon after, passes.
+    let program = command_family(&episode.outcome_command);
+    if episode.outcome_exit == Some(0) && outcome_ms > 0 && episode.failure.starts_with("failed ") && !episode.failure.starts_with(&format!("failed {program} ")) {
+        let later = rows(
+            flow,
+            "MATCH (r:CommandRun)-[:IN_SHELL]->(s:Shell {key: $shell}) WHERE r.started_ms > $after AND r.started_ms <= $until RETURN r.command, r.exit_code ORDER BY r.started_ms LIMIT 50",
+            json!({"shell": episode.term_id, "after": outcome_ms, "until": outcome_ms + RERUN_MS}),
+            50,
+        )
+        .await?;
+        let rerun = later.iter().find(|row| {
+            let family = command_family(row.first().and_then(Value::as_str).unwrap_or(""));
+            !family.is_empty() && episode.failure.starts_with(&format!("failed {family} "))
+        });
+        episode.rerun_ok = rerun.is_some_and(|row| row.get(1).and_then(Value::as_i64) == Some(0));
     }
     Ok(())
 }
 
+/// The episode's facts and edges. Its request snapshot is a record of that moment: appended once
+/// to the episodes stream, found again from the episode's `at_ms`.
 pub async fn persist_episode(flow: &Flow, e: &Episode) -> Result<(), RpcError> {
     let key = e.key();
+    let written = rows(flow, "MATCH (e:TerminalEpisode {key: $key}) RETURN e.at_ms", json!({"key": key}), 1).await?;
+    let at_ms = match written.first().and_then(|r| r.first()).and_then(Value::as_u64) {
+        Some(at_ms) => at_ms,
+        None => {
+            let at_ms = now_ms();
+            append_episodes(flow, vec![json!({"episode": key, "messages": e.messages, "shown": e.shown})]).await?;
+            at_ms
+        }
+    };
     let mut nodes = vec![json!({"label": "TerminalEpisode", "key": key, "props": {
-        "session_id": e.session, "run_id": e.run, "source_seq": e.seq, "created_ms": e.ts_ms,
-        "question": e.question, "intent": e.intent, "cwd": e.cwd, "failure": e.failure,
+        "source_seq": e.seq, "created_ms": e.ts_ms, "at_ms": at_ms,
+        "question": e.question, "intent": e.intent, "failure": e.failure,
         "answer": e.answer, "proposal": e.proposal, "proposal_ms": e.proposal_ms, "facts": e.facts, "status": e.status,
-        "messages_json": serde_json::to_string(&e.messages)?, "shown_json": serde_json::to_string(&e.shown)?,
-        "checks": e.checks, "outcome_id": e.outcome_id, "outcome_command": e.outcome_command,
-        "outcome_exit": e.outcome_exit, "outcome_failure": e.outcome_failure, "verified_fix": e.verified_fix(), "check_repair": e.check_repair, "correction": e.correction, "correction_seq": e.correction_seq
+        "checks": e.checks, "outcome_exit": e.outcome_exit, "outcome_failure": e.outcome_failure, "rerun_ok": e.rerun_ok,
+        "verified_fix": e.verified_fix(), "check_repair": e.check_repair, "correction": e.correction, "correction_seq": e.correction_seq
     }})];
     let mut edges = vec![edge("TerminalEpisode", &key, "OF", "Session", &e.session)];
     if !e.cwd.is_empty() {
-        nodes.push(json!({"label": "Folder", "key": e.cwd}));
+        folder_chain(&e.cwd, &mut nodes, &mut edges);
         edges.push(edge("TerminalEpisode", &key, "ABOUT", "Folder", &e.cwd));
     }
     for item in &e.shown {
@@ -489,6 +631,54 @@ pub async fn persist_episode(flow: &Flow, e: &Episode) -> Result<(), RpcError> {
     put(flow, nodes, edges).await
 }
 
+async fn append_episodes(flow: &Flow, records: Vec<Value>) -> Result<(), RpcError> {
+    flow.ctx()?.call(memory::STREAM_APPEND, json!({"topic": EPISODES, "records": records, "retention_days": 365})).await.map(|_| ())
+}
+
+/// The request snapshot and shown memory of an episode, from its record in the episodes stream.
+pub async fn episode_record(flow: &Flow, episode: &str, at_ms: u64) -> Result<Option<(Vec<ChatMessage>, Vec<Shown>)>, RpcError> {
+    let mut from = None;
+    loop {
+        let page: StreamReadResult = parse_params(flow.ctx()?.call(memory::STREAM_READ, json!({"topic": EPISODES, "since_ms": at_ms, "from_offset": from, "limit": 500})).await?)?;
+        if let Some(record) = page.records.iter().find(|r| field(&r.value, "episode") == episode) {
+            let messages = serde_json::from_value(record.value.get("messages").cloned().unwrap_or_default())?;
+            let shown = serde_json::from_value(record.value.get("shown").cloned().unwrap_or_default())?;
+            return Ok(Some((messages, shown)));
+        }
+        if page.end || page.records.is_empty() {
+            return Ok(None);
+        }
+        from = Some(page.next_offset);
+    }
+}
+
+/// A folder as the terminal keys it: absolute, without a trailing `/` (`/` itself stays); empty
+/// when it is not absolute.
+fn folder_key(cwd: &str) -> String {
+    match cwd.trim_end_matches('/') {
+        _ if !cwd.starts_with('/') => String::new(),
+        "" => "/".into(),
+        trimmed => trimmed.into(),
+    }
+}
+
+/// The folder and the folders above it, linked by IN, up to the home folder for one below it,
+/// else up to `/`: the same Folder nodes the terminal writes.
+fn folder_chain(folder: &str, nodes: &mut Vec<Value>, edges: &mut Vec<Value>) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut below: Option<String> = None;
+    for dir in Path::new(folder).ancestors() {
+        let dir = dir.to_string_lossy().into_owned();
+        nodes.push(json!({"label": "Folder", "key": dir}));
+        if let Some(child) = below.replace(dir.clone()) {
+            edges.push(edge("Folder", &child, "IN", "Folder", &dir));
+        }
+        if dir == home.trim_end_matches('/') || dir == "/" {
+            break;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Distilled {
     useful: String,
@@ -496,80 +686,140 @@ struct Distilled {
     anchor: String,
     scope: String,
     correction_quote: String,
+    /// Checkpoints written before this field existed have none.
+    #[serde(default)]
+    preference_quote: String,
     contradicted: Vec<String>,
 }
 
 async fn learn_episode(flow: &Flow, e: &Episode, cancel: &CancellationToken) -> Result<(), RpcError> {
     let pass_key = e.revision();
-    let prior = rows(flow, "MATCH (p:TerminalLearningPass {key: $key}) RETURN p.distilled_json", json!({"key": pass_key}), 1).await?;
-    let stored = prior.first().and_then(|r| r.first()).and_then(Value::as_str).filter(|s| !s.is_empty());
-    let lesson: Option<Distilled> = if let Some(stored) = stored {
-        serde_json::from_str(stored).map_err(|error| RpcError::internal(format!("learning checkpoint: {error}")))?
-    } else if e.status != "cancelled" && (!e.failure.is_empty() || e.outcome_exit.is_some_and(|code| code != 0) || !e.correction.is_empty() || e.checks.contains("Not run:")) {
+    let prior = rows(
+        flow,
+        "MATCH (p:TerminalLearningPass {key: $key}) WHERE p.useful IS NOT NULL OPTIONAL MATCH (p)-[:CONTRADICTED]->(k:Knowledge) \
+         RETURN p.useful, p.lesson, p.anchor, p.scope, p.correction_quote, p.preference_quote, collect(k.id)",
+        json!({"key": pass_key}),
+        1,
+    )
+    .await?;
+    let lesson: Option<Distilled> = if let Some(row) = prior.first() {
+        let text = |index: usize| row.get(index).and_then(Value::as_str).unwrap_or("").to_owned();
+        let contradicted = row.get(6).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
+        Some(Distilled { useful: text(0), lesson: text(1), anchor: text(2), scope: text(3), correction_quote: text(4), preference_quote: text(5), contradicted })
+    } else if e.status != "cancelled" && (!e.continuing || !e.failure.is_empty() || e.outcome_exit.is_some_and(|code| code != 0) || !e.correction.is_empty() || e.checks.contains("Not run:")) {
         let schema: Value = serde_json::from_str(&std::fs::read_to_string(flow.data_file("schemas/learn.json")).map_err(|error| RpcError::internal(error.to_string()))?)?;
         let card = json!({"question": e.question, "intent": e.intent, "folder": e.cwd, "failure": e.failure, "facts": e.facts, "checks": e.checks,
             "answer": e.answer, "proposal": e.proposal, "observed_command": e.outcome_command, "observed_exit": e.outcome_exit, "verified_fix": e.verified_fix(), "check_repair": e.check_repair,
-            "next_user_message": e.correction, "shown": e.shown});
+            "next_user_message": e.correction, "question_is_user_words": !e.continuing, "shown": e.shown});
         let result =
             background(flow, "learn", vec![ChatMessage::new("system", flow.prompt("learn")?), ChatMessage::new("user", security::guard(&card.to_string()))], Some(schema), cancel)
                 .await?;
         if result.result.finish_reason != "stop" {
             return Err(RpcError::internal("terminal lesson extraction did not finish"));
         }
-        let learned: Distilled = parse_json(&result.result.content)?;
+        let mut learned: Distilled = parse_json(&result.result.content)?;
+        // Only memory shown in the episode can have been contradicted by it.
+        learned.contradicted.retain(|id| e.shown.iter().any(|shown| &shown.id == id));
         Some(learned)
     } else {
         None
     };
     check_cancel(cancel)?;
     // Persist the actual extraction before any side effect, so a retry does not ask for a new lesson.
-    pass(flow, e, &pass_key, "distilled", serde_json::to_string(&lesson)?).await?;
+    pass(flow, e, &pass_key, "distilled", lesson.as_ref(), None).await?;
     let mut lesson_id = None;
     if let Some(learned) = &lesson {
         let text = learned.lesson.split_whitespace().collect::<Vec<_>>().join(" ");
-        let anchor_ok = matches!(learned.anchor.as_str(), "tool:run" | "tool:skill" | "approach") || learned.anchor.starts_with("command:");
+        let anchor_ok = matches!(learned.anchor.as_str(), "tool:run" | "tool:skill" | "approach" | "preference") || learned.anchor.starts_with("command:");
         // A model may propose a lesson, never relax the command risk policy through memory.
-        let explicit_correction = !learned.correction_quote.trim().is_empty() && e.correction.contains(&learned.correction_quote);
-        let demonstrated = e.verified_fix() || e.check_repair || explicit_correction;
-        if demonstrated && learned.useful == "yes" && !text.is_empty() && text.chars().count() <= 240 && anchor_ok && security::guarded_reasons(&text).is_none() {
-            lesson_id = keep(flow, e, learned, &text).await?;
+        let explicit_correction = was_corrected(learned, e);
+        // The user's own standing rule, in their own words ("I use pnpm here", "remember ...").
+        let stated = !e.continuing && !learned.preference_quote.trim().is_empty() && e.question.contains(&learned.preference_quote);
+        // Why it is kept, as Settings › Memory says it.
+        let why = if e.verified_fix() {
+            Some("fix")
+        } else if e.check_repair {
+            Some("check")
+        } else if explicit_correction {
+            Some("correction")
+        } else if stated {
+            Some("preference")
+        } else {
+            None
+        };
+        if let Some(why) = why
+            && learned.useful == "yes"
+            && !text.is_empty()
+            && text.chars().count() <= 240
+            && anchor_ok
+            && security::guarded_reasons(&text).is_none()
+        {
+            lesson_id = keep(flow, e, learned, &text, why).await?;
+        }
+        if explicit_correction {
+            replace_corrected(flow, e, learned, lesson_id.as_deref()).await?;
         }
     }
     feedback(flow, e, lesson.as_ref()).await?;
     check_cancel(cancel)?;
-    pass(flow, e, &pass_key, "done", serde_json::to_string(&lesson)?).await?;
-    flow.journal(
-        &e.session,
-        kinds::NOTE,
-        json!({"purpose": "terminal_learned", "run_id": e.run,
-        "pass": pass_key, "lesson_id": lesson_id, "host_message": false, "text": ""}),
-    )
-    .await?;
+    pass(flow, e, &pass_key, "done", lesson.as_ref(), lesson_id.as_deref()).await?;
     Ok(())
 }
 
-async fn pass(flow: &Flow, e: &Episode, key: &str, state: &str, distilled: String) -> Result<(), RpcError> {
-    put(
-        flow,
-        vec![json!({"label": "TerminalLearningPass", "key": key, "props": {"state": state, "distilled_json": distilled, "updated_ms": now_ms()}})],
-        vec![edge("TerminalLearningPass", key, "FROM", "TerminalEpisode", &e.key())],
-    )
-    .await
+fn was_corrected(learned: &Distilled, e: &Episode) -> bool {
+    !learned.correction_quote.trim().is_empty() && e.correction.contains(&learned.correction_quote)
 }
 
-async fn keep(flow: &Flow, e: &Episode, learned: &Distilled, text: &str) -> Result<Option<String>, RpcError> {
+/// The user said a shown lesson was wrong: it goes now, replaced by what they said instead when
+/// that was learned, rather than waiting for three bad observations.
+async fn replace_corrected(flow: &Flow, e: &Episode, learned: &Distilled, replacement: Option<&str>) -> Result<(), RpcError> {
+    for id in learned.contradicted.iter().filter(|id| e.shown.iter().any(|shown| &shown.id == *id && shown.kind == "lesson")) {
+        let item: KnowledgeItem = parse_params(flow.ctx()?.call(memory::KNOWLEDGE_GET, json!({"id": id})).await?)?;
+        if item.by != "chatflow-terminal" || matches!(item.state.as_str(), "withdrawn" | "superseded") {
+            continue;
+        }
+        match replacement.filter(|new| new != id) {
+            Some(new) => flow.ctx()?.call(memory::KNOWLEDGE_SUPERSEDE, json!({"id": id, "by": new})).await?,
+            None => flow.ctx()?.call(memory::KNOWLEDGE_WITHDRAW, json!({"id": id, "reason": "The user corrected it", "by": "chatflow-terminal"})).await?,
+        };
+    }
+    Ok(())
+}
+
+/// The pass's state and what the model distilled: its fields, the shown memory it contradicted
+/// and the lesson kept from it.
+async fn pass(flow: &Flow, e: &Episode, key: &str, state: &str, distilled: Option<&Distilled>, kept: Option<&str>) -> Result<(), RpcError> {
+    let props = match distilled {
+        Some(d) => json!({"state": state, "updated_ms": now_ms(), "useful": d.useful, "lesson": d.lesson, "anchor": d.anchor, "scope": d.scope,
+            "correction_quote": d.correction_quote, "preference_quote": d.preference_quote}),
+        None => json!({"state": state, "updated_ms": now_ms()}),
+    };
+    let mut edges = vec![edge("TerminalLearningPass", key, "FROM", "TerminalEpisode", &e.key())];
+    if let Some(d) = distilled {
+        edges.extend(d.contradicted.iter().map(|id| edge("TerminalLearningPass", key, "CONTRADICTED", "Knowledge", id)));
+    }
+    if let Some(id) = kept {
+        edges.push(edge("TerminalLearningPass", key, "DISTILLED", "Knowledge", id));
+    }
+    put(flow, vec![json!({"label": "TerminalLearningPass", "key": key, "props": props})], edges).await
+}
+
+async fn keep(flow: &Flow, e: &Episode, learned: &Distilled, text: &str, why: &str) -> Result<Option<String>, RpcError> {
     let local = learned.scope != "general" || text.contains('/') || text.contains('~') || (!e.cwd.is_empty() && text.contains(&e.cwd));
     if local && e.cwd.is_empty() {
         return Ok(None);
     }
+    // The lesson is its text. Where it holds is its ABOUT edge and scope alias; what it is anchored
+    // to is on the pass that distilled it. The same lesson learned in another folder is one item.
     let scope = if local { format!("folder:{}", e.cwd) } else { format!("os:{}", std::env::consts::OS) };
-    let name = format!("{} [{}]: {}", learned.anchor, scope, text);
+    let name = text;
     let all: KnowledgeListResult = parse_params(flow.ctx()?.call(memory::KNOWLEDGE_LIST, json!({"kind": "lesson", "include_history": true})).await?)?;
     let mut existing = all.items.iter().find(|item| item.name == name).cloned();
     if existing.is_none() {
-        let similar: KnowledgeSearchResult = parse_params(flow.ctx()?.call(memory::KNOWLEDGE_SEARCH, json!({"kind": "lesson", "text": text, "limit": 3})).await?)?;
+        // Withdrawn and replaced lessons too: one the user removed is not learned again in other words.
+        let similar: KnowledgeSearchResult = parse_params(flow.ctx()?.call(memory::KNOWLEDGE_SEARCH, json!({"kind": "lesson", "text": text, "limit": 3, "include_history": true})).await?)?;
         existing =
-            similar.items.into_iter().find(|item| item.score.unwrap_or(0.0) >= 0.90 && item.name.starts_with(&format!("{} [", learned.anchor)) && item.aliases.contains(&scope));
+            similar.items.into_iter().find(|item| item.score.unwrap_or(0.0) >= 0.90 && item.aliases.contains(&scope));
     }
     // A user editing a learned item owns it; the learner does not replace that provenance.
     if existing.as_ref().is_some_and(|item| item.by != "chatflow-terminal") {
@@ -578,7 +828,7 @@ async fn keep(flow: &Flow, e: &Episode, learned: &Distilled, text: &str) -> Resu
     if existing.as_ref().is_some_and(|item| matches!(item.state.as_str(), "withdrawn" | "superseded")) {
         return Ok(None);
     }
-    let name = existing.as_ref().map(|item| item.name.as_str()).unwrap_or(&name);
+    let name = existing.as_ref().map(|item| item.name.as_str()).unwrap_or(name);
     let mut aliases = vec![scope];
     if !e.failure.is_empty() {
         aliases.push(e.failure.clone());
@@ -595,10 +845,12 @@ async fn keep(flow: &Flow, e: &Episode, learned: &Distilled, text: &str) -> Resu
             )
             .await?,
     )?;
-    let mut edges = vec![edge("Knowledge", &item.id, "LEARNED_FROM", "TerminalEpisode", &e.key())];
+    let mut learned_from = edge("Knowledge", &item.id, "LEARNED_FROM", "TerminalEpisode", &e.key());
+    learned_from["props"] = json!({"why": why});
+    let mut edges = vec![learned_from];
     let mut nodes = Vec::new();
     if local {
-        nodes.push(json!({"label": "Folder", "key": e.cwd}));
+        folder_chain(&e.cwd, &mut nodes, &mut edges);
         edges.push(edge("Knowledge", &item.id, "ABOUT", "Folder", &e.cwd));
     }
     put(flow, nodes, edges).await?;
@@ -609,7 +861,7 @@ async fn feedback(flow: &Flow, e: &Episode, distilled: Option<&Distilled>) -> Re
     let lessons: Vec<_> = e.shown.iter().filter(|s| s.kind == "lesson").collect();
     let matching = lessons.iter().filter(|s| !s.failure.is_empty() && s.failure == e.failure).count();
     for item in lessons {
-        let corrected = distilled.is_some_and(|d| !d.correction_quote.trim().is_empty() && e.correction.contains(&d.correction_quote) && d.contradicted.contains(&item.id));
+        let corrected = distilled.is_some_and(|d| was_corrected(d, e) && d.contradicted.contains(&item.id));
         let applied = !e.proposal.is_empty() && replay::same_command(&e.proposal, &e.outcome_command);
         let verdict = if corrected {
             "hurt"
@@ -656,7 +908,7 @@ pub async fn record_feedback(flow: &Flow, key: &str, episode: &str, lesson: &str
     put(
         flow,
         vec![json!({"label": "TerminalFeedback", "key": key, "props": {
-            "lesson_id": lesson, "verdict": verdict, "source": source, "evidence": evidence, "created_ms": now_ms()
+            "verdict": verdict, "source": source, "evidence": evidence, "created_ms": now_ms()
         }})],
         vec![edge("TerminalFeedback", key, "FOR", "Knowledge", lesson), edge("TerminalFeedback", key, "FROM", "TerminalEpisode", episode)],
     )
@@ -670,8 +922,10 @@ pub struct Score {
     pub seen: u64,
 }
 
+/// Replays of the old `recorded_context_replay` source were graded on the very episode a lesson
+/// was learned from, which proves nothing; they are not counted.
 pub async fn scores(flow: &Flow) -> Result<HashMap<String, Score>, RpcError> {
-    let found = rows(flow, "MATCH (f:TerminalFeedback) RETURN f.lesson_id, f.verdict, count(f)", json!({}), 5000).await?;
+    let found = rows(flow, "MATCH (f:TerminalFeedback)-[:FOR]->(k:Knowledge) WHERE f.source <> 'recorded_context_replay' RETURN k.id, f.verdict, count(f)", json!({}), 5000).await?;
     let mut scores: HashMap<String, Score> = HashMap::new();
     for row in found {
         let Some(id) = row.first().and_then(Value::as_str) else { continue };
@@ -687,18 +941,27 @@ pub async fn scores(flow: &Flow) -> Result<HashMap<String, Score>, RpcError> {
     Ok(scores)
 }
 
-async fn withdraw_harmful(flow: &Flow) -> Result<(), RpcError> {
-    for (id, score) in scores(flow).await? {
-        if score.hurt > score.helped && score.hurt + score.helped >= 3 {
-            let item: KnowledgeItem = parse_params(flow.ctx()?.call(memory::KNOWLEDGE_GET, json!({"id": id})).await?)?;
-            if item.kind == "lesson" && item.by == "chatflow-terminal" && item.state != "withdrawn" {
-                flow.ctx()?
-                    .call(
-                        memory::KNOWLEDGE_WITHDRAW,
-                        json!({"id": id, "reason": "More harmful than helpful across at least three recorded observations", "by": "chatflow-terminal"}),
-                    )
-                    .await?;
-            }
+/// More harmful than helpful across at least three observations.
+fn harmful(score: Option<&Score>) -> bool {
+    score.is_some_and(|s| s.hurt > s.helped && s.hurt + s.helped >= 3)
+}
+
+/// Each lesson carries its score where memory shows it, and a harmful one is withdrawn. The
+/// counters only add, so they are brought up to the graph's count, never past it.
+async fn settle_lessons(flow: &Flow) -> Result<(), RpcError> {
+    let scores = scores(flow).await?;
+    let lessons: KnowledgeListResult = parse_params(flow.ctx()?.call(memory::KNOWLEDGE_LIST, json!({"kind": "lesson", "include_history": true})).await?)?;
+    for item in &lessons.items {
+        let Some(score) = scores.get(&item.id) else { continue };
+        let more = |now: u64, stored: u32| now.saturating_sub(u64::from(stored)) as u32;
+        let (seen, helped, hurt) = (more(score.seen, item.seen), more(score.helped, item.helped), more(score.hurt, item.hurt));
+        if seen + helped + hurt > 0 {
+            flow.ctx()?.call(memory::KNOWLEDGE_COUNT, json!({"id": item.id, "seen": seen, "helped": helped, "hurt": hurt})).await?;
+        }
+        if harmful(Some(score)) && item.by == "chatflow-terminal" && !matches!(item.state.as_str(), "withdrawn" | "superseded") {
+            flow.ctx()?
+                .call(memory::KNOWLEDGE_WITHDRAW, json!({"id": item.id, "reason": "More harmful than helpful across at least three recorded observations", "by": "chatflow-terminal"}))
+                .await?;
         }
     }
     Ok(())
@@ -774,6 +1037,9 @@ pub async fn background(flow: &Flow, purpose: &str, messages: Vec<ChatMessage>, 
     outcome
 }
 
+/// The graph read, for other parts of the flow.
+pub const GRAPH_QUERY: &str = memory::GRAPH_QUERY;
+
 pub async fn rows(flow: &Flow, cypher: &str, params: Value, limit: u32) -> Result<Vec<Vec<Value>>, RpcError> {
     let result = flow.ctx()?.call(memory::GRAPH_QUERY, json!({"cypher": cypher, "params": params, "limit": limit})).await?;
     if result.get("truncated").and_then(Value::as_bool) == Some(true) {
@@ -808,36 +1074,41 @@ fn parse_json<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, RpcError>
     serde_json::from_str(text.trim()).map_err(|error| RpcError::internal(format!("terminal learning JSON: {error}")))
 }
 
-async fn night_report(flow: &Flow) -> Result<(), RpcError> {
-    // Day keys are UTC, matching the journal timestamps and CC's daily review convention.
-    let day = now_ms() / 86_400_000;
-    let key = format!("terminal-{day}");
-    if !rows(flow, "MATCH (r:TerminalNightReport {key: $key}) RETURN r.key", json!({"key": key}), 1).await?.is_empty() {
-        return Ok(());
-    }
-    let lessons: KnowledgeListResult = parse_params(flow.ctx()?.call(memory::KNOWLEDGE_LIST, json!({"kind": "lesson"})).await?)?;
-    let scores = scores(flow).await?;
-    let replays = rows(flow, "MATCH (r:TerminalReplay) WHERE r.created_ms >= $since RETURN r.lesson_id, r.verdict, r.oracle", json!({"since": day * 86_400_000}), 5000).await?;
-    let mut text = vec!["# CortexTerm learning review".to_owned(), "Proposals only: skills and risk-engine code are never changed by learning.".into()];
-    for item in lessons.items.iter().filter(|item| item.by == "chatflow-terminal") {
-        let score = scores.get(&item.id);
-        let (helped, hurt, seen) = score.map_or((0, 0, 0), |s| (s.helped, s.hurt, s.seen));
-        text.push(format!("- {}: helped {helped}, hurt {hurt}, observations {seen}; {}", item.name, item.evidence.join(", ")));
-        if helped >= 3 && hurt == 0 {
-            text.push(format!("  Proposed skill addition: {}", item.text));
+/// Once per start, for records earlier versions wrote: an episode's snapshot moves from JSON text
+/// to the episodes stream, and properties that copied an edge or held JSON are dropped.
+async fn migrate(flow: &Flow) -> Result<(), RpcError> {
+    let gone = |names: &[&str]| names.iter().map(|name| (name.to_string(), Value::Null)).collect::<serde_json::Map<_, _>>();
+    loop {
+        let old = rows(flow, "MATCH (e:TerminalEpisode) WHERE e.session_id IS NOT NULL OR e.messages_json IS NOT NULL RETURN e.key, e.messages_json, e.shown_json LIMIT 1000", json!({}), 1000).await?;
+        if old.is_empty() {
+            break;
         }
-        if helped >= 5 && hurt == 0 && item.aliases.iter().any(|a| a.starts_with("failed ") || a.starts_with("refused ")) {
-            text.push(format!("  Proposed host repair review: {}", item.text));
+        let mut records = Vec::new();
+        let mut nodes = Vec::new();
+        for row in &old {
+            let value = |index: usize| row.get(index).and_then(Value::as_str).and_then(|text| serde_json::from_str::<Value>(text).ok()).unwrap_or(json!([]));
+            let key = row.first().and_then(Value::as_str).unwrap_or("");
+            let mut props = gone(&["session_id", "run_id", "cwd", "outcome_id", "outcome_command", "messages_json", "shown_json"]);
+            if row.get(1).is_some_and(|v| !v.is_null()) {
+                records.push(json!({"episode": key, "messages": value(1), "shown": value(2)}));
+                props.insert("at_ms".into(), json!(now_ms()));
+            }
+            nodes.push(json!({"label": "TerminalEpisode", "key": key, "props": props}));
+        }
+        if !records.is_empty() {
+            append_episodes(flow, records).await?;
+        }
+        put(flow, nodes, Vec::new()).await?;
+    }
+    for (label, names) in [("TerminalFeedback", &["lesson_id"][..]), ("TerminalReplay", &["lesson_id", "lesson_text"][..]), ("TerminalLearningPass", &["distilled_json"][..])] {
+        loop {
+            let old = rows(flow, &format!("MATCH (n:{label}) WHERE n.{} IS NOT NULL RETURN n.key LIMIT 1000", names[0]), json!({}), 1000).await?;
+            if old.is_empty() {
+                break;
+            }
+            let nodes = old.iter().filter_map(|row| row.first()?.as_str()).map(|key| json!({"label": label, "key": key, "props": gone(names)})).collect();
+            put(flow, nodes, Vec::new()).await?;
         }
     }
-    for row in &replays {
-        text.push(format!("- Recorded-context replay: {}", serde_json::to_string(row)?));
-    }
-    let machine = flow.ctx()?.call(memory::GRAPH_MACHINE, json!({})).await?;
-    put(
-        flow,
-        vec![json!({"label": "TerminalNightReport", "key": key, "props": {"text": text.join("\n"), "created_ms": now_ms(), "replays": replays.len()}})],
-        vec![edge("TerminalNightReport", &key, "ON", "Machine", field(&machine, "key"))],
-    )
-    .await
+    Ok(())
 }

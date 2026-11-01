@@ -1,0 +1,6 @@
+#!/bin/sh
+# Start the event sensor service now (and after an update, the new one).
+plist=/Library/LaunchDaemons/ai.cortexterm.event-sensor.plist
+/bin/launchctl bootout system "$plist" 2>/dev/null
+/bin/launchctl bootstrap system "$plist"
+exit 0

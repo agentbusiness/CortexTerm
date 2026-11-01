@@ -131,10 +131,11 @@ pub struct ProtectionStatus {
     pub sensors: Vec<ProtectionSensor>,
     pub incidents: Vec<SecurityIncident>,
     pub exceptions: Vec<SecurityException>,
-    /// An explicit user-run command; never executed by configuration or the model.
-    pub deep_capture_command: Option<String>,
     /// Opens the verified signed installer; installation still requires the user's OS approval.
     pub deep_install_command: Option<String>,
+    /// The sensor service is installed: it starts at boot and CortexTerm reads it by itself.
+    #[serde(default)]
+    pub deep_service: bool,
     pub packet_capture_help: String,
     pub visibility: String,
 }
@@ -710,6 +711,10 @@ pub struct Finding {
     /// A command that ran to fix it and did not: a fresh check still found it.
     #[serde(default)]
     pub tried: Option<String>,
+    /// The model's second look found it worse than code rated it (`password or keychain theft` …):
+    /// it is raised one level. The model can only raise, never lower or close a finding.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub raised: String,
     /// The graph node it is about, as (label, key): the plugin's own record, never sent.
     #[serde(skip)]
     pub about: Option<(String, String)>,

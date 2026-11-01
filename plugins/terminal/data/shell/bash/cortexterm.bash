@@ -30,7 +30,6 @@ fi
 if [[ $- == *i* && -n $CORTEXTERM_NONCE ]]; then
   _ct_nonce=$CORTEXTERM_NONCE
   builtin unset CORTEXTERM_NONCE
-  _ct_prompts=0
   _ct_path=
   _ct_aliases=
   _ct_funcs=
@@ -42,8 +41,9 @@ if [[ $- == *i* && -n $CORTEXTERM_NONCE ]]; then
 
   _ct_precmd() {
     local ret=$? k a=
-    # A D without a C (an empty line) is ignored by the terminal.
-    (( _ct_prompts++ )) && builtin printf '\e]133;D;%s\a' "$ret"
+    # Every prompt: a D without a C (an empty line, the first prompt) is ignored by the terminal,
+    # and the signed D tells it that an unsigned one comes from a shell inside this one (ssh).
+    builtin printf '\e]133;D;%s;%s\a' "$ret" "$_ct_nonce"
     builtin printf '\e]7;file://%s%s\a' "$HOSTNAME" "${PWD// /%20}"
     _ct_send env "$PATH" "$_ct_path" && _ct_path=$PATH
     for k in "${!BASH_ALIASES[@]}"; do a+="$k=${BASH_ALIASES[$k]}"$'\n'; done

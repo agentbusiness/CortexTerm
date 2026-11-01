@@ -1,72 +1,166 @@
 //! User-authorized native Endpoint Security capture. The privileged helper has one job: emit
-//! allow-listed metadata. This unprivileged sink removes all unrecognized fields before writing.
+//! allow-listed metadata. This unprivileged reader removes all unrecognized fields before the
+//! events reach the collector (in this process) and the `protection.events` stream.
 
 use super::input;
-use serde_json::{Value, json};
+use cc_protocol::contracts::system::{ProtectionSensor, SecurityObservation};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap};
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::io::{BufRead, BufReader};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-const FILE_LIMIT: u64 = 16 * 1024 * 1024;
 const MAX_LINE: usize = 64 * 1024;
-static STOP_CAPTURE: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn request_stop(_signal: libc::c_int) {
-    STOP_CAPTURE.store(true, Ordering::Relaxed);
-}
-
-struct SignalGuard {
-    interrupt: libc::sighandler_t,
-    terminate: libc::sighandler_t,
-}
-impl Drop for SignalGuard {
-    fn drop(&mut self) {
-        unsafe {
-            libc::signal(libc::SIGINT, self.interrupt);
-            libc::signal(libc::SIGTERM, self.terminate);
-        }
-    }
-}
+/// Cleaned events waiting for the collector; more are counted as lost.
+const MAX_WAITING: usize = 4096;
+/// A sensor without a valid record for this long is stale.
+const FRESH_MS: u64 = 120_000;
+/// The history of cleaned endpoint events.
+const TOPIC: &str = "protection.events";
 
 fn shell(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-const INSTALLED_HELPER: &str = "/Library/Application Support/CortexTerm/Security/CortexTermEventSensor.app/Contents/MacOS/cortexterm-event-sensor";
+/// The installed sensor service (a LaunchDaemon) and the socket it serves the connecting user on.
+const SERVICE: &str = "/Library/LaunchDaemons/ai.cortexterm.event-sensor.plist";
+const SOCKET: &str = "/var/run/ai.cortexterm.event-sensor.sock";
+static SERVICE_RUNNING: AtomicBool = AtomicBool::new(false);
+static SERVICE_STOP: AtomicBool = AtomicBool::new(false);
+static SERVICE_PROBLEM: Mutex<Option<String>> = Mutex::new(None);
 
-/// The producer elevated by this command must be installed in the fixed root-owned location.
-/// A mutable plugin asset, unsigned build, or unprovisioned helper is never offered to sudo.
-pub fn deep_capture_command() -> Option<String> {
-    if !cfg!(target_os = "macos") {
-        return None;
+/// What the service thread handed over and the collector has not taken yet.
+struct Feed {
+    events: VecDeque<SecurityObservation>,
+    /// The last valid native record (0: none yet).
+    last_at: u64,
+    /// Records lost here (malformed, stale, over the queue) and the most the producer reported.
+    lost: u64,
+    native_lost: u64,
+    stopped: bool,
+}
+
+static FEED: Mutex<Feed> = Mutex::new(Feed { events: VecDeque::new(), last_at: 0, lost: 0, native_lost: 0, stopped: false });
+
+fn feed() -> std::sync::MutexGuard<'static, Feed> {
+    FEED.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+pub fn service_installed() -> bool {
+    Path::new(SERVICE).exists()
+}
+
+/// Why the sensor service gives no events, when it said.
+pub fn service_problem() -> Option<String> {
+    SERVICE_PROBLEM.lock().ok()?.clone()
+}
+
+/// While deep monitoring is on, read the installed sensor service's events: no terminal, no
+/// sudo. The socket must belong to root and be served by a root process.
+pub fn service_capture(on: bool) {
+    if !on {
+        if SERVICE_RUNNING.load(Ordering::Relaxed) {
+            SERVICE_STOP.store(true, Ordering::Relaxed);
+        }
+        *feed() = Feed { events: VecDeque::new(), last_at: 0, lost: 0, native_lost: 0, stopped: false };
+        return;
     }
-    let exe = std::env::current_exe().ok()?;
-    let helper = Path::new(INSTALLED_HELPER);
-    if !root_helper_path(helper) || !helper_trusted(helper, &exe) {
-        return None;
+    if !service_installed() || SERVICE_RUNNING.swap(true, Ordering::Relaxed) {
+        return;
     }
-    let uid = unsafe { libc::geteuid() };
-    if uid == 0 {
-        return None;
+    SERVICE_STOP.store(false, Ordering::Relaxed);
+    std::thread::spawn(|| {
+        let problem = |text: Option<String>| {
+            if let Ok(mut slot) = SERVICE_PROBLEM.lock() {
+                *slot = text;
+            }
+        };
+        while !SERVICE_STOP.load(Ordering::Relaxed) {
+            let owned = std::fs::symlink_metadata(SOCKET).is_ok_and(|meta| meta.uid() == 0);
+            match std::os::unix::net::UnixStream::connect(SOCKET) {
+                Ok(stream) if owned => {
+                    let (mut uid, mut gid) = (u32::MAX, u32::MAX);
+                    let root = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } == 0 && uid == 0;
+                    if !root {
+                        problem(Some("The sensor socket is not served by root; it was not read.".into()));
+                    } else {
+                        let end = stream.try_clone().ok();
+                        problem(capture(stream).err());
+                        if let Some(end) = end {
+                            let _ = end.shutdown(std::net::Shutdown::Both);
+                        }
+                    }
+                }
+                _ => problem(Some("The sensor service is installed but not answering yet; it starts within seconds of installing.".into())),
+            }
+            for _ in 0..10 {
+                if SERVICE_STOP.load(Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        SERVICE_RUNNING.store(false, Ordering::Relaxed);
+    });
+}
+
+/// The events the service handed over since the last call (also appended to `protection.events`)
+/// and the sensor's state.
+pub fn take() -> (Vec<SecurityObservation>, ProtectionSensor) {
+    let now = crate::util::now_ms();
+    let (events, last_at, dropped, stopped) = {
+        let mut feed = feed();
+        (feed.events.drain(..).collect::<Vec<_>>(), feed.last_at, feed.lost.saturating_add(feed.native_lost), feed.stopped)
+    };
+    if !events.is_empty() {
+        crate::graph::append(TOPIC, events.iter().filter_map(|e| serde_json::to_value(e).ok()).collect(), 14);
     }
-    let dir = crate::util::data_dir();
-    let home = std::fs::canonicalize(crate::util::home()).ok()?;
-    Some(format!(
-        "mkdir -p -m 700 {} && sudo {} --uid {uid} --home {} --exclude-path {} | env CORTEX_PLUGIN_DATA={} {} --security-events",
-        shell(&dir.to_string_lossy()),
-        shell(&helper.to_string_lossy()),
-        shell(&home.to_string_lossy()),
-        shell(&dir.to_string_lossy()),
-        shell(&dir.to_string_lossy()),
-        shell(&exe.to_string_lossy())
-    ))
+    let mut status = ProtectionSensor { id: "endpoint".into(), label: "Endpoint events".into(), last_at, dropped, ..Default::default() };
+    if last_at == 0 {
+        let problem = service_problem();
+        let (state, step) = if service_installed() {
+            match problem.as_deref() {
+                Some(problem) => ("unavailable", problem),
+                None => ("starting", "The sensor service is installed; waiting for its first events."),
+            }
+        } else if deep_install_command().is_some() {
+            ("unavailable", "The native sensor is not installed yet. Turning on deep monitoring opens its installer; macOS asks for your password once.")
+        } else {
+            ("unavailable", "This build has no signed sensor to install: it needs Apple's Endpoint Security approval for the signing team first. Nothing on this Mac can turn it on until then.")
+        };
+        status.state = state.into();
+        status.detail = step.to_owned();
+        return (events, status);
+    }
+    status.state = if stopped {
+        "unavailable"
+    } else if now.saturating_sub(last_at) > FRESH_MS || dropped > 0 {
+        "degraded"
+    } else {
+        "active"
+    }
+    .into();
+    status.detail = format!(
+        "Local metadata only. Last validated record {} seconds ago; {dropped} records lost. {}",
+        now.saturating_sub(last_at) / 1000,
+        if stopped {
+            "The native producer ended; the sensor service is asked again within seconds."
+        } else {
+            "Native Endpoint Security sensor must remain running with its required permissions."
+        }
+    );
+    (events, status)
+}
+
+/// Open the signed sensor installer (macOS asks for an administrator's approval). True when it
+/// was opened.
+pub fn open_installer() -> bool {
+    deep_install_command().is_some_and(|command| crate::util::run("/bin/sh", &["-c", &command], Duration::from_secs(10)).is_ok_and(|out| out.ok))
 }
 
 pub fn deep_install_command() -> Option<String> {
@@ -157,17 +251,8 @@ pub fn deep_install_command() -> Option<String> {
     None
 }
 
-fn root_helper_path(path: &Path) -> bool {
-    path == Path::new(INSTALLED_HELPER)
-        && path.ancestors().all(|ancestor| {
-            std::fs::symlink_metadata(ancestor).is_ok_and(|meta| {
-                !meta.file_type().is_symlink() && meta.uid() == 0 && meta.mode() & 0o022 == 0
-            })
-        })
-}
-
 fn expected_team(executable: &Path) -> Option<String> {
-    signature(executable).map(|(team, _)| team).or_else(|| {
+    signature_team(executable).or_else(|| {
         option_env!("CORTEXTERM_ES_TEAM_ID")
             .filter(|team| team.len() == 10 && team.bytes().all(|b| b.is_ascii_alphanumeric()))
             .map(str::to_owned)
@@ -186,7 +271,8 @@ fn trusted_path(path: &Path) -> bool {
         })
 }
 
-fn signature(path: &Path) -> Option<(String, plist::Dictionary)> {
+/// The team of a valid, non-ad-hoc code signature.
+fn signature_team(path: &Path) -> Option<String> {
     let text = path.to_str()?;
     let verify = crate::util::run(
         "/usr/bin/codesign",
@@ -197,13 +283,8 @@ fn signature(path: &Path) -> Option<(String, plist::Dictionary)> {
     if !verify.ok {
         return None;
     }
-    let out = crate::util::run(
-        "/usr/bin/codesign",
-        &["-dvvvv", "--entitlements", "-", "--xml", text],
-        Duration::from_secs(5),
-    )
-    .ok()?;
-    if !out.ok || out.stderr.contains("Signature=adhoc") || out.stdout.len() > 256 * 1024 {
+    let out = crate::util::run("/usr/bin/codesign", &["-dvvvv", text], Duration::from_secs(5)).ok()?;
+    if !out.ok || out.stderr.contains("Signature=adhoc") {
         return None;
     }
     let team = out
@@ -214,252 +295,33 @@ fn signature(path: &Path) -> Option<(String, plist::Dictionary)> {
     if team.len() != 10 || !team.bytes().all(|c| c.is_ascii_alphanumeric()) {
         return None;
     }
-    let identifier = out
-        .stderr
-        .lines()
-        .find_map(|line| line.strip_prefix("Identifier="))?
-        .trim();
-    let mut entitlements = if out.stdout.trim().is_empty() {
-        plist::Dictionary::new()
-    } else {
-        match plist::Value::from_reader_xml(out.stdout.as_bytes()).ok()? {
-            plist::Value::Dictionary(dict) => dict,
-            _ => return None,
-        }
-    };
-    entitlements.insert(
-        "__identifier".into(),
-        plist::Value::String(identifier.into()),
-    );
-    Some((team.into(), entitlements))
+    Some(team.into())
 }
 
-fn helper_trusted(path: &Path, own_executable: &Path) -> bool {
-    use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<Option<(Vec<u8>, Instant, bool)>>> = OnceLock::new();
-    let Some(contents) = path.parent().and_then(Path::parent) else {
-        return false;
-    };
-    let Some(bundle) = contents.parent() else {
-        return false;
-    };
-    let profile = contents.join("embedded.provisionprofile");
-    if !root_helper_path(path) || !trusted_path(own_executable) {
-        return false;
+/// A cleaned event for the collector; the oldest waiting one is lost when the queue is full.
+fn deliver(event: SecurityObservation, native_lost: u64) {
+    let mut feed = feed();
+    if feed.events.len() >= MAX_WAITING {
+        feed.events.pop_front();
+        feed.lost = feed.lost.saturating_add(1);
     }
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() || meta.mode() & 0o111 == 0 || meta.len() > 64 * 1024 * 1024 {
-        return false;
-    }
-    let Ok(profile_meta) = std::fs::symlink_metadata(&profile) else {
-        return false;
-    };
-    if !profile_meta.is_file() || profile_meta.len() > 1024 * 1024 || profile_meta.nlink() != 1 {
-        return false;
-    }
-    if profile_meta.uid() != 0 || profile_meta.mode() & 0o022 != 0 {
-        return false;
-    }
-    let mut digest = Sha256::new();
-    // File replacement, profile replacement and a signed bundle update invalidate the cache.
-    for item in [path, own_executable, profile.as_path(), bundle] {
-        let Ok(meta) = std::fs::symlink_metadata(item) else {
-            return false;
-        };
-        digest.update(item.as_os_str().as_encoded_bytes());
-        for value in [
-            meta.dev(),
-            meta.ino(),
-            meta.len(),
-            meta.mtime() as u64,
-            meta.mtime_nsec() as u64,
-            meta.ctime() as u64,
-            meta.ctime_nsec() as u64,
-            meta.mode() as u64,
-            meta.uid() as u64,
-            meta.gid() as u64,
-        ] {
-            digest.update(value.to_ne_bytes());
-        }
-    }
-    let key = digest.finalize().to_vec();
-    let cache = CACHE.get_or_init(|| Mutex::new(None));
-    if let Ok(guard) = cache.lock() {
-        if let Some((old, checked, valid)) = &*guard {
-            if *old == key && checked.elapsed() < Duration::from_secs(60) {
-                return *valid;
-            }
-        }
-    }
-    let valid = (|| -> Option<()> {
-        let (team, entitlements) = signature(path)?;
-        let own_team = expected_team(own_executable)?;
-        if team != own_team
-            || entitlements.get("__identifier")?.as_string()? != "ai.cortexterm.event-sensor"
-            || entitlements
-                .get("com.apple.developer.endpoint-security.client")?
-                .as_boolean()?
-                != true
-        {
-            return None;
-        }
-        let bundle_check = crate::util::run(
-            "/usr/bin/codesign",
-            &["--verify", "--strict", bundle.to_str()?],
-            Duration::from_secs(5),
-        )
-        .ok()?;
-        if !bundle_check.ok {
-            return None;
-        }
-        let decoded = crate::util::run(
-            "/usr/bin/security",
-            &["cms", "-D", "-i", profile.to_str()?],
-            Duration::from_secs(5),
-        )
-        .ok()?;
-        if !decoded.ok || decoded.stdout.len() > 1024 * 1024 {
-            return None;
-        }
-        let profile = plist::Value::from_reader_xml(decoded.stdout.as_bytes()).ok()?;
-        let dictionary = profile.as_dictionary()?;
-        let expiry: std::time::SystemTime = dictionary.get("ExpirationDate")?.as_date()?.into();
-        if expiry <= std::time::SystemTime::now() {
-            return None;
-        }
-        let permits = dictionary.get("Entitlements")?.as_dictionary()?;
-        let expected = format!("{team}.ai.cortexterm.event-sensor");
-        if permits
-            .get("com.apple.developer.endpoint-security.client")?
-            .as_boolean()?
-            != true
-            || permits
-                .get("com.apple.application-identifier")?
-                .as_string()?
-                != expected
-        {
-            return None;
-        }
-        Some(())
-    })()
-    .is_some();
-    if let Ok(mut guard) = cache.lock() {
-        *guard = Some((key, Instant::now(), valid));
-    }
-    valid
+    feed.events.push_back(event);
+    feed.native_lost = feed.native_lost.max(native_lost);
 }
 
-fn secure_dir(path: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(path)
-        .map_err(|e| format!("Cannot create private capture directory: {e}"))?;
-    let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-    if !meta.is_dir()
-        || meta.file_type().is_symlink()
-        || meta.uid() != unsafe { libc::geteuid() }
-        || meta.mode() & 0o022 != 0
-    {
-        return Err("Capture directory must be owned by you and not writable by group or others; symbolic links are refused.".into());
-    }
-    Ok(())
+fn lost() {
+    let mut feed = feed();
+    feed.lost = feed.lost.saturating_add(1);
 }
 
-fn output(path: &Path) -> Result<File, String> {
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|e| e.to_string())?;
-    let meta = file.metadata().map_err(|e| e.to_string())?;
-    if !meta.is_file()
-        || meta.uid() != unsafe { libc::geteuid() }
-        || meta.mode() & 0o077 != 0
-        || meta.nlink() != 1
-    {
-        return Err(
-            "Capture output must be a private, single-link regular file owned by you.".into(),
-        );
-    }
-    Ok(file)
-}
-
-struct Sink {
-    file: File,
-    path: PathBuf,
-    bytes: u64,
-}
-impl Sink {
-    fn write(&mut self, value: Value) -> Result<(), String> {
-        let mut line = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
-        line.push(b'\n');
-        if self.bytes.saturating_add(line.len() as u64) > FILE_LIMIT {
-            self.file.sync_data().map_err(|e| e.to_string())?;
-            std::fs::rename(&self.path, self.path.with_extension("jsonl.1"))
-                .map_err(|e| e.to_string())?;
-            self.file = output(&self.path)?;
-            self.bytes = 0;
-        }
-        self.file.write_all(&line).map_err(|e| e.to_string())?;
-        self.file.flush().map_err(|e| e.to_string())?;
-        self.bytes = self.bytes.saturating_add(line.len() as u64);
-        Ok(())
-    }
-}
-
-/// Stdin contains only the native helper's schema-1 records. Never run this sink with sudo:
-/// the generated pipeline elevates the native producer alone. EOF stops capture immediately.
-pub fn endpoint_capture() -> Result<(), String> {
-    if unsafe { libc::geteuid() } == 0 {
-        return Err(
-            "Run the capture sink as your normal user; only the native producer needs sudo.".into(),
-        );
-    }
-    STOP_CAPTURE.store(false, Ordering::Relaxed);
-    let signals = unsafe {
-        SignalGuard {
-            interrupt: libc::signal(libc::SIGINT, request_stop as libc::sighandler_t),
-            terminate: libc::signal(libc::SIGTERM, request_stop as libc::sighandler_t),
-        }
-    };
-    if signals.interrupt == libc::SIG_ERR || signals.terminate == libc::SIG_ERR {
-        return Err("Cannot install the capture shutdown handlers.".into());
-    }
-    let _signals = signals;
-    let dir = crate::util::data_dir();
-    secure_dir(&dir)?;
-    let lock_path = dir.join("protection-events.lock");
-    let lock = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(lock_path)
-        .map_err(|e| e.to_string())?;
-    let meta = lock.metadata().map_err(|e| e.to_string())?;
-    if !meta.is_file()
-        || meta.uid() != unsafe { libc::geteuid() }
-        || meta.mode() & 0o077 != 0
-        || meta.nlink() != 1
-    {
-        return Err("Capture lock is not a private regular file.".into());
-    }
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err("Another endpoint capture is already running.".into());
-    }
-    let path = dir.join("protection-events.jsonl");
-    let file = output(&path)?;
-    let bytes = file.metadata().map_err(|e| e.to_string())?.len();
-    let mut sink = Sink { file, path, bytes };
+/// The native helper's schema-1 records from the sensor service's socket, cleaned, to the
+/// collector, until deep monitoring is turned off or the service ends the connection.
+fn capture<R: std::io::Read + Send + 'static>(reader: R) -> Result<(), String> {
     let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(256);
     let dropped = Arc::new(AtomicU64::new(0));
     let loss = dropped.clone();
     std::thread::spawn(move || {
-        let stdin = std::io::stdin();
-        let mut reader = BufReader::new(stdin.lock());
+        let mut reader = BufReader::new(reader);
         let mut line = Vec::new();
         loop {
             line.clear();
@@ -505,49 +367,56 @@ pub fn endpoint_capture() -> Result<(), String> {
         }
     });
     let mut native_dropped = 0u64;
-    let mut last_native = 0u64;
-    let mut last_beat = Instant::now();
+    let mut received = false;
     // Retain fixed-size path hashes for distinct counts, not thousands of long private paths.
     let mut changes: HashMap<String, (Instant, BTreeSet<[u8; 32]>, bool)> = HashMap::new();
     loop {
-        if STOP_CAPTURE.load(Ordering::Relaxed) {
-            sink.write(json!({"schema":1,"record":"stopped","at":crate::util::now_ms(),"dropped":native_dropped.saturating_add(dropped.load(Ordering::Relaxed))}))?;
-            return Ok(());
+        // Losses on the way from the socket count once, as they happen.
+        let reader_lost = dropped.swap(0, Ordering::Relaxed);
+        if reader_lost > 0 {
+            let mut feed = feed();
+            feed.lost = feed.lost.saturating_add(reader_lost);
         }
-        if last_beat.elapsed() >= Duration::from_secs(5) {
-            if last_native > 0 && crate::util::now_ms().saturating_sub(last_native) < 15_000 {
-                sink.write(json!({"schema":1,"record":"heartbeat","at":last_native,"dropped":native_dropped.saturating_add(dropped.load(Ordering::Relaxed))}))?;
-            }
-            last_beat = Instant::now();
+        if SERVICE_STOP.load(Ordering::Relaxed) {
+            return Ok(());
         }
         match receiver.recv_timeout(Duration::from_secs(1)) {
             Ok(line) => {
                 let value: Value = match serde_json::from_slice(&line) {
                     Ok(value) => value,
                     Err(_) => {
-                        dropped.fetch_add(1, Ordering::Relaxed);
+                        lost();
                         continue;
                     }
                 };
                 let now = crate::util::now_ms();
                 let valid_time = value["at"]
                     .as_u64()
-                    .is_some_and(|at| at <= now + 60_000 && now.saturating_sub(at) < 120_000);
+                    .is_some_and(|at| at <= now + 60_000 && now.saturating_sub(at) < FRESH_MS);
                 if value["schema"] != 1 || !valid_time {
-                    dropped.fetch_add(1, Ordering::Relaxed);
+                    lost();
                     continue;
                 }
-                last_native = now;
+                if value["record"] == "error" {
+                    return Err(value["text"].as_str().unwrap_or("The sensor could not start.").chars().take(300).collect());
+                }
+                received = true;
                 native_dropped = value["dropped"].as_u64().unwrap_or(native_dropped);
+                {
+                    let mut feed = feed();
+                    feed.last_at = now;
+                    feed.stopped = false;
+                    feed.native_lost = feed.native_lost.max(native_dropped);
+                }
                 if value["record"] == "heartbeat" {
                     continue;
                 }
-                let Some(mut event) = input::endpoint_observation(&value["observation"]) else {
-                    dropped.fetch_add(1, Ordering::Relaxed);
+                let Some(event) = input::endpoint_observation(&value["observation"]) else {
+                    lost();
                     continue;
                 };
-                if event.at > now + 60_000 || now.saturating_sub(event.at) > 120_000 {
-                    dropped.fetch_add(1, Ordering::Relaxed);
+                if event.at > now + 60_000 || now.saturating_sub(event.at) > FRESH_MS {
+                    lost();
                     continue;
                 }
                 changes.retain(|_, (at, _, _)| at.elapsed() < Duration::from_secs(30));
@@ -556,7 +425,7 @@ pub fn endpoint_capture() -> Result<(), String> {
                     "file_write" | "file_rename" | "file_unlink"
                 ) {
                     if changes.len() >= 1024 && !changes.contains_key(&event.subject) {
-                        dropped.fetch_add(1, Ordering::Relaxed);
+                        lost();
                         continue;
                     }
                     let bucket = changes
@@ -569,25 +438,26 @@ pub fn endpoint_capture() -> Result<(), String> {
                     }
                     if bucket.1.len() >= 50 && !bucket.2 {
                         bucket.2 = true;
-                        event.kind = "bulk_file_change".into();
-                        event.severity = "medium".into();
-                        event.rule = "endpoint.bulk_file_change".into();
-                        event.summary = "A process modified, renamed or removed at least 50 different home-directory files within 30 seconds. This may be a normal batch operation; the file changes alone do not establish ransomware.".into();
-                        event.count = bucket.1.len() as u64;
-                        sink.write(json!({"schema":1,"record":"event","at":now,"dropped":native_dropped.saturating_add(dropped.load(Ordering::Relaxed)),"observation":event}))?;
+                        let mut bulk = event.clone();
+                        bulk.kind = "bulk_file_change".into();
+                        bulk.severity = "medium".into();
+                        bulk.rule = "endpoint.bulk_file_change".into();
+                        bulk.summary = "A process modified, renamed or removed at least 50 different home-directory files within 30 seconds. This may be a normal batch operation; the file changes alone do not establish ransomware.".into();
+                        bulk.count = bucket.1.len() as u64;
+                        deliver(bulk, native_dropped);
                     }
                     // Keep a small sample of the actual changed paths, not every write.
                     if bucket.1.len() > 5 {
                         continue;
                     }
                 }
-                sink.write(json!({"schema":1,"record":"event","at":now,"dropped":native_dropped.saturating_add(dropped.load(Ordering::Relaxed)),"observation":event}))?;
+                deliver(event, native_dropped);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                if last_native == 0 {
+                if !received {
                     return Err("The native producer ended without a valid record. Check its entitlement, Full Disk Access permission and administrator authorization.".into());
                 }
-                sink.write(json!({"schema":1,"record":"stopped","at":crate::util::now_ms(),"dropped":native_dropped.saturating_add(dropped.load(Ordering::Relaxed))}))?;
+                feed().stopped = true;
                 return Ok(());
             }
             Err(mpsc::RecvTimeoutError::Timeout) => (),

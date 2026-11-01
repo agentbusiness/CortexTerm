@@ -4,7 +4,7 @@
 //! deletes the file:
 //!
 //! - the login-items database (`sfltool dumpbtm`): each item as `(:StartItem {key: btm:…, source:
-//!   btm, name, identifier, kind, disposition, program, url, team, developer})-[:ON]->(:Machine)`
+//!   btm, label, identifier, kind, disposition, program, url, team, developer})-[:ON]->(:Machine)`
 //!   (`-[:STARTS]->(:Binary)` when it names a program), the dump as `(:MacSetting {key: btm_dump,
 //!   value*, checked_ms, items})`;
 //! - eslogger: what it flagged in the stream `eslogger` (`{capture, severity, text}`), the
@@ -20,7 +20,7 @@ use std::time::Duration;
 
 /// The fields of a BTM record kept, with the property each is kept as.
 const BTM_FIELDS: &[(&str, &str)] = &[
-    ("Name", "name"),
+    ("Name", "label"),
     ("Identifier", "identifier"),
     ("Type", "kind"),
     ("Disposition", "disposition"),
@@ -113,7 +113,8 @@ pub fn btm() -> Option<(u64, Vec<BTreeMap<String, String>>)> {
                 keys.insert(key.clone());
                 let unit = batch.unit();
                 let node = unit.node("StartItem", key.clone());
-                node.p("source", "btm");
+                // `name` is the label's name before 0.1.21.
+                node.p("source", "btm").p("name", serde_json::Value::Null);
                 for (field, prop) in BTM_FIELDS {
                     node.p(prop, record.get(*field).cloned().filter(|v| v != "(null)").unwrap_or_default());
                 }

@@ -8,6 +8,7 @@
 use crate::codesign;
 use crate::sweep::{Part, secret_patterns, severity_of};
 use crate::graph::{self, Batch, Props, r};
+use cc_protocol::contracts::memory::GraphRef;
 use crate::util::{home, now_ms, plural, run, tilde, which};
 use crate::docs;
 use regex::Regex;
@@ -381,6 +382,54 @@ pub struct Project {
     envs: Vec<PathBuf>,
 }
 
+impl Project {
+    /// A git repository, or a folder with lockfiles or a virtual environment.
+    pub fn is_project(&self) -> bool {
+        !self.lockfiles.is_empty() || self.root.join(".git").exists()
+    }
+}
+
+/// What a look found no longer is marked gone (`memory.graph.retire`; its history and edges
+/// stay, and a later look that finds it again brings it back). Only kinds the look found
+/// something of: a read that failed is not an uninstall.
+pub async fn retire_unseen(label: &str, seen: &HashSet<String>) {
+    if seen.is_empty() || !graph::ready() {
+        return;
+    }
+    let rows = match graph::query_all(&format!("MATCH (n:{label}) WHERE n.ended_ms IS NULL RETURN n.key ORDER BY n.key"), json!({})).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::info!("inventory: cannot read the stored {label} nodes: {error}");
+            return;
+        }
+    };
+    let gone: Vec<GraphRef> = rows.iter().map(|row| graph::text(&row[0])).filter(|key| !key.is_empty() && !seen.contains(key)).map(|key| r(label, key)).collect();
+    if !gone.is_empty() {
+        tracing::info!("inventory: {} {label} nodes are no longer on this Mac", gone.len());
+        graph::retire(gone, "no longer on this Mac");
+    }
+}
+
+/// Repositories whose folder is gone, or that are not a project (no git, no lockfiles).
+pub async fn retire_gone_repos(seen: &HashSet<String>) {
+    if !graph::ready() {
+        return;
+    }
+    let Ok(rows) = graph::query_all("MATCH (n:Repo) WHERE n.ended_ms IS NULL RETURN n.key ORDER BY n.key", json!({})).await else { return };
+    let gone: Vec<GraphRef> = rows
+        .iter()
+        .map(|row| graph::text(&row[0]))
+        .filter(|key| {
+            let root = Path::new(key);
+            !key.is_empty() && !seen.contains(key) && (!root.is_dir() || !root.join(".git").exists())
+        })
+        .map(|key| r("Repo", key))
+        .collect();
+    if !gone.is_empty() {
+        graph::retire(gone, "not a repository any more");
+    }
+}
+
 struct BrowserExt {
     browser: &'static str,
     id: String,
@@ -478,6 +527,7 @@ impl Local {
             }
         }
         let mut unsigned = Vec::new();
+        let mut built = Vec::new();
         let mut hijack = Vec::new();
         let otool = inspect && run("/usr/bin/xcode-select", &["-p"], STEP).is_ok_and(|o| o.ok);
         for path in found {
@@ -505,7 +555,10 @@ impl Local {
             if inspect {
                 let sig = codesign::check(&path);
                 signature = Some((path.join("Contents/MacOS").join(text_of(&plist, "CFBundleExecutable")), sig.clone()));
-                if sig.unsigned() {
+                // Ad-hoc and never downloaded (no quarantine flag): built on this Mac.
+                if sig.status == "adhoc" && xattr::get(&path, "com.apple.quarantine").ok().flatten().is_none() {
+                    built.push(tilde(&path));
+                } else if sig.unsigned() {
                     unsigned.push(format!("{} ({})", tilde(&path), if sig.status == "adhoc" { "ad-hoc signed" } else { "not signed" }));
                 }
                 if otool && sig.risky.iter().any(|r| r == "cs.disable-library-validation") {
@@ -532,6 +585,15 @@ impl Local {
                     if unsigned.len() == 1 { "it" } else { "them" },
                     names(&unsigned, 6)
                 ),
+                None,
+                "codesign",
+            );
+        }
+        if !built.is_empty() {
+            self.part.add(
+                "info",
+                "app",
+                format!("{} built on this Mac (ad-hoc signed, never downloaded): {}.", plural(built.len(), "app was", "apps were"), names(&built, 6)),
                 None,
                 "codesign",
             );
@@ -810,7 +872,8 @@ impl Local {
             unit.node("Runtime", key.clone()).p("name", tool.label).p("product", tool.product).p("version", tool.version.clone());
             unit.edge(r("Runtime", key), "INSTALLED_ON", machine.clone()).p("place", tool.place.clone());
         }
-        for project in &self.projects {
+        // A folder commands ran in is a project only when it is a git repository or has lockfiles.
+        for project in self.projects.iter().filter(|p| p.is_project()) {
             let root = project.root.display().to_string();
             // name -> its versions in this repository.
             let mut versions: BTreeMap<(&str, &str), BTreeSet<&str>> = BTreeMap::new();
@@ -1465,8 +1528,15 @@ pub async fn checks(scope: Scope, discovery: crate::filesystem::Shared) -> Part 
             return part;
         }
     };
-    // What is installed goes to the graph first, so the findings below can point at it.
+    // What is installed goes to the graph first, so the findings below can point at it; what is
+    // not any more is marked gone.
     part.graph.extend(local.graph());
+    if scope.updates {
+        retire_unseen("Runtime", &local.toolchains.iter().map(|t| format!("{}@{}", t.product, t.version)).collect()).await;
+    }
+    if scope.apps {
+        retire_unseen("Extension", &local.extensions.iter().map(extension_key).collect()).await;
+    }
     let (apps, os, eol, deps, docker) = tokio::join!(
         when(scope.updates, apps_section(&client, &feeds, &local)),
         when(scope.updates, limited("macOS and Safari patch level", 30, os_section(&client, &feeds, &local))),

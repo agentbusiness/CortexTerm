@@ -17,14 +17,17 @@ first command in that shell after the proposal can be recovered from command his
 10 minutes and before the next manual request).
 
 The learner extracts one short, evidence-backed lesson from a demonstrated command correction,
-a failed check followed by a successful check of the same command family, or an explicit user
-correction. A proposal that was never run is not a successful fix. A successful helper command
-for another program is not proof of a fix. Both Gemma and Qwen receive the same constrained
+a failed check followed by a successful check of the same command family, an explicit user
+correction, or a standing preference the user stated in their own words ("I use pnpm here",
+"remember that the server is web-1"), quoted exactly from their request. A proposal that was
+never run is not a successful fix. A successful command of another program counts as the fix
+only when the failing program's next run in that shell, within 10 minutes, passes. Both Gemma and Qwen receive the same constrained
 JSON form and prompt. Learning uses the existing shared model, background priority and idle-only
 scheduling. A foreground turn cancels background work; each model lease is released on exit.
 
 Before answers, explanations and fixes, the flow recalls live facts for the current folder and
-its ancestors, relevant lessons by meaning, and lessons with the same failure key. It also adds
+its ancestors, the user's standing preferences in scope (whatever the question), relevant
+lessons by meaning, and lessons with the same failure key. It also adds
 matching lessons immediately after a failed check. Facts and lessons are observations; current
 evidence, the user's request and the risk engine retain authority. Local lessons are scoped to
 their folder and descendants; general lessons are scoped to the platform. Suspicious memory is
@@ -38,9 +41,10 @@ All durable learning state uses `memory@1` in CT's main graph:
 | --- | --- |
 | `TerminalEpisode` | `OF` Session, `ABOUT` Folder, `SHOWN` Knowledge, `OBSERVED` CommandRun; actual request snapshot, checks, answer, proposal and outcome |
 | `TerminalLearningPass` | `FROM` episode; extracted lesson and completion checkpoint per evidence revision |
-| `Knowledge:Lesson` | `LEARNED_FROM` episode, `ABOUT` Folder for local lessons; text, scope, failure aliases and journal evidence |
+| `Knowledge:Lesson` | `LEARNED_FROM` episode (its `why`: fix, check, correction or preference), `ABOUT` Folder for local lessons; text, scope, failure aliases and journal evidence |
 | `TerminalFeedback` | `FOR` lesson, `FROM` episode; verdict, observation source and evidence |
-| `TerminalReplay` / `TerminalNightReport` | replay `FOR` lesson and `FROM` episode; daily review `ON` Machine |
+| `TerminalReplay` | `FOR` lesson, `FROM` the held-out episode; both answers, model identities, oracle and verdict |
+| `TerminalLearningSession` | per session: where its settled episodes end and, once all are settled, the journal revision |
 
 The request snapshot is the actual model message payload, stored as JSON text; the episode,
 lessons, outcomes and feedback remain separate related graph records. Session journals remain
@@ -48,32 +52,41 @@ journal files, as the app's graph model specifies. No learning database, report 
 working directories are introduced.
 
 Stable observation keys make feedback idempotent across retries. CT derives its scores from
-feedback records rather than incrementing the generic knowledge counters. A sole matching lesson
+feedback records and brings each lesson's `seen`, `helped` and `hurt` counters up to them, so
+memory shows how a lesson fared. A sole matching lesson
 can be credited when the proposed command is actually run successfully for that failing command
 family, or a matching failed check is corrected. Several matching lessons are recorded as
 confounded. A repeated matching failure or an explicit user correction can count against a shown
 lesson. Unrun proposals and completed prose get no success credit. Lessons with more harmful
-than helpful observations after at least three decisive observations are withdrawn. Withdrawn
-items remain history; recall excludes them and an upsert does not revive them.
+than helpful observations after at least three decisive observations are withdrawn. When the
+user explicitly corrects a shown lesson, it is superseded at once by the lesson learned from the
+correction, or withdrawn when none was. Withdrawn and superseded items remain history; recall
+excludes them, and a new lesson that matches one of them by meaning (0.90) is not learned again.
 
-## Recorded-context replay and daily review
+A pass that fails (a model answer that does not parse, a Run whose output is on another machine)
+is kept with its count and set aside after three attempts; the other episodes go on. An episode
+settles 40 minutes after its request, when no correction, outcome or rerun can still arrive.
+A session whose journal has not changed since all its episodes settled is not read again.
 
-At idle, after the backlog, a candidate lesson is tried in two answer-only generations using the
-same recorded evidence, with and without that lesson. The model identity must match in both
+## Recorded-context replay
+
+At idle, after the backlog, a lesson is tried on a held-out episode: one with the same failure
+key, fixed, where the lesson was neither learned nor shown. Two answer-only generations use that
+episode's recorded evidence, with and without the lesson. The model identity must match in both
 arms. An actual successful command of the same failing command family supplies an exact-match
 oracle: one arm proposes that recorded command and the other does not. Equivalent commands
 that differ in text are not credited. Empty, unfinished or mismatched-model generations decide
 nothing. Both actual answers, their model identities, oracle and verdict are kept in the graph;
-interrupted comparisons resume from saved arms. Replay output never feeds the learner.
+interrupted comparisons resume from saved arms; one that keeps failing is set aside after three
+attempts. Replay output never feeds the learner. Verdicts from the earlier replay, which graded a
+lesson on the episode it came from, are no longer counted.
 
 This measures proposal recall in recorded context. It does not execute commands or demonstrate
 that a repair would work again on a live machine. Answers without an observed successful command
 are not graded by the model itself. User corrections still teach and score lessons for answers.
 
-Once per UTC day, the worker writes a graph review of scores, replay evidence and proposed skill
-additions (at least three helpful observations and no harm), plus possible host repairs (at
-least five helpful observations, no harm, and a failure key). These are review proposals; learning
-never edits skills, application code or risk policy.
+Learning never edits skills, application code or risk policy. The daily graph review is gone:
+nothing read it, and the scores now live on the lessons themselves.
 
 ## Verification for this change
 

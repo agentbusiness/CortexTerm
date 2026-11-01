@@ -1,0 +1,32 @@
+# CortexTerm plugin manifest (plugin.toml, schema ccplugin/1). One folder is one plugin; `cortex-pack`
+# builds it and packs it into a portable .ccplugin. Paths are relative to this folder.
+
+[plugin]
+id = "cleanup"
+name = "Cleanup"
+version = "0.1.0"
+description = "Disk space you can get back: build output, caches, AI agents' leftovers, temporary files, forgotten folders and large duplicates, with what is in use left alone. Clean, keep or postpone each find, or let the local model plan it; every find and decision is kept in the graph."
+license = "UNLICENSED"
+platforms = ["macos", "linux"]
+
+[backend]
+category = "cleanup"
+contract = "cleanup@1"
+dir = "backend"
+build = ["cargo", "build", "--release"]
+exec = "backend/target/release/cc-cleanup"
+provides = ["cleanup.scan", "cleanup.stop", "cleanup.status", "cleanup.apply", "cleanup.explain", "cleanup.plan"]
+
+# The recipes (data/recipes.toml), packed at the same path; the backend reads the live copy
+# (<home>/live/plugins/cleanup/data) when present.
+[data]
+dirs = ["data"]
+
+[ui]
+dir = "ui"
+build = ["npm", "run", "build"]
+
+[[ui.package]]
+dir = "ui"
+id = "cleanup.pane"
+slot = "machine.cleanup@1"

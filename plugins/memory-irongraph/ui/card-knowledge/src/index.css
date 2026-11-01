@@ -11,4 +11,4 @@
 #cc .cx-kn-meta{font-size:11.5px;}
 #cc .cx-kn-acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:2px;}
 #cc .cx-kn-add{display:grid;gap:4px;margin-top:8px;padding:6px 8px;border:1px dashed var(--rule);}
-#cc .cx-kn-add input,#cc .cx-kn-add textarea,#cc .cx-kn-add select{font:inherit;color:var(--ink);background:transparent;border:1px solid var(--rule);padding:3px 6px;}
+#cc .cx-kn-add input,#cc .cx-kn-add textarea{font:inherit;color:var(--ink);background:transparent;border:1px solid var(--rule);padding:3px 6px;}

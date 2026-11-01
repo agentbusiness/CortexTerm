@@ -1,0 +1,29 @@
+/* settings.memory@1 — the tabs as small-capitals segments, then plain rows: what it is about in
+   apparatus, the lesson in reading type, its score and actions; Why opens under its row. */
+#cc .cx-memory-tabs{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;margin:12px 0 4px;}
+#cc .cx-memory-tabs .grow{flex:1;}
+#cc .cx-memory-list{list-style:none;margin:0;padding:0;}
+#cc .cx-memory-item{padding:10px 0;border-top:1px solid var(--rule);}
+#cc .cx-memory-item:last-child{border-bottom:1px solid var(--rule);}
+#cc .cx-memory-item.open{background:var(--rubric-wash);}
+#cc .cx-memory-row{display:flex;align-items:center;gap:8px 14px;}
+#cc .cx-memory-row .grow{flex:1;min-width:0;}
+#cc .cx-memory-head{display:flex;flex-wrap:wrap;gap:2px 8px;}
+#cc .cx-memory-head .ap{white-space:nowrap;}
+#cc .cx-memory-kind{color:var(--rubric-lift);}
+#cc .cx-memory-kind.pref{color:var(--counter);}
+#cc .cx-memory-text{font-family:var(--font-reading);font-size:15px;line-height:1.4;color:var(--ink);margin:4px 0 0;overflow-wrap:anywhere;}
+#cc .cx-memory-text.faint{color:var(--ink-3);}
+#cc .cx-memory-score{font-size:12px;color:var(--ink-2);white-space:nowrap;flex:0 0 auto;}
+#cc .cx-memory-score.hot{color:var(--rubric-lift);}
+#cc .cx-memory-why{display:flex;flex-direction:column;gap:6px;margin:10px 0 2px 2px;padding-left:12px;border-left:1px solid var(--rule-2);}
+#cc .cx-memory-episode{display:flex;flex-direction:column;gap:2px;}
+#cc .cx-memory-why .hot{color:var(--rubric-lift);}
+#cc .cx-memory-why .ok{color:var(--counter);}
+#cc .cx-memory-why .faint{color:var(--ink-3);}
+#cc .cx-memory-quote{font-size:12px;color:var(--ink-2);margin:0;overflow-wrap:anywhere;}
+#cc .cx-memory-note{font-size:12px;color:var(--ink-3);margin:12px 0 0;}
+@media(max-width:640px){
+  #cc .cx-memory-row{flex-wrap:wrap;}
+  #cc .cx-memory-row .grow{flex-basis:100%;}
+}

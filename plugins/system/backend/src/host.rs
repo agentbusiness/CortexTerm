@@ -252,7 +252,7 @@ pub fn launchd_job_pids() -> HashSet<u32> {
         .collect()
 }
 
-fn cwd_of(pid: u32) -> String {
+pub(crate) fn cwd_of(pid: u32) -> String {
     let mut sys = sysinfo::System::new();
     let pid = sysinfo::Pid::from_u32(pid);
     sys.refresh_processes_specifics(

@@ -106,8 +106,11 @@ itself before it opens the database (`src/engine.rs`):
   `bytes_done / bytes_total`, `downloaded_bytes`, `resumed_from`, `source`, `install_ms`, `open_ms`),
   at most every 500 ms while downloading; the probe reports the model as its own check.
 
-UI: `ui/card-index` (`card.index@1`, the index state). The knowledge items have no card section
-(`ui/card-knowledge` is kept in the folder but not registered).
+UI: `ui/card-index` (`card.index@1`, the index state) and `ui/settings-memory`
+(`settings.memory@1`, Settings › Memory: the terminal flow's lessons with why and how they fared,
+the folders' habits, what was set aside; Forget). The knowledge items have no card section
+(`ui/card-knowledge` is kept in the folder but not registered). `memory.knowledge.search` takes
+`include_history` to search withdrawn and superseded items too.
 
 Once installed, everything works offline.
 

@@ -6,8 +6,9 @@
     "anchor": { "type": "string", "maxLength": 80 },
     "scope": { "type": "string", "enum": ["folder", "general"] },
     "correction_quote": { "type": "string", "maxLength": 300 },
+    "preference_quote": { "type": "string", "maxLength": 300 },
     "contradicted": { "type": "array", "maxItems": 4, "items": { "type": "string" } }
   },
-  "required": ["useful", "lesson", "anchor", "scope", "correction_quote", "contradicted"],
+  "required": ["useful", "lesson", "anchor", "scope", "correction_quote", "preference_quote", "contradicted"],
   "additionalProperties": false
 }

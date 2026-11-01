@@ -1,7 +1,11 @@
 /* Native, notify-only Endpoint Security sensor (macOS 11+).
  * No AUTH subscriptions, filesystem reads, arguments, environments, payloads, or network calls.
- * Requires the endpoint-security.client entitlement, root, and responsible-terminal FDA.
+ * Requires the endpoint-security.client entitlement, root, and Full Disk Access.
  * The callback copies a bounded metadata record and returns; one bounded writer emits JSONL.
+ * Two ways to run: `--uid U --home H --exclude-path D` writes to stdout (a terminal capture), or
+ * `--serve` (the installed LaunchDaemon) waits on a socket and serves the one user who connects,
+ * excluding that user's ~/.cortexterm. A refused client is told why on the socket. When the
+ * connection ends the process exits and launchd starts it again.
  */
 #define _DARWIN_C_SOURCE 1
 #include <EndpointSecurity/EndpointSecurity.h>
@@ -18,9 +22,13 @@
 #include <errno.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <pwd.h>
 #include <time.h>
 
 #define MAX_PENDING 512
+#define SOCKET_PATH "/var/run/ai.cortexterm.event-sensor.sock"
 /* Publicly documented EndpointSecurity codesigning_flags CS_VALID bit (also
  * kSecCodeStatusValid in Security/CSCommon.h). No private kernel header dependency. */
 #define CT_CS_VALID UINT32_C(0x00000001)
@@ -205,34 +213,74 @@ static void handle(const es_message_t *m) {
     dispatch_async(writer, ^{ emit_record(copy); free(copy); atomic_fetch_sub(&pending,1); });
 }
 
-static const char *new_client_error(es_new_client_result_t result) {
+static const char *new_client_error(es_new_client_result_t result, bool served) {
     switch (result) {
         case ES_NEW_CLIENT_RESULT_ERR_NOT_ENTITLED: return "Endpoint Security entitlement/provisioning is missing.";
-        case ES_NEW_CLIENT_RESULT_ERR_NOT_PERMITTED: return "Full Disk Access permission is missing for the responsible terminal.";
+        case ES_NEW_CLIENT_RESULT_ERR_NOT_PERMITTED: return served
+            ? "Full Disk Access is missing: turn on CortexTermEventSensor in System Settings > Privacy & Security > Full Disk Access."
+            : "Full Disk Access permission is missing for the responsible terminal.";
         case ES_NEW_CLIENT_RESULT_ERR_NOT_PRIVILEGED: return "Run only this producer using sudo; the capture sink must remain unprivileged.";
         case ES_NEW_CLIENT_RESULT_ERR_TOO_MANY_CLIENTS: return "macOS has too many Endpoint Security clients.";
         default: return "macOS refused the Endpoint Security client.";
     }
 }
 
-int main(int argc, char **argv) {
-    if (argc != 7 || strcmp(argv[1],"--uid") || strcmp(argv[3],"--home") || strcmp(argv[5],"--exclude-path")) {
-        fputs("Usage: cortexterm-event-sensor --uid UID --home ABSOLUTE_HOME --exclude-path PRIVATE_DATA_DIR\n",stderr); return 64;
+/* Tell the client on stdout why the sensor cannot run, then end. */
+static int refuse(const char *why, int code) {
+    fputs(why,stderr); fputc('\n',stderr);
+    printf("{\"schema\":1,\"record\":\"error\",\"at\":%llu,\"text\":",(unsigned long long)now_ms()); string_json(why); fputs("}\n",stdout); fflush(stdout);
+    return code;
+}
+
+/* The LaunchDaemon: wait for one user's connection; stdout becomes the connection. */
+static int serve(void) {
+    if (geteuid() != 0) { fputs("The sensor service runs as root (its LaunchDaemon).\n",stderr); return 77; }
+    int listener = socket(AF_UNIX,SOCK_STREAM,0);
+    if (listener < 0) return 71;
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    strlcpy(address.sun_path,SOCKET_PATH,sizeof(address.sun_path));
+    unlink(SOCKET_PATH);
+    if (bind(listener,(struct sockaddr *)&address,sizeof(address)) || chmod(SOCKET_PATH,0666) || listen(listener,1)) return 71;
+    for (;;) {
+        int connection = accept(listener,NULL,NULL);
+        if (connection < 0) continue;
+        uid_t uid; gid_t gid;
+        struct passwd *user = getpeereid(connection,&uid,&gid) == 0 && uid != 0 ? getpwuid(uid) : NULL;
+        if (!user || !user->pw_dir || !realpath(user->pw_dir,target_home)) { close(connection); continue; }
+        close(listener); unlink(SOCKET_PATH);
+        target_uid = uid;
+        snprintf(excluded_path,sizeof(excluded_path),"%s/.cortexterm",target_home);
+        if (dup2(connection,STDOUT_FILENO) < 0) return 71;
+        close(connection);
+        return 0;
     }
-    char *end = NULL; errno = 0;
-    unsigned long uid = strtoul(argv[2],&end,10);
-    if (errno || !end || *end || uid == 0 || uid > UINT32_MAX) return 64;
-    target_uid = (uid_t)uid;
-    if (geteuid() != 0) { fputs("Native event collection requires root and the Endpoint Security entitlement.\n",stderr); return 77; }
-    if (!realpath(argv[4],target_home) || strcmp(argv[4],target_home) || !realpath(argv[6],excluded_path)) return 64;
+}
+
+int main(int argc, char **argv) {
+    bool served = argc == 2 && !strcmp(argv[1],"--serve");
+    if (served) {
+        int code = serve();
+        if (code) return code;
+    } else {
+        if (argc != 7 || strcmp(argv[1],"--uid") || strcmp(argv[3],"--home") || strcmp(argv[5],"--exclude-path")) {
+            fputs("Usage: cortexterm-event-sensor --serve | --uid UID --home ABSOLUTE_HOME --exclude-path PRIVATE_DATA_DIR\n",stderr); return 64;
+        }
+        char *end = NULL; errno = 0;
+        unsigned long uid = strtoul(argv[2],&end,10);
+        if (errno || !end || *end || uid == 0 || uid > UINT32_MAX) return 64;
+        target_uid = (uid_t)uid;
+        if (geteuid() != 0) { fputs("Native event collection requires root and the Endpoint Security entitlement.\n",stderr); return 77; }
+        if (!realpath(argv[4],target_home) || strcmp(argv[4],target_home) || !realpath(argv[6],excluded_path)) return 64;
+    }
     struct stat home;
-    if (lstat(target_home,&home) || !S_ISDIR(home.st_mode) || home.st_uid != target_uid || !below(excluded_path,target_home)) return 64;
+    if (lstat(target_home,&home) || !S_ISDIR(home.st_mode) || home.st_uid != target_uid || !below(excluded_path,target_home)) return refuse("The connected user's home folder could not be verified.",64);
     signal(SIGPIPE,SIG_DFL);
     writer = dispatch_queue_create("ai.cortexterm.security.writer",DISPATCH_QUEUE_SERIAL);
     es_new_client_result_t result = es_new_client(&client, ^(es_client_t *unused, const es_message_t *message) { (void)unused; handle(message); });
-    if (result != ES_NEW_CLIENT_RESULT_SUCCESS) { fprintf(stderr,"%s\n",new_client_error(result)); return 77; }
+    if (result != ES_NEW_CLIENT_RESULT_SUCCESS) return refuse(new_client_error(result, served),77);
     const es_event_type_t events[] = {ES_EVENT_TYPE_NOTIFY_EXEC,ES_EVENT_TYPE_NOTIFY_OPEN,ES_EVENT_TYPE_NOTIFY_CLOSE,ES_EVENT_TYPE_NOTIFY_CREATE,ES_EVENT_TYPE_NOTIFY_RENAME,ES_EVENT_TYPE_NOTIFY_UNLINK};
-    if (es_subscribe(client,events,sizeof(events)/sizeof(events[0])) != ES_RETURN_SUCCESS) { fputs("Cannot subscribe to Endpoint Security notify events.\n",stderr); es_delete_client(client); return 70; }
+    if (es_subscribe(client,events,sizeof(events)/sizeof(events[0])) != ES_RETURN_SUCCESS) { es_delete_client(client); return refuse("Cannot subscribe to Endpoint Security notify events.",70); }
     dispatch_source_t heartbeat = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,writer);
     dispatch_source_set_timer(heartbeat,dispatch_time(DISPATCH_TIME_NOW,0),5*NSEC_PER_SEC,NSEC_PER_SEC/2);
     dispatch_source_set_event_handler(heartbeat, ^{

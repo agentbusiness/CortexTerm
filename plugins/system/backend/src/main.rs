@@ -318,7 +318,20 @@ impl Shared {
 
     /// Security findings join protection as facts about their group: one incident per group.
     fn record_sweep(&self, report: &SweepReport) {
-        let observations = report.findings.iter().filter(|f| !f.ignored && protection::security_kind(&f.kind)).take(200).map(|f| {
+        let findings: Vec<_> = report.findings.iter().filter(|f| !f.ignored && protection::security_kind(&f.kind)).take(200).collect();
+        // Each group's incident is ABOUT what its findings are about.
+        let mut about: HashMap<String, Vec<cc_protocol::contracts::memory::GraphRef>> = HashMap::new();
+        for f in &findings {
+            if let Some((label, key)) = &f.about {
+                let targets = about.entry(protection::group_subject(&f.group)).or_default();
+                let target = graph::r(label, key.clone());
+                if !targets.contains(&target) {
+                    targets.push(target);
+                }
+            }
+        }
+        lock(&self.protection).set_about(about);
+        let observations = findings.into_iter().map(|f| {
             cc_protocol::contracts::system::SecurityObservation {
                 at: report.at, source: "security sweep".into(), kind: f.kind.clone(), severity: f.severity.clone(),
                 summary: protection::scrub(&f.text, 600), rule: f.source.clone(), subject: protection::group_subject(&f.group),
@@ -344,7 +357,28 @@ impl Shared {
         let marked = store.mark(report);
         drop(store);
         self.record_sweep(&marked);
+        tokio::spawn(self.clone().second_look(marked.findings.clone()));
         marked
+    }
+
+    /// The model's second look at a sweep, when it is idle: what it raises shows one level higher
+    /// and alerts like any other finding. It can never lower or close one.
+    async fn second_look(self: Arc<Self>, findings: Vec<cc_protocol::contracts::system::Finding>) {
+        let Some(ctx) = self.ctx.get().cloned() else { return };
+        let raised = security_investigator::second_look(&ctx, &findings).await;
+        if raised.is_empty() {
+            return;
+        }
+        let keys: Vec<String> = raised.iter().map(|(key, _)| key.clone()).collect();
+        let report = {
+            let mut store = lock(&self.findings);
+            store.raise(raised);
+            let last = store.last.clone();
+            let mut report = store.mark(last);
+            report.findings.retain(|f| keys.contains(&f.key));
+            report
+        };
+        self.record_sweep(&report);
     }
 
     /// The report with its findings' decisions and tried fixes, and the decisions in force.
@@ -568,7 +602,6 @@ async fn markers(since: u64, bucket_ms: u64) -> Vec<Marker> {
         let mut done = Job { id: job.id.clone(), state: "done".into(), started: at, ..Job::default() };
         let (exit_code, tail, matched, timed_out) = if job.kind == "sweep" {
             let mut report = self.run_sweep().await;
-            ran = schedule::Ran::Sweep(graph::ready().then_some(report.at));
             report.findings.retain(|finding| !finding.ignored);
             let mut tail = vec![format!(
                 "{} after checking {}",
@@ -1060,8 +1093,8 @@ async fn protection_status(shared: Arc<Shared>) -> Result<Value, RpcError> {
         let mut status = lock(&shared.protection).status();
         // Signature/provisioning checks may block on macOS; never hold the incident lock while
         // they run, or collection and alerting would wait behind a UI status request.
-        status.deep_capture_command = protection_sensors::deep_capture_command();
-        status.deep_install_command = protection_sensors::deep_install_command();
+        status.deep_service = protection_sensors::service_installed();
+        status.deep_install_command = if status.deep_service { None } else { protection_sensors::deep_install_command() };
         to_value(&status)
     })
         .await.map_err(|_| RpcError::internal("Cannot read protection status."))?
@@ -1074,7 +1107,12 @@ async fn dispatch(shared: Arc<Shared>, method: &str, params: Value) -> Result<Va
             let config: cc_protocol::contracts::system::ProtectionConfig = parse_params(params)?;
             let _serial = shared.protection_actions.lock().await;
             let memory_before = (graph::refused(), graph::dropped());
+            let deep_on = config.deep_watch && !lock(&shared.protection).config.deep_watch;
             lock(&shared.protection).configure(config).map_err(RpcError::invalid_params)?;
+            // Deep monitoring turned on without its sensor: open the signed installer (macOS asks).
+            if deep_on && !protection_sensors::service_installed() {
+                tokio::task::spawn_blocking(protection_sensors::open_installer);
+            }
             if !graph::flush(Duration::from_secs(5)).await || memory_before != (graph::refused(), graph::dropped()) {
                 return Err(RpcError::new("unavailable", "Settings changed in this session, but local memory has not acknowledged them yet. Check protection status before restarting."));
             }
@@ -1165,6 +1203,7 @@ async fn dispatch(shared: Arc<Shared>, method: &str, params: Value) -> Result<Va
             }).await.map_err(|e| RpcError::internal(e.to_string()))?.map_err(RpcError::invalid_params)?;
             let status = tokio::task::spawn_blocking(keys::status).await.map_err(|_| RpcError::internal("Cannot read key status."))?;
             protection::keys_changed(&status);
+            tokio::task::spawn_blocking(malware::check_keys);
             to_value(&status)
         }
         methods::KEYS_STATUS => to_value(&tokio::task::spawn_blocking(keys::status).await.map_err(|e| RpcError::internal(e.to_string()))?),
@@ -1635,19 +1674,13 @@ impl Plugin for SystemPlugin {
 }
 
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("--security-events") {
-        if let Err(error) = protection_sensors::endpoint_capture() {
-            eprintln!("CortexTerm event capture: {error}");
-            std::process::exit(1);
-        }
-        return;
-    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("CORTEX_LOG").unwrap_or_else(|_| "warn".into()))
         .with_writer(std::io::stderr)
         .init();
     keys::import_files();
     protection::keys_changed(&keys::status());
+    std::thread::spawn(malware::check_keys);
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(error) => {

@@ -1,5 +1,5 @@
 # CortexTerm marks for zsh (sourced by our .zshenv in interactive shells).
-#   OSC 133;A prompt start, 133;B input start, 133;C command start, 133;D;<exit> command done
+#   OSC 133;A prompt start, 133;B input start, 133;C command start, 133;D;<exit>;<nonce> command done
 #   OSC 7 file://<host><cwd>
 #   OSC 633;E;<command line>;<nonce> before C
 #   OSC 6973;env|alias|func;<base64>;<nonce> the PATH, aliases and functions, when they change
@@ -8,7 +8,7 @@
 
 typeset -g _ct_nonce=$CORTEXTERM_NONCE
 builtin unset CORTEXTERM_NONCE
-typeset -gi _ct_running=0 _ct_zle=0
+typeset -gi _ct_zle=0
 typeset -g _ct_path= _ct_aliases= _ct_funcs=
 
 _ct_b64() { builtin print -rn -- "$1" | command base64 | command tr -d '\n' }
@@ -20,10 +20,9 @@ _ct_send() {
 
 _ct_precmd() {
   local ret=$?
-  if (( _ct_running )); then
-    builtin printf '\e]133;D;%s\a' $ret
-    _ct_running=0
-  fi
+  # Every prompt: a D without a C is ignored by the terminal, and the signed D tells it that an
+  # unsigned one comes from a shell inside this one (ssh).
+  builtin printf '\e]133;D;%s;%s\a' $ret $_ct_nonce
   # Run after every other precmd hook (prompt themes print and redraw there).
   if [[ ${precmd_functions[-1]} != _ct_precmd ]]; then
     precmd_functions=(${precmd_functions:#_ct_precmd} _ct_precmd)
@@ -53,7 +52,6 @@ _ct_preexec() {
   c=${c//$'\a'/\\x07}
   c=${c//$'\e'/\\x1b}
   builtin printf '\e]633;E;%s;%s\a\e]133;C\a' $c $_ct_nonce
-  _ct_running=1
 }
 
 _ct_line_init() { builtin printf '\e]133;B\a' }

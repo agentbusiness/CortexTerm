@@ -82,6 +82,9 @@ pub struct Saved {
     /// The session that owns the terminal, if one does.
     #[serde(default)]
     pub session: Option<String>,
+    /// The shell signs its command-done marks with the nonce.
+    #[serde(default)]
+    pub signed_done: bool,
 }
 
 struct Recorder {
@@ -97,6 +100,13 @@ struct Recorder {
 /// One terminal's marks and Runs.
 pub struct Tracker {
     nonce: String,
+    /// The shell's script signs its command-done marks with the nonce (it does at every prompt;
+    /// one started by an earlier version does not): from then on an unsigned one comes from
+    /// another shell inside this one (`ssh` to a machine with its own shell integration).
+    signed_done: bool,
+    /// The Run that just finished, until the shell reports its folder: a Run that changed the
+    /// folder (`cd`) is linked to where it went.
+    just_finished: Option<(String, String)>,
     store: Option<Arc<Store>>,
     /// The session that owns the terminal.
     pub session: Option<String>,
@@ -125,6 +135,9 @@ pub struct Tracker {
     reads_tty: bool,
     /// The current prompt was answered (typed into); it waits for the command's next output.
     answered: bool,
+    /// A full-screen program's screen while it runs in the alternate screen: its last screen is
+    /// recorded as the Run's output when it leaves, so a full-screen Run has output too.
+    screen: Option<vt100::Parser>,
     /// The Keychain key looked up for the current prompt (once per prompt).
     tried: Option<String>,
     /// The Keychain key filled in during this Run, and [`Tracker::lines`] then.
@@ -145,6 +158,8 @@ impl Tracker {
         };
         Self {
             nonce,
+            signed_done: false,
+            just_finished: None,
             store,
             session: None,
             state,
@@ -166,6 +181,7 @@ impl Tracker {
             tty: None,
             reads_tty: false,
             answered: false,
+            screen: None,
             tried: None,
             filled: None,
             lines: 0,
@@ -184,6 +200,7 @@ impl Tracker {
         tracker.state.last_exit = saved.last_exit;
         tracker.env = saved.env;
         tracker.session = saved.session;
+        tracker.signed_done = saved.signed_done;
         if let Some(run) = running.filter(|run| run.ended.is_none() && tracker.store.is_some()) {
             tracker.last_output = now_ms();
             tracker.recorder = Some(Recorder { run, batch: Vec::new(), kept: 0, sample: Vec::new(), detected: false });
@@ -206,6 +223,7 @@ impl Tracker {
             run: self.recorder.as_ref().map(|r| r.run.clone()),
             env: self.env.clone(),
             session: self.session.clone(),
+            signed_done: self.signed_done,
         }
     }
 
@@ -327,10 +345,9 @@ impl Tracker {
             self.overwritten.clear();
             self.overwritten_ansi.clear();
         }
+        // A raw-mode program that draws in the normal screen (a progress spinner, a prompt) still
+        // prints output worth recording; only the alternate screen makes a Run full-screen.
         self.state.interactive = true;
-        if let Some(recorder) = &mut self.recorder {
-            recorder.run.fullscreen = true;
-        }
     }
 
     pub fn set_reads_tty(&mut self, reads: bool) {
@@ -401,6 +418,9 @@ impl Tracker {
         if self.recorder.is_some() {
             self.finish(None, now_ms());
         }
+        if let Some(store) = &self.store {
+            store.shell_ended(&self.state.term_id);
+        }
         self.state.at_prompt = false;
         self.state.interactive = false;
         self.state.alternate_screen = false;
@@ -418,6 +438,14 @@ impl Tracker {
     }
 
     fn byte(&mut self, byte: u8, now: u64) {
+        self.scan_byte(byte, now);
+        // After the scanner: the byte that leaves the alternate screen has taken its screen first.
+        if let Some(screen) = &mut self.screen {
+            screen.process(&[byte]);
+        }
+    }
+
+    fn scan_byte(&mut self, byte: u8, now: u64) {
         match self.scan {
             Scan::Ground => match byte {
                 0x1b => self.scan = Scan::Esc,
@@ -498,7 +526,7 @@ impl Tracker {
     }
 
     fn recording(&self) -> bool {
-        self.recorder.is_some() && !self.state.alternate_screen && !self.state.interactive
+        self.recorder.is_some() && !self.state.alternate_screen
     }
 
     fn text(&mut self, byte: u8, now: u64) {
@@ -570,6 +598,25 @@ impl Tracker {
         }
     }
 
+    /// The full-screen program's last screen, as the Run's output lines.
+    fn last_screen(&mut self) {
+        let Some(screen) = self.screen.take() else { return };
+        let rows: Vec<String> = screen.screen().contents().lines().map(|row| row.trim_end().to_owned()).collect();
+        let rows: Vec<&String> = rows.iter().skip_while(|row| row.is_empty()).collect();
+        let end = rows.iter().rposition(|row| !row.is_empty()).map_or(0, |i| i + 1);
+        if end == 0 || !self.recording() {
+            return;
+        }
+        let typed = std::mem::take(&mut self.line);
+        self.line = b"[the full-screen program's last screen]".to_vec();
+        self.end_line();
+        for row in &rows[..end] {
+            self.line = row.as_bytes().to_vec();
+            self.end_line();
+        }
+        self.line = typed;
+    }
+
     fn csi(&mut self, last: u8) {
         if last == b'm' && self.recording() {
             self.redraw();
@@ -593,8 +640,18 @@ impl Tracker {
                     recorder.run.fullscreen = true;
                 }
             }
+            if !on && self.state.alternate_screen {
+                self.state.alternate_screen = false;
+                self.last_screen();
+            }
             self.state.alternate_screen = on;
-            if on { self.take_keyboard(); }
+            if on {
+                self.take_keyboard();
+                if self.recorder.is_some() && self.screen.is_none() {
+                    // Larger than any real window: the program lays out for the real one.
+                    self.screen = Some(vt100::Parser::new(100, 300, 0));
+                }
+            }
             // Stay in the terminal until the shell returns: an app can leave the alternate
             // buffer to ask a question, launch a subprocess, or suspend.
             self.clear_line();
@@ -607,11 +664,19 @@ impl Tracker {
         let (code, rest) = payload.split_once(';').unwrap_or((payload.as_str(), ""));
         match code {
             "133" => self.mark(rest, now),
-            "7" => {
-                // file://host/path (percent-encoded)
+            // file://host/path (percent-encoded). This shell reports its folder at its prompt; one
+            // reported while a command runs is another shell's (`ssh`, `docker exec`), on another
+            // machine's disk.
+            "7" if self.recorder.is_none() => {
                 if let Some(path) = rest.strip_prefix("file://").and_then(|r| r.find('/').map(|i| &r[i..])) {
                     let path = percent_decode(path);
+                    let moved = self.just_finished.take();
                     if !path.is_empty() && path != self.state.cwd {
+                        if let (Some(store), Some((run_id, from))) = (&self.store, moved)
+                            && from == self.state.cwd
+                        {
+                            store.moved(&run_id, &path);
+                        }
                         self.state.git_branch = git_branch(Path::new(&path));
                         self.state.cwd = path;
                     }
@@ -645,9 +710,16 @@ impl Tracker {
                 }
             },
             "C" if self.recorder.is_none() => self.start(now),
-            "D" if self.recorder.is_some() => {
+            "D" => {
                 let code = parts.next().and_then(|c| c.trim().parse::<i32>().ok());
-                self.finish(code, now);
+                if parts.next() == Some(self.nonce.as_str()) {
+                    self.signed_done = true;
+                } else if self.signed_done {
+                    return;
+                }
+                if self.recorder.is_some() {
+                    self.finish(code, now);
+                }
             }
             _ => {}
         }
@@ -677,7 +749,7 @@ impl Tracker {
             started: now,
             format: "raw".into(),
             author: "user".into(),
-            fullscreen: self.state.interactive || self.state.alternate_screen,
+            fullscreen: self.state.alternate_screen,
             usual_ms,
             ..Run::default()
         };
@@ -690,6 +762,13 @@ impl Tracker {
     }
 
     fn finish(&mut self, code: Option<i32>, now: u64) {
+        // A full-screen program that ended without leaving the alternate screen: its last screen.
+        if self.state.alternate_screen && self.screen.is_some() {
+            self.state.alternate_screen = false;
+            self.last_screen();
+            self.state.alternate_screen = true;
+        }
+        self.screen = None;
         // The shell's prompt redraws the last line (zsh's PROMPT_SP prints `%`, spaces and
         // carriage returns after output without a final newline): keep what the command wrote.
         if self.cr || self.line.iter().all(u8::is_ascii_whitespace) {
@@ -737,6 +816,7 @@ impl Tracker {
         if code.is_some() {
             self.state.last_exit = code;
         }
+        self.just_finished = Some((run.id.clone(), run.cwd.clone()));
         let run = recorder.run;
         self.push(topics::RUN_FINISHED, &run);
     }

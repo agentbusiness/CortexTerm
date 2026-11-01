@@ -1,0 +1,463 @@
+# What the cleanup scan knows (plugins/cleanup/README.md). Each recipe finds one kind of thing:
+#
+#   names    folder names met while walking the home folder. "a/b" is a folder b inside a folder a.
+#            The folder's project is its parent (for "a/b", a's parent).
+#   beside   with names: the project holds one of these files ("*.csproj" matches by suffix).
+#   inside   with names: the folder holds one of these.
+#   paths    fixed places ("~", "$TMPDIR" and "$UID" are expanded). A last component "*" makes each
+#            entry its own item.
+#   kind     build | cache | agent | temp | model | trash (contracts/cleanup.rs)
+#   safety   regenerable: comes back by itself or with `regenerate`, deleted outright.
+#            review: the person's files or history, moved to the Trash, never cleaned by the AI.
+#   command  run instead of deleting ({path}, {project}); no shell.
+#   programs these programs working inside the project mean it is in use.
+#   apps     these programs running at all mean it is in use.
+#   each     with names: every entry of the folder is its own item.
+#   locks    files under the item a running tool holds a lock on (a build in progress).
+#   stale    "cargo": while the project is active, only older builds go (README).
+#   ignored  in a git repository the folder must be ignored by git (ambiguous names).
+#   min_age_days  offered only when nothing inside changed for this long.
+#   min_mb   offered only from this size (20 when absent).
+#   xcode    read DerivedData's info.plist for its project.
+#   worktree a git worktree: uncommitted or unpushed work keeps it.
+
+# ---- Build output -------------------------------------------------------------------------------
+
+[[recipe]]
+id = "cargo-target"
+title = "Rust build output"
+kind = "build"
+safety = "regenerable"
+names = ["target"]
+beside = ["Cargo.toml"]
+regenerate = "cargo build"
+programs = ["cargo", "rustc", "rust-analyzer", "bacon", "cargo-watch"]
+locks = ["debug/.cargo-lock", "release/.cargo-lock"]
+stale = "cargo"
+why = "Compiled crates, incremental caches and binaries; cargo rebuilds them."
+
+[[recipe]]
+id = "node-modules"
+title = "Node packages"
+kind = "build"
+safety = "regenerable"
+names = ["node_modules"]
+beside = ["package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb", "npm-shrinkwrap.json"]
+regenerate = "npm install (or pnpm / yarn / bun install)"
+programs = ["node", "bun", "deno", "next-server", "vite", "esbuild", "tsserver"]
+why = "Installed packages of a project with a lock file, which installs them again."
+
+[[recipe]]
+id = "js-build"
+title = "Web build output"
+kind = "build"
+safety = "regenerable"
+names = [".next", ".turbo", ".parcel-cache", ".angular", ".svelte-kit", ".nuxt", ".vite", ".expo", ".docusaurus", "storybook-static"]
+beside = ["package.json"]
+regenerate = "the project's build or dev command"
+programs = ["node", "bun", "next-server", "vite"]
+why = "Framework build output and caches."
+
+[[recipe]]
+id = "js-dist"
+title = "Web bundle output"
+kind = "build"
+safety = "regenerable"
+names = ["dist", "build", "out"]
+beside = ["package.json"]
+ignored = true
+regenerate = "npm run build"
+programs = ["node", "bun", "vite"]
+why = "Bundled output that git ignores; the build makes it again."
+
+[[recipe]]
+id = "xcode-derived"
+title = "Xcode DerivedData"
+kind = "build"
+safety = "regenerable"
+paths = ["~/Library/Developer/Xcode/DerivedData/*"]
+xcode = true
+regenerate = "build in Xcode"
+programs = ["xcodebuild", "XCBBuildService", "SourceKitService"]
+why = "Xcode's build products and index for one project."
+
+[[recipe]]
+id = "swift-build"
+title = "Swift package build"
+kind = "build"
+safety = "regenerable"
+names = [".build", ".swiftpm"]
+beside = ["Package.swift"]
+regenerate = "swift build"
+programs = ["swift-build", "swift", "sourcekit-lsp"]
+why = "SwiftPM build products and checkouts."
+
+[[recipe]]
+id = "gradle-build"
+title = "Gradle build output"
+kind = "build"
+safety = "regenerable"
+names = ["build", ".gradle"]
+beside = ["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"]
+ignored = true
+regenerate = "./gradlew build"
+programs = ["java", "gradle"]
+why = "Gradle's per-project build output and caches."
+
+[[recipe]]
+id = "maven-target"
+title = "Maven build output"
+kind = "build"
+safety = "regenerable"
+names = ["target"]
+beside = ["pom.xml"]
+regenerate = "mvn package"
+programs = ["java", "mvn"]
+why = "Maven's compiled classes and packages."
+
+[[recipe]]
+id = "python-caches"
+title = "Python tool caches"
+kind = "build"
+safety = "regenerable"
+names = ["__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".nox", ".hypothesis"]
+regenerate = "made again when the tools run"
+programs = ["python", "python3", "pytest", "mypy"]
+min_mb = 5
+why = "Bytecode and test or type-checker caches."
+
+[[recipe]]
+id = "python-venv"
+title = "Python virtual environment"
+kind = "build"
+safety = "regenerable"
+names = [".venv", "venv"]
+beside = ["pyproject.toml", "requirements.txt", "setup.py", "uv.lock", "poetry.lock", "Pipfile"]
+inside = ["pyvenv.cfg"]
+regenerate = "uv sync (or pip install -r requirements.txt)"
+programs = ["python", "python3", "uvicorn", "jupyter"]
+min_age_days = 30
+why = "Installed packages for one project; its requirements install them again."
+
+[[recipe]]
+id = "dotnet-build"
+title = ".NET build output"
+kind = "build"
+safety = "regenerable"
+names = ["bin", "obj"]
+beside = ["*.csproj", "*.fsproj", "*.sln"]
+ignored = true
+regenerate = "dotnet build"
+programs = ["dotnet"]
+why = "Compiled .NET output."
+
+[[recipe]]
+id = "misc-build"
+title = "Build output"
+kind = "build"
+safety = "regenerable"
+names = ["zig-cache", ".zig-cache", "zig-out", "_build", ".dart_tool", ".terraform", "Pods", "DerivedData", ".cxx", "cmake-build-debug", "cmake-build-release"]
+regenerate = "the project's build"
+why = "Build output or downloaded dependencies of a project."
+
+# ---- Tool and package caches --------------------------------------------------------------------
+
+[[recipe]]
+id = "cargo-registry"
+title = "Cargo download cache"
+kind = "cache"
+safety = "regenerable"
+paths = ["~/.cargo/registry/cache", "~/.cargo/registry/src", "~/.cargo/git/checkouts"]
+regenerate = "cargo downloads crates again when needed"
+programs = ["cargo"]
+min_age_days = 1
+why = "Downloaded crate archives and their unpacked sources."
+
+[[recipe]]
+id = "npm-cache"
+title = "npm cache"
+kind = "cache"
+safety = "regenerable"
+paths = ["~/.npm/_cacache"]
+command = "npm cache clean --force"
+regenerate = "npm downloads packages again"
+programs = ["npm", "node"]
+why = "npm's download cache."
+
+[[recipe]]
+id = "pnpm-store"
+title = "pnpm store"
+kind = "cache"
+safety = "regenerable"
+paths = ["~/Library/pnpm/store", "~/.local/share/pnpm/store"]
+command = "pnpm store prune"
+regenerate = "pnpm downloads packages again"
+programs = ["pnpm"]
+why = "pnpm's shared package store; prune keeps what projects still link."
+
+[[recipe]]
+id = "yarn-cache"
+title = "Yarn cache"
+kind = "cache"
+safety = "regenerable"
+paths = ["~/Library/Caches/Yarn", "~/.yarn/berry/cache"]
+regenerate = "yarn downloads packages again"
+programs = ["yarn"]
+why = "Yarn's download cache."
+
+[[recipe]]
+id = "bun-cache"
+title = "Bun cache"
+kind = "cache"
+safety = "regenerable"
+paths = ["~/.bun/install/cache"]
+regenerate = "bun downloads packages again"
+programs = ["bun"]
+why = "Bun's package cache."
+
+[[recipe]]
+id = "go-cache"
+title = "Go build cache"
+kind = "cache"
+safety = "regenerable"
+paths = ["~/Library/Caches/go-build", "~/.cache/go-build"]
+command = "go clean -cache"
+regenerate = "go builds again"
+programs = ["go", "gopls"]
+why = "Go's compiled package cache."
+
+[[recipe]]
+id = "go-modcache"
+title = "Go module cache"
+kind = "cache"
+safety = "regenerable"
+paths = ["~/go/pkg/mod"]
+command = "go clean -modcache"
+regenerate = "go downloads modules again"
+programs = ["go", "gopls"]
+why = "Downloaded Go modules (read-only files: go removes them)."
+
+[[recipe]]
+id = "pip-cache"
+title = "pip and uv caches"
+kind = "cache"
+safety = "regenerable"
+paths = ["~/Library/Caches/pip", "~/.cache/pip", "~/.cache/uv", "~/Library/Caches/pypoetry", "~/.cache/pypoetry"]
+regenerate = "packages download again"
+programs = ["pip", "uv", "poetry"]
+why = "Python package download caches."
+
+[[recipe]]
+id = "conda-pkgs"
+title = "Conda package cache"
+kind = "cache"
+safety = "regenerable"
+paths = ["~/miniconda3/pkgs", "~/anaconda3/pkgs", "~/miniforge3/pkgs", "~/.conda/pkgs"]
+command = "conda clean --all --yes"
+regenerate = "conda downloads packages again"
+programs = ["conda", "mamba"]
+why = "Conda's downloaded packages."
+
+[[recipe]]
+id = "gradle-cache"
+title = "Gradle caches"
+kind = "cache"
+safety = "regenerable"
+paths = ["~/.gradle/caches", "~/.gradle/wrapper/dists", "~/.gradle/daemon"]
+regenerate = "Gradle downloads again"
+programs = ["java", "gradle"]
+min_age_days = 7
+why = "Gradle's dependency and wrapper downloads."
+
+[[recipe]]
+id = "maven-repo"
+title = "Maven repository"
+kind = "cache"
+safety = "regenerable"
+paths = ["~/.m2/repository"]
+regenerate = "Maven downloads again"
+programs = ["java", "mvn"]
+min_age_days = 30
+why = "Maven's downloaded artifacts."
+
+[[recipe]]
+id = "homebrew-cache"
+title = "Homebrew downloads"
+kind = "cache"
+safety = "regenerable"
+paths = ["~/Library/Caches/Homebrew"]
+command = "brew cleanup --prune=all"
+regenerate = "brew downloads again when installing"
+programs = ["brew"]
+why = "Downloaded bottles and old versions Homebrew keeps."
+
+[[recipe]]
+id = "cocoapods-cache"
+title = "CocoaPods cache"
+kind = "cache"
+safety = "regenerable"
+paths = ["~/Library/Caches/CocoaPods"]
+regenerate = "pod install downloads again"
+programs = ["pod"]
+why = "CocoaPods' download cache."
+
+[[recipe]]
+id = "xcode-device-support"
+title = "Device support files"
+kind = "cache"
+safety = "regenerable"
+paths = ["~/Library/Developer/Xcode/iOS DeviceSupport/*", "~/Library/Developer/Xcode/watchOS DeviceSupport/*", "~/Library/Developer/Xcode/tvOS DeviceSupport/*"]
+regenerate = "Xcode copies them again when that device connects"
+apps = ["Xcode"]
+min_age_days = 90
+why = "Symbols copied from a device's OS version; old versions are rarely needed."
+
+[[recipe]]
+id = "simulator-caches"
+title = "Simulator caches"
+kind = "cache"
+safety = "regenerable"
+paths = ["~/Library/Developer/CoreSimulator/Caches"]
+regenerate = "made again by the simulator"
+apps = ["Simulator", "Xcode"]
+why = "Dyld and other simulator caches."
+
+[[recipe]]
+id = "jetbrains-caches"
+title = "JetBrains IDE caches"
+kind = "cache"
+safety = "regenerable"
+paths = ["~/Library/Caches/JetBrains/*"]
+regenerate = "the IDE indexes again"
+apps = ["idea", "pycharm", "webstorm", "goland", "rustrover", "clion"]
+min_age_days = 30
+why = "Indexes and caches of an IDE version."
+
+[[recipe]]
+id = "editor-caches"
+title = "Editor caches"
+kind = "cache"
+safety = "regenerable"
+paths = ["~/Library/Application Support/Code/CachedData", "~/Library/Application Support/Code/Cache", "~/Library/Application Support/Cursor/CachedData", "~/Library/Application Support/Cursor/Cache"]
+regenerate = "the editor makes them again"
+apps = ["Code", "Electron", "Cursor"]
+why = "Compiled code and web caches of VS Code or Cursor."
+
+# ---- AI agents' leftovers -----------------------------------------------------------------------
+
+[[recipe]]
+id = "claude-worktrees"
+title = "Agent worktree"
+kind = "agent"
+safety = "review"
+names = [".claude/worktrees"]
+each = true
+worktree = true
+command = "git -C {project} worktree remove {path}"
+programs = ["claude", "node"]
+min_age_days = 3
+why = "A git worktree an agent made for a task; its branch stays in the repository."
+
+[[recipe]]
+id = "agent-scratch"
+title = "Agent scratch folders"
+kind = "agent"
+safety = "regenerable"
+paths = ["/private/tmp/claude-$UID/*", "~/.claude/shell-snapshots", "~/.claude/debug", "~/.claude/statsig"]
+programs = ["claude"]
+min_age_days = 3
+why = "Scratch files, shell snapshots and logs of finished agent sessions."
+
+[[recipe]]
+id = "agent-transcripts"
+title = "Agent transcripts"
+kind = "agent"
+safety = "review"
+paths = ["~/.claude/projects/*", "~/.codex/sessions", "~/.codex/archived_sessions"]
+programs = ["claude", "codex"]
+min_age_days = 30
+min_mb = 200
+why = "Old conversation logs of coding agents; deleting them ends resume for those sessions."
+
+[[recipe]]
+id = "cursor-backup"
+title = "Cursor state backup"
+kind = "agent"
+safety = "regenerable"
+paths = ["~/Library/Application Support/Cursor/User/globalStorage/state.vscdb.backup"]
+apps = ["Cursor"]
+why = "A backup copy of Cursor's state database; Cursor writes it again."
+
+[[recipe]]
+id = "aider-cache"
+title = "Aider tag cache"
+kind = "agent"
+safety = "regenerable"
+names = [".aider.tags.cache.v3", ".aider.tags.cache.v4"]
+programs = ["aider"]
+min_mb = 5
+why = "Aider's repository map cache."
+
+# ---- Models -------------------------------------------------------------------------------------
+
+[[recipe]]
+id = "hf-cache"
+title = "Hugging Face models"
+kind = "model"
+safety = "review"
+paths = ["~/.cache/huggingface/hub/*"]
+command = "hf cache rm {path}"
+regenerate = "downloads again (can be large)"
+programs = ["python", "python3"]
+min_age_days = 30
+why = "A downloaded model or dataset repository."
+
+[[recipe]]
+id = "lmstudio-models"
+title = "LM Studio models"
+kind = "model"
+safety = "review"
+paths = ["~/.lmstudio/models/*", "~/.cache/lm-studio/models/*"]
+apps = ["LM Studio"]
+min_age_days = 30
+why = "Models downloaded in LM Studio."
+
+# ---- Temporary files and the Trash --------------------------------------------------------------
+
+[[recipe]]
+id = "user-temp"
+title = "Temporary files"
+kind = "temp"
+safety = "regenerable"
+paths = ["$TMPDIR/*"]
+min_age_days = 3
+min_mb = 10
+why = "Left in the temporary folder by programs that are no longer running."
+
+[[recipe]]
+id = "logs"
+title = "Old logs"
+kind = "temp"
+safety = "regenerable"
+paths = ["~/Library/Logs/*"]
+min_age_days = 30
+min_mb = 50
+why = "Log files of apps; nothing reads them back."
+
+[[recipe]]
+id = "installers"
+title = "Downloaded installers"
+kind = "temp"
+safety = "review"
+paths = ["~/Downloads/*.dmg", "~/Downloads/*.pkg", "~/Downloads/*.xip", "~/Downloads/*.iso"]
+min_age_days = 14
+min_mb = 50
+why = "Installer images in Downloads, usually installed long ago."
+
+[[recipe]]
+id = "trash"
+title = "Trash"
+kind = "trash"
+safety = "review"
+paths = ["~/.Trash"]
+why = "Files already moved to the Trash; emptying it deletes them for good."

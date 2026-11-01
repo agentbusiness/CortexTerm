@@ -2,7 +2,7 @@
  * what it is about, and the person's decisions. Sensor, finding and model text is rendered as text,
  * never HTML or commands; fixes go through the assistant, which checks again after they run. */
 import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from 'react';
-import { ago, errorMessage, useRuntime } from '@cortex/sdk';
+import { Menu, ago, errorMessage, useRuntime } from '@cortex/sdk';
 import type { Alert, CveReport, Decision, Finding, History, SweepReport } from './api';
 import { quote } from './api';
 import { useMachineAlerts } from './machine-data';
@@ -32,7 +32,7 @@ interface SecurityException {
 }
 interface ProtectionStatus {
   at: number; config: ProtectionConfig; sensors: ProtectionSensor[]; incidents: SecurityIncident[];
-  exceptions: SecurityException[]; deep_capture_command?: string | null; deep_install_command?: string | null;
+  exceptions: SecurityException[]; deep_install_command?: string | null; deep_service?: boolean;
   packet_capture_help: string; visibility: string;
 }
 interface StopTarget {
@@ -87,6 +87,7 @@ const STAGES: [string, string, string[]][] = [
 /** An advisory id in a finding's words. */
 const ADVISORY = /\b(CVE-\d{4}-\d{4,}|GHSA(?:-[0-9a-z]{4}){3}|RUSTSEC-\d{4}-\d{4}|PYSEC-\d{4}-\d+|GO-\d{4}-\d+|MAL-\d{4}-\d+)\b/i;
 /** Lets the admin group read the packet capture devices until the next restart. */
+const IMPORT_FORMATS: Record<ProtectionImport['kind'], string> = { suricata: 'Suricata EVE JSON', zeek: 'Zeek connection JSON' };
 const GRANT_BPF = 'sudo chgrp admin /dev/bpf* && sudo chmod g+r /dev/bpf*';
 const SYSTEM_PATH = /^\/(System|usr|bin|sbin)\//;
 /** The outermost app or bundle a path is in, else the path. */
@@ -179,8 +180,6 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
   const [importKind, setImportKind] = useState<ProtectionImport['kind']>('suricata');
   const [importPath, setImportPath] = useState('');
   const [confirmStop, setConfirmStop] = useState<StopTarget | null>(null);
-  const [copied, setCopied] = useState<'capture' | 'install' | null>(null);
-  const [copyProblem, setCopyProblem] = useState<string | null>(null);
 
   const rpc = useCallback(async <T,>(method: string, params: unknown): Promise<T> => {
     const controller = new AbortController();
@@ -221,7 +220,7 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
     statusRef.current = null;
     setStatus(null); setLoading(true); setActionUncertain(false); setLoadProblem(null); setActionProblem(null); setBusy(null);
     setDetails(new Map()); setDetailProblem({}); setConfirmStop(null); setReport(null); setHistory(null); setSelected(''); setDeciding(false); setAsked(new Set());
-    setImportPath(''); setTimelineLimits({}); setFocusedEvidence({}); setCopied(null); setCopyProblem(null);
+    setImportPath(''); setTimelineLimits({}); setFocusedEvidence({});
     let timer: ReturnType<typeof setTimeout> | undefined;
     const poll = async () => {
       if (!mounted.current || generation.current !== currentGeneration) return;
@@ -328,18 +327,6 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
     if (config.imports.length >= 4) { setActionProblem('Four sensor files are already connected. Remove one before adding another.'); return; }
     if (config.imports.some((entry) => entry.path === path)) { setActionProblem('This sensor file is already connected.'); return; }
     if (await configure({ imports: [...config.imports, { kind: importKind, path }] })) setImportPath('');
-  };
-
-  const copyCommand = async (kind: 'capture' | 'install') => {
-    const command = kind === 'capture' ? statusRef.current?.deep_capture_command : statusRef.current?.deep_install_command;
-    if (!command) return;
-    const currentGeneration = generation.current;
-    setCopyProblem(null); setCopied(null);
-    try {
-      if (!navigator.clipboard?.writeText) throw new Error('Clipboard access is unavailable. Select and copy the command below.');
-      await navigator.clipboard.writeText(command);
-      if (mounted.current && currentGeneration === generation.current) setCopied(kind);
-    } catch (cause) { if (mounted.current && currentGeneration === generation.current) setCopyProblem(errorMessage(cause)); }
   };
 
   const hasProblem = !!loadProblem;
@@ -506,6 +493,7 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
     const decision = entry.decision;
     const checks = checksOf(entry.findings);
     const tried = entry.findings.find((finding) => finding.tried)?.tried;
+    const raised = entry.findings.find((finding) => finding.raised)?.raised;
     const investigation = entry.incident?.investigation;
     const advisory = entry.findings.map((finding) => ADVISORY.exec(finding.text)?.[1]?.toUpperCase()).find(Boolean);
     return <>
@@ -520,6 +508,7 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
         {openCheck === check.id && <ul className="ct-sec-each">{check.findings.slice(0, 50).map((finding) => <li key={finding.key} dir="auto">{finding.text}</li>)}
           {check.findings.length > 50 && <li className="ct-faint">and {check.findings.length - 50} more. Ask about them, or decide about the whole group.</li>}</ul>}
       </li>)}</ol>
+      {raised && <p className="ct-asec-note ct-warn">Raised by the assistant's second look: this looks like {raised}. The checks rated it one level lower.</p>}
       {tried && <p className="ct-asec-note ct-warn">Tried <code>{tried}</code>: a fresh check still finds it. The assistant won't offer it again.</p>}
       {(report?.fixes ?? []).filter((fix) => fix.group === entry.key).slice(0, 3).map((fix) => fixCard(fix))}
       {advisory && copiesView(entry, advisory)}
@@ -744,27 +733,20 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
         <p className="ct-protection-meta">{date(sensor.last_at) ? <time dateTime={iso(sensor.last_at)} title={time(sensor.last_at)}>Last seen {ago(sensor.last_at)}</time> : 'Nothing seen yet'}{sensor.dropped > 0 && <span className="ct-warn"> · {count(sensor.dropped)} events lost</span>}</p>
       </li>)}</ul>
       {toggle('packet_watch', 'Watch for network scans', 'Packet metadata, when macOS allows capture.')}
-      {toggle('deep_watch', 'Read deep activity events', 'Needs the separately approved sensor below.')}
+      {toggle('deep_watch', 'Read deep activity events', 'Needs the native sensor: turning this on installs it once.')}
       {toggle('investigate', 'Investigate incidents with local AI', 'Read-only checks. The model never decides or acts.')}
       {status!.packet_capture_help && <p className="ct-asec-note" dir="auto">{status!.packet_capture_help}</p>}
       <details className="ct-protection-setup">
         <summary>Deep activity capture</summary>
-        {status!.deep_capture_command ? <>
-          <p className="ct-asec-note">The verified native sensor is installed. This command asks for administrator permission in your terminal and keeps capture running there. CT only copies it.</p>
-          <pre className="ct-protection-command" tabIndex={0}><code>{status!.deep_capture_command}</code></pre>
-          <button type="button" className="detent sm" onClick={() => void copyCommand('capture')}>{copied === 'capture' ? 'COPIED' : 'COPY CAPTURE COMMAND'}</button>
-        </> : status!.deep_install_command ? <>
-          <p className="ct-asec-note">Install the signed native sensor first. This command opens the macOS installer; macOS asks for your approval. CT only copies it.</p>
-          <pre className="ct-protection-command" tabIndex={0}><code>{status!.deep_install_command}</code></pre>
-          <button type="button" className="detent sm" onClick={() => void copyCommand('install')}>{copied === 'install' ? 'COPIED' : 'COPY INSTALLER COMMAND'}</button>
-        </> : <p className="ct-asec-note">Unavailable: no verified sensor or signed installer was found for this computer.</p>}
-        {copyProblem && <p className="ct-asec-note ct-warn" role="status">{copyProblem}</p>}
+        {status!.deep_service ? <p className="ct-asec-note">The sensor service is installed. It starts when the Mac starts, and CT reads its events while deep activity events are on. Nothing to run.</p>
+        : status!.deep_install_command ? <p className="ct-asec-note">Turning on deep activity events opens the sensor's installer. macOS asks for your password once; after that the sensor starts with the Mac and CT reads it by itself.</p>
+        : <p className="ct-asec-note">This build has no signed sensor: it needs Apple's Endpoint Security approval for the signing team first.</p>}
       </details>
       <details className="ct-protection-setup">
         <summary>Connect a network sensor log</summary>
         <p className="ct-asec-note">To see other devices, connect a local Suricata EVE or Zeek JSON log from your router or network sensor. CT only reads the file.</p>
         <form className="ct-protection-import" onSubmit={(event) => { event.preventDefault(); void addImport(); }}>
-          <label><span className="ct-label">FORMAT</span><select value={importKind} disabled={configurationDisabled} onChange={(event) => setImportKind(event.target.value as ProtectionImport['kind'])}><option value="suricata">Suricata EVE JSON</option><option value="zeek">Zeek connection JSON</option></select></label>
+          <div className="ct-protection-field"><span className="ct-label">FORMAT</span><Menu label="" value={IMPORT_FORMATS[importKind]} disabled={configurationDisabled} items={(Object.keys(IMPORT_FORMATS) as ProtectionImport['kind'][]).map((kind) => ({ key: kind, label: IMPORT_FORMATS[kind], selected: kind === importKind, onSelect: () => setImportKind(kind) }))} /></div>
           <label><span className="ct-label">LOCAL LOG PATH</span><input type="text" value={importPath} maxLength={1024} spellCheck={false} autoComplete="off" placeholder="/absolute/path/to/sensor.jsonl" disabled={configurationDisabled || config.imports.length >= 4} onChange={(event) => setImportPath(event.target.value)} /></label>
           <button type="submit" className="detent sm" disabled={configurationDisabled || !importPath.trim() || config.imports.length >= 4}>CONNECT FILE</button>
         </form>

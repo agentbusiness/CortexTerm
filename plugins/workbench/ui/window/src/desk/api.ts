@@ -274,6 +274,8 @@ export interface Finding {
   decision?: string;
   /** A fix command that ran and did not clear it. */
   tried?: string | null;
+  /** The model's second look found it worse than its rating; raised one level. */
+  raised?: string;
 }
 
 /** The person's decision about a group of findings (`system.finding.decide`). */

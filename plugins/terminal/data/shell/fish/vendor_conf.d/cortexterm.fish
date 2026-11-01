@@ -39,7 +39,7 @@ function __ct_send -a kind value last
 end
 
 function __ct_postexec --on-event fish_postexec
-    printf '\e]133;D;%s\a' $status
+    printf '\e]133;D;%s;%s\a' $status $__ct_nonce
 end
 
 function __ct_prompt --on-event fish_prompt
@@ -52,6 +52,9 @@ function __ct_prompt --on-event fish_prompt
             set -gx GIT_PAGER cat
         end
     end
+    # Signed at every prompt (a D without a C is ignored): an unsigned one then comes from a
+    # shell inside this one (ssh).
+    printf '\e]133;D;0;%s\a' $__ct_nonce
     printf '\e]7;file://%s%s\a' $hostname (string replace -a ' ' '%20' -- $PWD)
     set -l path (string join : -- $PATH)
     __ct_send env "$path" "$__ct_path"; and set -g __ct_path "$path"

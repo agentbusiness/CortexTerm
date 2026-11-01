@@ -137,11 +137,18 @@ pub async fn load_ports() -> Result<usize, String> {
     let rows = crate::graph::query_all("MATCH (p:Port) WHERE p.last_ms >= $since RETURN p.key, p.last_ms ORDER BY p.key", serde_json::json!({"since": since})).await?;
     let seen: HashMap<String, u64> = rows.iter().map(|row| (crate::graph::text(&row[0]), crate::graph::number(&row[1]))).collect();
     let count = seen.len();
+    // Older ones are not listening any more.
+    let stale = crate::graph::query_all("MATCH (p:Port) WHERE p.last_ms < $since AND p.ended_ms IS NULL RETURN p.key ORDER BY p.key", serde_json::json!({"since": since})).await?;
+    let stale: Vec<_> = stale.iter().map(|row| crate::graph::r("Port", crate::graph::text(&row[0]))).collect();
+    if !stale.is_empty() {
+        crate::graph::retire(stale, "not listening for two weeks");
+    }
     *LOADED_PORTS.lock().unwrap_or_else(|p| p.into_inner()) = Some(seen);
     Ok(count)
 }
 
-/// Ports seen now, as nodes: who opened them (its program), and where they listen.
+/// Ports seen now, as nodes: who opened them (its program), the folder it runs in (a dev
+/// server's project), and where they listen.
 fn write_ports(ports: &[&Port], exe_of: &HashMap<u32, String>) {
     use crate::graph::{Props, r};
     let Some(machine) = crate::graph::machine() else { return };
@@ -153,11 +160,17 @@ fn write_ports(ports: &[&Port], exe_of: &HashMap<u32, String>) {
         match exe_of.get(&port.pid).filter(|e| !e.is_empty()) {
             Some(exe) => {
                 unit.node("Binary", exe.clone());
-                unit.edge(r("Port", key), "OPENED_BY", r("Binary", exe.clone()));
+                unit.edge(r("Binary", exe.clone()), "ON", machine.clone());
+                unit.edge(r("Port", key.clone()), "OPENED_BY", r("Binary", exe.clone()));
             }
             None => {
-                unit.edge(r("Port", key), "ON", machine.clone());
+                unit.edge(r("Port", key.clone()), "ON", machine.clone());
             }
+        }
+        let cwd = crate::host::cwd_of(port.pid);
+        if cwd.starts_with('/') && cwd != "/" {
+            let folder = crate::graph::folder(unit, std::path::Path::new(&cwd));
+            unit.edge(r("Port", key), "IN", folder);
         }
     }
     crate::graph::put(batch);
@@ -576,7 +589,12 @@ impl Sampler {
         }
         self.watch.ports_baseline = false;
         if self.watch.ports_saved.elapsed() >= Duration::from_secs(600) {
-            // Every port open now, so its last_ms says it is still seen.
+            // Every port open now, so its last_ms says it is still seen; one not seen for two
+            // weeks is marked gone.
+            let gone: Vec<_> = self.watch.ports.seen.iter().filter(|(_, at)| now.saturating_sub(**at) > 2 * week).map(|(key, _)| crate::graph::r("Port", key.clone())).collect();
+            if !gone.is_empty() {
+                crate::graph::retire(gone, "not listening for two weeks");
+            }
             self.watch.ports.seen.retain(|_, at| now.saturating_sub(*at) <= 2 * week);
             write_ports(&self.ports.iter().collect::<Vec<_>>(), &exe_of);
             self.watch.ports_saved = Instant::now();

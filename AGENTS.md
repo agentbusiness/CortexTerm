@@ -60,6 +60,13 @@ and behave. A UI change is done only when the running app matches its board: lay
 labels and the keys shown on buttons. Check by screenshotting the running app next to the board. If the
 build should differ from the board, change the board on purpose and say why.
 
+## Use the theme's controls
+
+Never use the browser's native controls: their pop-ups ignore the theme. A dropdown is the SDK's
+`Menu` (`@cortex/sdk`, `.pick` with the theme's `.menu` list), never `<select>`. A switch is `.sw`,
+a button `.detent`, a segmented choice `.ct-seg`, never a native checkbox or radio. Inputs,
+buttons and pickers on one row share one height.
+
 ## No builds unless asked
 
 Write the code only. Never build, package, install, release or hot-swap the app or a plugin

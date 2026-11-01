@@ -7,9 +7,9 @@
 //! `SUPERSEDES` (-> `Knowledge`). Code is linked by sid, so a rename keeps the link.
 //!
 //! Nothing is deleted: a withdrawn or superseded item keeps its node and links as history, and
-//! search, `linked` and the brief serve only live items. Search by meaning is IronGraph's automatic
-//! embedding index (`semantic_nodes`) bound to the scope's live items, an exact name or alias match
-//! first.
+//! search (unless asked for history), `linked` and the brief serve only live items. Search by
+//! meaning is IronGraph's automatic embedding index (`semantic_nodes`) bound to the scope's live
+//! items, an exact name or alias match first.
 
 use crate::db::{Rows, layer};
 use crate::host::Host;
@@ -277,6 +277,21 @@ impl WorkStore {
         Ok(found)
     }
 
+    /// Nothing is kept unconnected: an item with no edge hangs off this Mac until it has one; one
+    /// with other edges loses that anchor.
+    async fn anchor(&self, id: &str) -> Result<(), RpcError> {
+        let rows = self.k_run(&format!("{} MATCH (k:Knowledge {{id: $id}})-[e]-() RETURN type(e)", layer::ALL_READ), params! { "id" => id }).await?;
+        let anchored = rows.rows.iter().any(|row| s(row, 0) == "ON");
+        let linked = rows.rows.iter().any(|row| s(row, 0) != "ON");
+        let cypher = match (linked, anchored) {
+            (true, true) => "MATCH (k:Knowledge {id: $id})-[r:ON]->(:Machine) DELETE r",
+            (false, false) => "MATCH (k:Knowledge {id: $id}), (m:Machine) MERGE (k)-[:ON]->(m)",
+            _ => return Ok(()),
+        };
+        self.k_run(&format!("{} {cypher}", layer::KNOWLEDGE_WRITE), params! { "id" => id }).await?;
+        Ok(())
+    }
+
     /// Add one link; false when the target does not resolve.
     async fn add_link(&self, id: &str, rel: &str, target: &str) -> Result<bool, RpcError> {
         check_rel(rel)?;
@@ -370,6 +385,7 @@ impl WorkStore {
                 unresolved.push(KnowledgeLink { rel: link.rel.trim().to_owned(), target: link.target.trim().to_owned(), id: String::new(), name: String::new() });
             }
         }
+        self.anchor(&id).await?;
         let mut item = self.must_get(&id).await?;
         item.links.extend(unresolved);
         Ok(item)
@@ -394,12 +410,12 @@ impl WorkStore {
 
     /// Live items by meaning, best first; an exact name or alias match first with score 1.
     /// Every live item in scope is ranked, so `pending` counts exactly the ones not embedded yet.
-    pub async fn knowledge_search(&self, text: &str, kind: Option<&str>, limit: u32) -> Result<KnowledgeSearchResult, RpcError> {
+    pub async fn knowledge_search(&self, text: &str, kind: Option<&str>, limit: u32, include_history: bool) -> Result<KnowledgeSearchResult, RpcError> {
         let text = text.trim();
         if text.is_empty() {
             return Err(RpcError::invalid_params("memory.knowledge.search needs `text`"));
         }
-        let live = self.knowledge_list(kind, None, false).await?;
+        let live = self.knowledge_list(kind, None, include_history).await?;
         if live.is_empty() {
             return Ok(KnowledgeSearchResult::default());
         }
@@ -453,6 +469,7 @@ impl WorkStore {
         if !self.add_link(id, &rel, target).await? {
             return Err(RpcError::not_found(format!("`{target}` does not name a {} target", rel.replace('_', " "))));
         }
+        self.anchor(id).await?;
         self.must_get(id).await
     }
 
@@ -469,6 +486,7 @@ impl WorkStore {
             )
             .await?;
         }
+        self.anchor(id).await?;
         self.must_get(id).await
     }
 
