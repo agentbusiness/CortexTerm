@@ -3,29 +3,15 @@
  * never HTML or commands; fixes go through the assistant, which checks again after they run. */
 import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import { Menu, ago, errorMessage, useRuntime } from '@cortex/sdk';
-import type { Alert, CveReport, Decision, Finding, History, SweepReport } from './api';
+import type { CveReport, Finding, History, SecurityClaim, SecurityIncident, SecurityObservation, SweepReport } from './api';
 import { quote } from './api';
 import { useMachineAlerts } from './machine-data';
+import { type Item, itemsOf, nameOf, priority, rank } from './security-items';
 import './security-protection.css';
 
 interface ProtectionImport { kind: 'suricata' | 'zeek'; path: string }
 interface ProtectionConfig { packet_watch: boolean; deep_watch: boolean; investigate: boolean; imports: ProtectionImport[] }
 interface ProtectionSensor { id: string; label: string; state: string; detail: string; last_at: number; dropped: number }
-interface SecurityObservation {
-  id: string; at: number; source: string; kind: string; severity: string; summary: string; rule: string; subject: string;
-  pid?: number | null; process_started?: number | null; parent_pid?: number | null; executable?: string | null;
-  process_started_us?: number | null; process_version?: number | null;
-  path?: string | null; remote?: string | null; port?: number | null; count: number;
-}
-interface SecurityClaim { text: string; evidence: string[] }
-interface SecurityInvestigation {
-  state: string; summary: SecurityClaim[]; alternatives: SecurityClaim[]; unknowns: string[]; next_steps: string[];
-  checked_at: number; error?: string | null; observations: SecurityObservation[];
-}
-interface SecurityIncident {
-  id: string; key: string; first_at: number; last_at: number; title: string; severity: string; state: string;
-  observations: SecurityObservation[]; investigation?: SecurityInvestigation | null; revision: number; omitted_observations?: number;
-}
 interface SecurityException {
   id: string; incident_key: string; created_at: number; expires_at: number; reason: string;
   observation_keys: string[]; max_severity: string;
@@ -42,30 +28,10 @@ interface StopTarget {
 
 type Ask = (text: string, intent: 'ask' | 'explain' | 'fix', runId?: string) => void;
 
-/** One row of the list: a group of sweep findings, a live incident or a machine alert. */
-interface Item {
-  key: string;
-  kind: 'sweep' | 'incident' | 'alert';
-  title: string;
-  /** The group's full name when the title is its last part. */
-  where: string;
-  text: string;
-  severity: string;
-  open: boolean;
-  last: number;
-  count: number;
-  findings: Finding[];
-  incident?: SecurityIncident;
-  alert?: Alert;
-  decision?: Decision;
-}
-
 const POLL_MS = 8_000;
 const SLOW_MS = 60_000;
 const RPC_MS = 20_000;
 const MAX_TIMELINE = 100;
-const PRIORITY: Record<string, string> = { critical: 'ACT NOW', high: 'ACT NOW', medium: 'SOON', warn: 'SOON', low: 'WATCH', info: 'NOTED' };
-const priority = (severity: string) => PRIORITY[severity] ?? 'NOTED';
 const VERDICTS = [
   ['expected', 'e', 'EXPECTED', 'Normal for this. Real, and fine.'],
   ['false_alarm', 'f', 'FALSE ALARM', 'The check is wrong here.'],
@@ -94,12 +60,10 @@ const SYSTEM_PATH = /^\/(System|usr|bin|sbin)\//;
 const bundleOf = (path: string) => /^(.*?\.(app|bundle|pkg))(\/|$)/.exec(path)?.[1] ?? path;
 const verdictName = (verdict: string) => VERDICTS.find(([id]) => id === verdict)?.[2] ?? verdict.toUpperCase();
 const plural = (n: number, word: string) => `${count(n)} ${word}${n === 1 ? '' : 's'}`;
-const nameOf = (group: string) => (group.includes('/') ? group.split('/').filter(Boolean).pop() : group) || group;
 const count = (value: number) => new Intl.NumberFormat().format(value);
 const date = (at: number) => Number.isFinite(at) && at > 0 && at < 8_640_000_000_000_000 ? new Date(at) : null;
 const time = (at: number) => date(at)?.toLocaleString() ?? 'Not recorded';
 const iso = (at: number) => date(at)?.toISOString();
-const rank = (severity: string) => (({ high: 0, warn: 1, medium: 1, low: 2, info: 3 } as Record<string, number>)[severity] ?? 4);
 const tone = (value: string) => ['high', 'warn', 'medium', 'low', 'info'].includes(value) ? value : 'info';
 
 function stopTarget(incident: SecurityIncident): StopTarget | null {
@@ -761,38 +725,6 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
       <LookupKeys />
     </div>;
   }
-}
-
-/** Sweep groups, live incidents and machine alerts as one list, open and worst first. */
-function itemsOf(report: SweepReport | null, incidents: SecurityIncident[], alerts: Alert[]): Item[] {
-  const items: Item[] = [];
-  const groups = new Map<string, Finding[]>();
-  for (const finding of report?.findings ?? []) {
-    const group = finding.group || finding.source;
-    groups.set(group, [...(groups.get(group) ?? []), finding]);
-  }
-  for (const [group, findings] of groups) {
-    const open = findings.filter((finding) => !finding.ignored);
-    const listed = (open.length ? open : findings).sort((a, b) => rank(a.severity) - rank(b.severity));
-    const incident = incidents.find((entry) => entry.key === `group:${group}` && entry.state !== 'dismissed') ?? incidents.find((entry) => entry.key === `group:${group}`);
-    const title = nameOf(group);
-    items.push({
-      key: group, kind: 'sweep', title, where: title === group ? '' : group, text: listed[0]!.text,
-      severity: listed[0]!.severity, open: open.length > 0, last: incident?.last_at ?? report?.at ?? 0, count: listed.length,
-      findings: listed, incident, decision: report?.decisions?.find((decision) => decision.group === group),
-    });
-  }
-  for (const incident of incidents) {
-    if (incident.key.startsWith('group:')) continue;
-    items.push({ key: incident.id, kind: 'incident', title: incident.title, where: '', text: `${plural(incident.observations.length, 'linked observation')}`, severity: incident.severity, open: incident.state !== 'dismissed', last: incident.last_at, count: incident.observations.length, findings: [], incident });
-  }
-  // A security alert is also its incident (same title): listed once, as the incident.
-  const titles = new Set(incidents.map((incident) => incident.title));
-  for (const alert of alerts) {
-    if (alert.dismissed || alert.kind === 'security-incident' || titles.has(alert.text)) continue;
-    items.push({ key: alert.id, kind: 'alert', title: alert.text, where: '', text: alert.kind, severity: alert.severity, open: true, last: alert.at, count: 1, findings: [], alert });
-  }
-  return items.sort((a, b) => Number(b.open) - Number(a.open) || rank(a.severity) - rank(b.severity) || b.last - a.last);
 }
 
 /** An open issue as the question a person would ask about it. */

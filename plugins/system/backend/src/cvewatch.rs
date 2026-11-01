@@ -37,21 +37,23 @@ const BY: &str = "cve-watch";
 const SUFFIX: &str = " affects this Mac";
 
 /// Run the watch for as long as the plugin runs. `ctx` reaches the graph; `fire` raises an alert;
-/// `resolve` closes the alerts of an advisory that no longer affects this Mac.
-pub async fn run(ctx: impl Fn() -> Option<Ctx>, fire: impl Fn(Candidate), resolve: impl Fn(&str)) {
+/// `settle` closes the alerts of every advisory the graph no longer says affects this Mac, whoever
+/// changed its verdict (this watch, a check the person or the assistant ran, an update).
+pub async fn run(ctx: impl Fn() -> Option<Ctx>, fire: impl Fn(Candidate), settle: impl Fn(&BTreeSet<String>)) {
     tokio::time::sleep(FIRST).await;
     while !crate::graph::wait_ready(Duration::from_secs(3600)).await {}
     loop {
         if let Some(ctx) = ctx() {
             match round(&ctx).await {
-                Ok((found, gone)) => {
+                Ok(found) => {
                     for candidate in found {
                         fire(candidate);
                     }
-                    for id in gone {
-                        resolve(&format!("cve:{id}"));
-                    }
                 }
+                Err(error) => tracing::info!("cve watch: {error}"),
+            }
+            match affecting().await {
+                Ok(still) => settle(&still.into_iter().map(|id| format!("cve:{id}")).collect()),
                 Err(error) => tracing::info!("cve watch: {error}"),
             }
         }
@@ -59,15 +61,16 @@ pub async fn run(ctx: impl Fn() -> Option<Ctx>, fire: impl Fn(Candidate), resolv
     }
 }
 
-/// One round: what to look at, each looked at, the graph brought up to date. The new alerts, and
-/// the advisories that no longer affect this Mac.
-async fn round(ctx: &Ctx) -> Result<(Vec<Candidate>, Vec<String>), String> {
+/// The advisories the graph says affect this Mac now.
+async fn affecting() -> Result<BTreeSet<String>, String> {
+    let rows = crate::graph::query("MATCH (a:Advisory)-[e:AFFECTS]->(t) WHERE e.verdict = 'affected' AND t.ended_ms IS NULL RETURN DISTINCT a.key", json!({})).await?;
+    Ok(rows.iter().map(|row| crate::graph::text(&row[0])).collect())
+}
+
+/// One round: what to look at, each looked at, the graph brought up to date. The new alerts.
+async fn round(ctx: &Ctx) -> Result<Vec<Candidate>, String> {
     let known = known(ctx).await?;
-    let before: BTreeSet<String> = crate::graph::query("MATCH (a:Advisory)-[e:AFFECTS]->(t) WHERE e.verdict = 'affected' AND t.ended_ms IS NULL RETURN DISTINCT a.key", json!({}))
-        .await?
-        .iter()
-        .map(|row| crate::graph::text(&row[0]))
-        .collect();
+    let before = affecting().await?;
     // The CISA list is refreshed every round, not once a day as the sweep does.
     let client = reqwest::Client::builder().timeout(Duration::from_secs(60)).build().map_err(|e| e.to_string())?;
     let _ = inventory::feed_within(&client, KEV_FILE, KEV, inventory::keep_kev, EVERY).await;
@@ -94,7 +97,6 @@ async fn round(ctx: &Ctx) -> Result<(Vec<Candidate>, Vec<String>), String> {
     }
 
     let mut found = Vec::new();
-    let mut gone = Vec::new();
     let mut affected = BTreeSet::new();
     for (looked, id) in ids.iter().take(MOST).enumerate() {
         if looked > 0 {
@@ -106,9 +108,6 @@ async fn round(ctx: &Ctx) -> Result<(Vec<Candidate>, Vec<String>), String> {
             batch.record(&report);
         }
         let fact = known.iter().find(|(known_id, _)| known_id == id).map(|(_, item)| item);
-        if matches!(report.verdict.as_str(), "fixed" | "not-affected") {
-            gone.push(id.clone());
-        }
         if report.verdict == "affected" {
             affected.insert(id.clone());
             if !before.contains(id) && fact.is_none() {
@@ -131,7 +130,7 @@ async fn round(ctx: &Ctx) -> Result<(Vec<Candidate>, Vec<String>), String> {
         }
     }
     tracing::info!("cve watch: {} advisories looked at, {} affect this Mac, {} new", ids.len().min(MOST), affected.len(), found.len());
-    Ok((found, gone))
+    Ok(found)
 }
 
 /// The facts earlier versions of the watch wrote that are still live: (advisory id, item).

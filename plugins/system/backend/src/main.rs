@@ -945,7 +945,7 @@ fn start(shared: &Arc<Shared>) {
     let (a, b, c) = (shared.clone(), shared.clone(), shared.clone());
     tokio::spawn(cvewatch::run(move || a.ctx.get().cloned(), move |candidate| {
         b.fire(candidate);
-    }, move |key| lock(&c.alerts).resolve(key)));
+    }, move |still| lock(&c.alerts).settle("cve", still)));
 
     // The network watcher: connections, threat lists and this Mac's network.
     let (a, b, c) = (shared.clone(), shared.clone(), shared.clone());

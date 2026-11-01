@@ -374,7 +374,6 @@ function ClusterCard({ computer, selected, color, lifted, dragStyle, grip, onCol
 }
 
 function ClusterAlerts({ node }: { node: string }) {
-  const { alerts, loading, problem } = useMachineAlerts(node);
-  const count = alerts.filter((alert) => !alert.dismissed && alert.severity !== 'info').length;
+  const { needing: count, loading, problem } = useMachineAlerts(node);
   return <span className={`ct-label ${count ? 'ct-warn' : 'ct-faint'}`}>{loading ? 'ALERTS…' : problem ? 'ALERTS UNAVAILABLE' : count ? `${count} ALERT${count === 1 ? '' : 'S'}` : 'NO ALERTS'}</span>;
 }

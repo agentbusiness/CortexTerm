@@ -11,7 +11,6 @@
 //! (f)-[:AT {step, kind, what, line}]->(c:Code)   each trace step's innermost symbol, else its file
 //! (f)-[:IN_PACKAGE]->(d:Code:Dependency)         the package a quick fix upgrades
 //! (f)-[:FIXED_IN]->(s:Session)                   the session that fixes or fixed it
-//! stream `security.status`                     every status move, in order
 //! ```
 //!
 //! A finding's trace, quick fix and lifecycle are nodes of their own, linked to it; the code the
@@ -76,9 +75,6 @@ const FINDING_FIELDS: [&str; 37] = [
     "name",
     "updated_ms",
 ];
-
-/// The stream every status move is appended to.
-const STATUS_TOPIC: &str = "security.status";
 
 /// Audit properties, in the order `audit_from` reads them (the JSON field names of [`SecurityAudit`]).
 const AUDIT_FIELDS: [&str; 11] = ["id", "started_ms", "finished_ms", "units", "lines_judged", "findings", "leads", "hardening", "scope", "skill_version", "report_path"];
@@ -299,7 +295,7 @@ impl SecurityStore {
     }
 
     /// Write a finding's trace steps and quick fix (replacing the stored ones) and the status moves
-    /// not stored yet, which also go to the `security.status` stream.
+    /// not stored yet.
     async fn write_parts(&self, finding: &SecurityFinding, history: &[SecurityStatusChange], now: u64) -> Result<(), RpcError> {
         let id = &finding.id;
         self.run(&format!("{} MATCH (f:Security:Finding {{id: $id}})-[:HAS_STEP]->(t:SecurityTraceStep) DETACH DELETE t", layer::WORKSPACE_WRITE), params! { "id" => id }).await?;
@@ -326,7 +322,6 @@ impl SecurityStore {
         }
         let stored = self.run(&format!("{} MATCH (f:Security:Finding {{id: $id}})-[:CHANGED]->(c:SecurityStatusChange) RETURN count(c)", layer::WORKSPACE_READ), params! { "id" => id }).await?;
         let known = stored.rows.first().and_then(|row| row.first()).and_then(Value::as_u64).unwrap_or(0) as usize;
-        let mut records = Vec::new();
         for (position, change) in history.iter().enumerate().skip(known) {
             self.run(
                 &format!(
@@ -339,14 +334,6 @@ impl SecurityStore {
                 },
             )
             .await?;
-            if let Ok(bytes) = serde_json::to_vec(&json!({ "at_ms": change.ms, "value": { "finding": id, "change": change } })) {
-                records.push(bytes);
-            }
-        }
-        if !records.is_empty()
-            && let Err(error) = self.graph.stream_append(&self.ig_id, STATUS_TOPIC, records).await
-        {
-            tracing::warn!(error = %error.message, "status moves not added to their stream");
         }
         Ok(())
     }
