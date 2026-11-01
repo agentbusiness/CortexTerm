@@ -348,9 +348,10 @@ impl Flow {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             let outcome = run.exit_code.map(|code| format!("exit {code}")).unwrap_or_else(|| "exit status unavailable".into());
-            // A fix for a sweep finding is judged by checking the finding again, not by its exit code.
+            // A fix for a sweep finding or a CVE alert is judged by checking again, not by its exit code.
             let recheck = match security::subject_of(&pending.question) {
                 Some(security::Subject::Finding(text)) if run.exit_code == Some(0) => flow.recheck(&text, &run.command).await,
+                Some(security::Subject::Alert(text)) => flow.recheck_cve(&text).await,
                 _ => None,
             };
             let mut tried = pending.tried;
@@ -1456,7 +1457,7 @@ impl Flow {
     /// it is written here; the model is not asked.
     async fn cve_evidence(&self, text: &str, evidence: &mut Evidence) {
         let Some(id) = text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')).find(|w| w.starts_with("CVE-")) else { return };
-        let cypher = "MATCH (a:Advisory {key: $id})-[e:AFFECTS]->(t) WHERE e.verdict = 'affected' RETURN t.key, e.version, e.place, e.why, e.fix LIMIT 4";
+        let cypher = "MATCH (a:Advisory {key: $id})-[e:AFFECTS]->(t) WHERE e.verdict = 'affected' AND t.ended_ms IS NULL RETURN t.key, e.version, e.place, e.why, e.fix LIMIT 4";
         let Some(found) = self.fact(crate::learning::GRAPH_QUERY, json!({"cypher": cypher, "params": {"id": id}, "limit": 4})).await else { return };
         let mut copies = Vec::new();
         for row in found["rows"].as_array().into_iter().flatten().filter_map(Value::as_array) {
@@ -1492,6 +1493,32 @@ impl Flow {
             "Checked again after the command: the finding is gone. It is fixed.".to_owned()
         } else {
             "Checked again after the command: the finding is still there. The command did not fix it; do not offer it again. Say why it may not have helped (for example the flaw is in a copy the command does not update, such as one inside an app).".to_owned()
+        })
+    }
+
+    /// After a command for a CVE alert ran: the system plugin checks the CVE against this Mac as it
+    /// is now. What is still affected and what fixes it, or that nothing here is affected any more;
+    /// None when the alert names no CVE or it could not be checked.
+    async fn recheck_cve(&self, text: &str) -> Option<String> {
+        let id = text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')).find(|w| w.starts_with("CVE-"))?;
+        let ctx = self.ctx.get()?;
+        let report = tokio::time::timeout(Duration::from_secs(150), ctx.call("system.cve", json!({"id": id}))).await.ok()?.ok()?;
+        let field = |m: &Value, key: &str| m.get(key).and_then(Value::as_str).unwrap_or("").to_owned();
+        let affected: Vec<String> = report["matches"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|m| field(m, "verdict") == "affected")
+            .map(|m| {
+                let fix = field(m, "fix");
+                let fix = if fix.is_empty() { "no fix can be installed yet".to_owned() } else { format!("fix: `{fix}`") };
+                format!("- {} {} ({}): {}; {fix}.", field(m, "what"), field(m, "version"), field(m, "place"), field(m, "why"))
+            })
+            .collect();
+        Some(if affected.is_empty() {
+            format!("Checked {id} again on this Mac after the command: nothing here is affected any more. It is fixed.")
+        } else {
+            format!("Checked {id} again on this Mac after the command. Only these are still affected:\n{}\nAnything else the alert named is no longer on this Mac and needs nothing. Never install a package to fix a CVE.", affected.join("\n"))
         })
     }
 

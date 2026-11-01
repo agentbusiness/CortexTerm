@@ -63,7 +63,7 @@ pub async fn run(ctx: impl Fn() -> Option<Ctx>, fire: impl Fn(Candidate), resolv
 /// the advisories that no longer affect this Mac.
 async fn round(ctx: &Ctx) -> Result<(Vec<Candidate>, Vec<String>), String> {
     let known = known(ctx).await?;
-    let before: BTreeSet<String> = crate::graph::query("MATCH (a:Advisory)-[e:AFFECTS]->() WHERE e.verdict = 'affected' RETURN DISTINCT a.key", json!({}))
+    let before: BTreeSet<String> = crate::graph::query("MATCH (a:Advisory)-[e:AFFECTS]->(t) WHERE e.verdict = 'affected' AND t.ended_ms IS NULL RETURN DISTINCT a.key", json!({}))
         .await?
         .iter()
         .map(|row| crate::graph::text(&row[0]))

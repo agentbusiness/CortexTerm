@@ -117,12 +117,25 @@ pub async fn report(raw: &str) -> Result<CveReport, String> {
         Ok(Ok(mac)) => Some(mac),
         _ => None,
     };
-    let seen: graph::Batch = mac.as_ref().map(Mac::graph).unwrap_or_default();
     let report = assemble(id, &advisory, &feeds, mac.as_ref());
-    let present = seen.refs();
-    graph::put(seen);
+    let present = remember(mac.as_ref()).await;
     record(&report, &present);
     Ok(report)
+}
+
+/// What is on this Mac goes to the graph once, so each advisory can point at it; what a look no
+/// longer finds (an uninstalled app or formula) is marked gone. The nodes written.
+async fn remember(mac: Option<&Mac>) -> std::collections::HashSet<cc_protocol::contracts::memory::GraphRef> {
+    let seen: graph::Batch = mac.map(Mac::graph).unwrap_or_default();
+    let present = seen.refs();
+    graph::put(seen);
+    if mac.is_some() {
+        let keys = |label: &str| present.iter().filter(|r| r.label == label).map(|r| r.key.clone()).collect();
+        inventory::retire_unseen("App", &keys("App")).await;
+        inventory::retire_unseen("Formula", &keys("Formula")).await;
+        inventory::retire_gone_repos(&keys("Repo")).await;
+    }
+    present
 }
 
 /// What a look at this Mac said about an advisory: `(:Advisory)-[:AFFECTS]->` each thing on this
@@ -202,16 +215,7 @@ impl Batch {
             Ok(Ok(mac)) => Some(mac),
             _ => None,
         };
-        // What is on this Mac goes to the graph once, so each advisory can point at it.
-        let seen: graph::Batch = mac.as_ref().map(Mac::graph).unwrap_or_default();
-        let present = seen.refs();
-        graph::put(seen);
-        if mac.is_some() {
-            let keys = |label: &str| present.iter().filter(|r| r.label == label).map(|r| r.key.clone()).collect();
-            inventory::retire_unseen("App", &keys("App")).await;
-            inventory::retire_unseen("Formula", &keys("Formula")).await;
-            inventory::retire_gone_repos(&keys("Repo")).await;
-        }
+        let present = remember(mac.as_ref()).await;
         Ok(Batch { client, feeds, mac, present })
     }
 
