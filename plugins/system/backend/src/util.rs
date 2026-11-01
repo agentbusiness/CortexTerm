@@ -10,6 +10,28 @@ pub fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
+/// Run `f` on a thread of its own at background priority, so a long check stays out of the way:
+/// on a Mac the background QoS class (efficiency cores, throttled disk reads), on Linux the
+/// lowest nice. None when the thread could not start or `f` panicked.
+pub async fn background<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("background".into())
+        .spawn(move || {
+            #[cfg(target_os = "macos")]
+            unsafe {
+                libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_BACKGROUND, 0);
+            }
+            #[cfg(target_os = "linux")]
+            unsafe {
+                libc::nice(19);
+            }
+            let _ = tx.send(f());
+        })
+        .ok()?;
+    rx.await.ok()
+}
+
 pub fn home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
 }

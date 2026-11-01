@@ -88,7 +88,7 @@ fn ids_text(ids: &[String]) -> String {
 }
 
 async fn blocking(f: impl FnOnce() -> Part + Send + 'static) -> Part {
-    tokio::task::spawn_blocking(f).await.unwrap_or_default()
+    crate::util::background(f).await.unwrap_or_default()
 }
 
 /// The parts of the sweep a check can ask for by name.
