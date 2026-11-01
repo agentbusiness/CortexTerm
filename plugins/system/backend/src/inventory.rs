@@ -1507,7 +1507,7 @@ pub async fn checks(scope: Scope, discovery: crate::filesystem::Shared) -> Part 
             return part;
         }
     };
-    let gathering = tokio::task::spawn_blocking(move || {
+    let gathering = crate::util::background(move || {
         let found = discovery.get();
         if discovery.is_cancelled() { return Local::default(); }
         Local::gather(scope, found)
@@ -1522,9 +1522,9 @@ pub async fn checks(scope: Scope, discovery: crate::filesystem::Shared) -> Part 
     };
     part.merge(notes);
     let local = match gathering.await {
-        Ok(local) => local,
-        Err(error) => {
-            part.skipped.push(format!("installed software: filesystem discovery failed: {error}"));
+        Some(local) => local,
+        None => {
+            part.skipped.push("installed software: filesystem discovery failed".into());
             return part;
         }
     };
