@@ -909,6 +909,9 @@ impl Flow {
                                 if parents.is_empty() { "unknown".to_owned() } else { parents.join(" < ") }
                             ));
                         }
+                        if kind == "cve" {
+                            self.cve_evidence(text, &mut evidence).await;
+                        }
                         let same = alerts.iter().filter(|a| field(a, "kind") == kind && a.get("dismissed").and_then(Value::as_bool) == Some(true)).count();
                         if same > 0 {
                             evidence.lines.push(format!("Past choices: the user dismissed {same} {kind} alert{} this week.", if same == 1 { "" } else { "s" }));
@@ -1400,6 +1403,30 @@ impl Flow {
             },
             Ok(Err(error)) => Check { output: format!("macsec: {}", error.message), exit_code: Some(1) },
             Err(_) => Check { output: String::new(), exit_code: None },
+        }
+    }
+
+    /// A CVE alert: what on this Mac is affected and what fixes each copy, from the system plugin's
+    /// check. A copy nothing can fix yet gets no command, and the model is told not to invent one.
+    async fn cve_evidence(&self, text: &str, evidence: &mut Evidence) {
+        let Some(id) = text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')).find(|w| w.starts_with("CVE-")) else { return };
+        let Some(ctx) = self.ctx.get() else { return };
+        let Ok(Ok(report)) = tokio::time::timeout(Duration::from_secs(60), ctx.call("system.cve", json!({"id": id}))).await else {
+            evidence.lines.push(format!("{id} could not be checked again just now."));
+            return;
+        };
+        let mut fixable = false;
+        for m in report["matches"].as_array().into_iter().flatten().filter(|m| m["verdict"] == "affected").take(4) {
+            let fix = m["fix"].as_str().unwrap_or("");
+            evidence.lines.push(format!("Affected copy: {} {} ({}): {}. {}", m["what"].as_str().unwrap_or("?"), m["version"].as_str().unwrap_or(""), m["place"].as_str().unwrap_or(""),
+                m["why"].as_str().unwrap_or(""), if fix.is_empty() { "No command fixes this copy yet.".to_owned() } else { format!("What fixes it: {fix}") }));
+            if !fix.is_empty() && !fix.starts_with("Update ") && evidence.fix.is_none() {
+                evidence.fix = Some(fix.to_owned());
+                fixable = true;
+            }
+        }
+        if !fixable {
+            evidence.lines.push("No command can fix this yet. Say so, and say what to wait for. Do not offer brew update, brew upgrade or any other command.".into());
         }
     }
 

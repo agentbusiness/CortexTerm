@@ -909,10 +909,10 @@ fn start(shared: &Arc<Shared>) {
     tokio::spawn(async move { watch_launch_folders(s).await });
 
     // The CVE watch: new exploited advisories checked against this Mac, kept in the graph.
-    let (a, b) = (shared.clone(), shared.clone());
+    let (a, b, c) = (shared.clone(), shared.clone(), shared.clone());
     tokio::spawn(cvewatch::run(move || a.ctx.get().cloned(), move |candidate| {
         b.fire(candidate);
-    }));
+    }, move |key| lock(&c.alerts).resolve(key)));
 
     // The network watcher: connections, threat lists and this Mac's network.
     let (a, b, c) = (shared.clone(), shared.clone(), shared.clone());

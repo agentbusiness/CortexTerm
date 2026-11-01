@@ -326,6 +326,7 @@ fn assemble(id: String, advisory: &Advisory, feeds: &Feeds, mac: Option<&Mac>) -
     matches.sort_by_key(|m: &CveMatch| order(&m.verdict));
     matches.truncate(30);
     report.affects = affects;
+    homebrew_reach(&mut matches);
     report.matches = matches;
     verdict(&mut report, advisory, mac.is_some());
     report
@@ -1409,6 +1410,34 @@ fn candidates(vendor: &str, product: &str, mac: &Mac) -> Vec<Candidate> {
         }
     }
     found
+}
+
+/// An affected Homebrew formula whose fix Homebrew does not ship yet: no upgrade can fix it, so
+/// none is offered.
+fn homebrew_reach(matches: &mut [CveMatch]) {
+    for m in matches.iter_mut().filter(|m| m.verdict == "affected" && m.place == "Homebrew" && !m.fixed_in.is_empty()) {
+        let Some(newest) = brew_newest(&m.what) else { continue };
+        if version_cmp(&newest, &m.fixed_in) == Some(Ordering::Less) {
+            m.why = format!("{}; Homebrew's newest {} is {newest}, so no upgrade fixes it yet", m.why, m.what);
+            m.fix = None;
+        }
+    }
+}
+
+/// Homebrew's newest version of a formula (its local catalogue, as of the last `brew update`),
+/// remembered for an hour.
+fn brew_newest(name: &str) -> Option<String> {
+    static NEWEST: Mutex<BTreeMap<String, (u64, String)>> = Mutex::new(BTreeMap::new());
+    if let Some((at, version)) = NEWEST.lock().ok()?.get(name)
+        && at + 3_600_000 > now_ms()
+    {
+        return Some(version.clone());
+    }
+    let out = crate::util::run("brew", &["info", "--json=v2", name], Duration::from_secs(30)).ok().filter(|out| out.ok)?;
+    let info: Value = serde_json::from_str(&out.stdout).ok()?;
+    let version = info.pointer("/formulae/0/versions/stable")?.as_str()?.to_owned();
+    NEWEST.lock().ok()?.insert(name.to_owned(), (now_ms(), version.clone()));
+    Some(version)
 }
 
 /// Whether one CPE covers a version: Some(true) inside, Some(false) outside, None unknown.

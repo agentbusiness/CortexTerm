@@ -136,6 +136,16 @@ impl AlertStore {
         Some(alert)
     }
 
+    /// What an alert said is no longer true (an update fixed it): its open alerts close.
+    pub fn resolve(&mut self, key: &str) {
+        for stored in self.alerts.iter_mut().filter(|s| s.key == key && !s.alert.dismissed) {
+            stored.alert.dismissed = true;
+            let mut batch = Batch::new();
+            batch.unit().node("Alert", stored.alert.id.clone()).p("dismissed", true);
+            graph::put(batch);
+        }
+    }
+
     /// The alert's node (with its kind's) as it is now.
     fn write(&self, alert: &Alert, key: &str, quiet_until: Option<u64>, about: Option<GraphRef>) {
         let Some(machine) = graph::machine() else { return };
