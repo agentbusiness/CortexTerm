@@ -133,6 +133,7 @@ pub mod methods {
     pub const KNOWLEDGE_LIST: &str = "memory.knowledge.list";
     /// [`super::KnowledgeSearchParams`] -> [`super::KnowledgeSearchResult`]: live items by meaning
     /// (IronGraph's own embedding), an exact name or alias match first; best first, with `score`.
+    /// `include_history` searches withdrawn and superseded items too.
     pub const KNOWLEDGE_SEARCH: &str = "memory.knowledge.search";
     /// [`super::KnowledgeLinkParams`] -> [`super::KnowledgeItem`]: add one link (see
     /// [`super::KnowledgeLink`]); a target that does not resolve is `not_found`.
@@ -1665,6 +1666,9 @@ pub struct KnowledgeSearchParams {
     pub kind: Option<String>,
     #[serde(default = "default_knowledge_limit")]
     pub limit: u32,
+    /// Withdrawn and superseded items too (a learner checking what it was told to forget).
+    #[serde(default)]
+    pub include_history: bool,
 }
 
 fn default_knowledge_limit() -> u32 {
@@ -2175,7 +2179,8 @@ pub struct MachineInfo {
 }
 
 /// [`methods::STREAM_APPEND`]. Topic names: `[a-z0-9][a-z0-9._-]*`, at most 200 bytes; `queue.` and
-/// `session.` topics belong to the plugin.
+/// `session.` topics, and `app.sessions`, `settings`, `security.status` and `board`, belong to the
+/// plugin.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct StreamAppendParams {
     pub topic: String,

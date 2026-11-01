@@ -1,10 +1,10 @@
 //! Scheduled jobs, run in-app while the plugin runs: a shell command or the security sweep, at
 //! `daily HH:MM`, `hourly`, `every N min` or `weekly <day> HH:MM` (local time). They live in the
 //! graph: `(:Schedule {key: id, name, kind, command, cwd, when, enabled, alert_on, next, owner_…,
-//! sandboxed, writable, approved, last_…})-[:ON]->(:Machine)`, `-[:RUNS {at}]->` each `(:Sweep)`
-//! it ran, or the `(:CommandRun)` of each command it ran (the terminal's Run: a command runs
-//! through `terminal.command`, with its risk engine and sandbox, traced). A deleted schedule is
-//! retired. A run missed while the app was closed runs once a minute after start. The first start
+//! sandboxed, writable, approved, last_…})-[:ON]->(:Machine)`, `-[:RUNS {at}]->` the
+//! `(:CommandRun)` of each command it ran (the terminal's Run: a command runs through
+//! `terminal.command`, with its risk engine and sandbox, traced); a sweep it ran is on stream
+//! `security.sweeps`. A deleted schedule is retired. A run missed while the app was closed runs once a minute after start. The first start
 //! seeds the daily security sweep.
 
 use crate::graph::{self, Batch, Props, r};
@@ -299,11 +299,9 @@ impl Store {
 
 /// What a run left in the graph.
 pub enum Ran {
-    /// The sweep stored at this time (none when memory was not ready).
-    Sweep(Option<u64>),
     /// The terminal's Run of the command.
     Command(String),
-    /// The command did not start.
+    /// Nothing to link: a sweep (on its stream), or a command that did not start.
     Nothing,
 }
 
@@ -353,9 +351,6 @@ fn write(schedule: &Schedule, ran: Option<Ran>) {
     }
     unit.edge(me.clone(), "ON", machine);
     match (ran, &schedule.last) {
-        (Some(Ran::Sweep(Some(sweep_at))), Some(last)) => {
-            unit.edge(me, "RUNS", r("Sweep", sweep_at.to_string())).p("at", last.at);
-        }
         (Some(Ran::Command(run_id)), Some(last)) => {
             unit.edge(me, "RUNS", r("CommandRun", run_id)).p("at", last.at);
         }

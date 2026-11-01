@@ -48,7 +48,7 @@ async function homeProject(client: Client): Promise<{ id: string; root: string }
   return client.call<{ id: string; root: string }>('frame.project.open', { root: probe.cwd });
 }
 
-type SideView = 'machine' | 'alerts' | 'traces' | 'ssh' | 'schedules' | 'files' | 'log' | 'investigate';
+type SideView = 'machine' | 'alerts' | 'traces' | 'ssh' | 'schedules' | 'files' | 'cleanup' | 'log' | 'investigate';
 interface SideDetails { run?: string; pid?: number; trace?: string }
 
 const NAV = { def: 220, min: 160, max: 420, fold: 110 };
@@ -98,6 +98,7 @@ export function Desk() {
   useLive();
   const host = useHost();
   const filesAvailable = useSyncExternalStore(host.subscribeUiPlugins, () => host.uiPlugins().some((plugin) => plugin.slot === 'machine.files@1'));
+  const cleanupAvailable = useSyncExternalStore(host.subscribeUiPlugins, () => host.uiPlugins().some((plugin) => plugin.slot === 'machine.cleanup@1'));
   const client = clientOf(null);
   const [doc, setDoc] = useShared<DeskDoc>('ct.desks', EMPTY_DOC);
   const [home, setHome] = useState('');
@@ -276,7 +277,7 @@ export function Desk() {
   const setSideRun = useCallback((run: string) => setSideDetails((current) => ({ ...current, [sideNode ?? '']: { ...current[sideNode ?? ''], run } })), [sideNode, setSideDetails]);
   const setSidePid = useCallback((pid: number) => setSideDetails((current) => ({ ...current, [sideNode ?? '']: { ...current[sideNode ?? ''], pid } })), [sideNode, setSideDetails]);
   const setSideTrace = useCallback((trace: string) => setSideDetails((current) => ({ ...current, [sideNode ?? '']: { ...current[sideNode ?? ''], trace } })), [sideNode, setSideDetails]);
-  const sideView = (requestedSideView === 'log' && !sideRun || requestedSideView === 'investigate' && !sidePid || requestedSideView === 'files' && (!sideNode || !filesAvailable)) ? 'machine' : requestedSideView;
+  const sideView = (requestedSideView === 'log' && !sideRun || requestedSideView === 'investigate' && !sidePid || requestedSideView === 'files' && (!sideNode || !filesAvailable) || requestedSideView === 'cleanup' && !cleanupAvailable) ? 'machine' : requestedSideView;
 
   function focusedCwd() {
     const term = focusedTerm?.termId ? live.states.get(focusedTerm.termId) : undefined;
@@ -678,7 +679,7 @@ export function Desk() {
               <ComputerPicker computers={machineOptions} node={sideNode ?? ''} colors={cluster.layout.colors}
                 onSelect={selectSideNode} onCluster={() => { setOverlay(null); setClusterOpen(true); }} />
               <div className="ct-side-tabs" role="tablist" aria-label={`Views for ${selectedComputer.name}`}>
-                {([['machine', 'MACHINE'], ['alerts', sideAlertCount ? `ALERTS · ${sideAlertCount}` : 'ALERTS'], ['traces', 'TRACES'], ['ssh', 'SSH'], ['schedules', 'SCHEDULES'], ...(sideNode && filesAvailable ? [['files', 'FILES']] : []), ...(sideRun ? [['log', 'LOG']] : []), ...(sidePid ? [['investigate', `PID ${sidePid}`]] : [])] as [SideView, string][]).map(([view, label]) => (
+                {([['machine', 'MACHINE'], ['alerts', sideAlertCount ? `ALERTS · ${sideAlertCount}` : 'ALERTS'], ['traces', 'TRACES'], ['ssh', 'SSH'], ['schedules', 'SCHEDULES'], ...(sideNode && filesAvailable ? [['files', 'FILES']] : []), ...(cleanupAvailable ? [['cleanup', 'CLEANUP']] : []), ...(sideRun ? [['log', 'LOG']] : []), ...(sidePid ? [['investigate', `PID ${sidePid}`]] : [])] as [SideView, string][]).map(([view, label]) => (
                   <button key={view} id={`ct-side-tab-${view}`} type="button" role="tab" aria-selected={sideView === view} aria-controls="ct-machine-panel"
                     className={`ct-side-tab${sideView === view ? ' on' : ''}${view === 'alerts' && sideAlertCount ? ' hot' : ''}`} onClick={() => setSideView(view)}>{label}</button>
                 ))}
@@ -697,6 +698,7 @@ export function Desk() {
                 {sideView === 'ssh' && <SshPane {...sideFrame('ssh')} onShell={onSideShell} onAsk={onSideAsk} />}
                 {sideView === 'schedules' && <SchedulesPane {...sideFrame('schedules')} home={sideHome} />}
                 {sideView === 'files' && sideNode && <host.Slot name="machine.files@1" className="ct-side-files" />}
+                {sideView === 'cleanup' && <host.Slot name="machine.cleanup@1" className="ct-side-cleanup" />}
                 {sideView === 'investigate' && sidePid > 0 && <Investigate pid={sidePid} home={sideHome} onAsk={onSideAsk} onSignal={onSignal}
                   onShell={onSideShell} onInvestigate={onInvestigate} onOpenTrace={onOpenTrace}
                   onOpenFile={(path) => addPane({ id: newId('pane'), kind: 'editor', title: path.split('/').pop() || path, cwd: sideHome, path, ...(sideNode ? { node: sideNode } : {}) })}

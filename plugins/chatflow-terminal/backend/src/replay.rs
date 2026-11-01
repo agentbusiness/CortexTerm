@@ -2,14 +2,18 @@
 //! request, with only the candidate memory changed. An observed successful command is the
 //! deterministic oracle. An answer without such evidence remains unscored, rather than letting
 //! the model grade its own prose as a successful repair.
+//!
+//! A lesson is tried on held-out episodes only: the same failure, fixed, where the lesson was
+//! neither learned nor shown. On the episode it came from it would only repeat its own answer.
 
 use crate::flow::{Flow, proposed_command};
-use crate::learning::{self, Shown, background, check_cancel, edge, put, rows};
+use crate::learning::{self, MAX_ATTEMPTS, Shown, background, check_cancel, edge, put, rows};
 use cc_protocol::contracts::memory::{KnowledgeItem, KnowledgeListResult, methods as memory};
 use cc_protocol::contracts::model::ChatMessage;
 use cc_protocol::contracts::now_ms;
-use cc_protocol::{RpcError, parse_params};
+use cc_protocol::{RpcError, codes, parse_params};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use tokio_util::sync::CancellationToken;
 
 /// Preserve whitespace inside arguments, quotes and scripts: only outside blank space is ignored.
@@ -23,79 +27,126 @@ pub async fn one(flow: &Flow, cancel: &CancellationToken) -> Result<(), RpcError
     lessons.sort_by_key(|item| item.created_ms);
     for lesson in lessons {
         check_cancel(cancel)?;
-        let snapshots = rows(flow,
-            "MATCH (k:Knowledge {id: $id})-[:LEARNED_FROM]->(e:TerminalEpisode) WHERE e.verified_fix = true AND e.proposal <> '' RETURN e.key, e.messages_json, e.shown_json, e.outcome_command, e.failure ORDER BY e.created_ms LIMIT 10",
-            json!({"id": lesson.id}), 10).await?;
-        for row in snapshots {
-            let text = |index: usize| row.get(index).and_then(Value::as_str).unwrap_or("");
-            let episode = text(0);
-            let key = format!("{}/{episode}", lesson.id);
-            let prior = rows(
+        let failures: Vec<&String> = lesson.aliases.iter().filter(|alias| alias.starts_with("failed ")).collect();
+        if failures.is_empty() {
+            continue;
+        }
+        let own: HashSet<String> = rows(flow, "MATCH (k:Knowledge {id: $id})-[:LEARNED_FROM]->(e:TerminalEpisode) RETURN e.key", json!({"id": lesson.id}), 1000)
+            .await?
+            .into_iter()
+            .filter_map(|row| row.first()?.as_str().map(str::to_owned))
+            .collect();
+        for failure in failures {
+            let snapshots = rows(
                 flow,
-                "MATCH (r:TerminalReplay {key: $key}) RETURN r.state, r.with_answer, r.without_answer, r.with_model, r.without_model, r.lesson_text, r.expected_command",
-                json!({"key": key}),
-                1,
+                "MATCH (e:TerminalEpisode)-[:OBSERVED]->(r:CommandRun) WHERE e.failure = $failure AND e.verified_fix = true AND e.proposal <> '' \
+                 OPTIONAL MATCH (e)-[:ABOUT]->(f:Folder) RETURN e.key, e.at_ms, EXISTS { (e)-[:SHOWN]->(:Knowledge {id: $id}) }, r.command, f.key ORDER BY e.created_ms LIMIT 50",
+                json!({"failure": failure, "id": lesson.id}),
+                50,
             )
             .await?;
-            if prior.first().and_then(|r| r.first()).and_then(Value::as_str) == Some("done") {
-                continue;
-            }
-            let messages: Vec<ChatMessage> = serde_json::from_str(text(1)).map_err(|error| RpcError::internal(format!("replay snapshot: {error}")))?;
-            if messages.is_empty() || text(3).trim().is_empty() || text(4).is_empty() {
-                continue;
-            }
-            let shown: Vec<Shown> = serde_json::from_str(text(2)).map_err(|error| RpcError::internal(format!("replay memory: {error}")))?;
-            // The observed successful command is the external checker; it is not added as an
-            // answer to either prompt. Both prompts otherwise use the same frozen evidence.
-            let expected = text(3);
-            let reusable = prior.first().is_some_and(|r| r.get(5).and_then(Value::as_str) == Some(lesson.text.as_str()) && r.get(6).and_then(Value::as_str) == Some(expected));
-            let saved = |index| if reusable { prior.first().and_then(|r| r.get(index)).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned) } else { None };
-            let mut with = saved(1);
-            let mut without = saved(2);
-            let mut with_model = saved(3).unwrap_or_default();
-            let mut without_model = saved(4).unwrap_or_default();
-            for arm in ["without", "with"] {
-                check_cancel(cancel)?;
-                if (arm == "with" && with.is_some()) || (arm == "without" && without.is_some()) {
+            for row in snapshots {
+                let text = |index: usize| row.get(index).and_then(Value::as_str).unwrap_or("");
+                let episode = text(0);
+                // Where the lesson was shown, the run itself already said how it fared.
+                let shown = row.get(2).and_then(Value::as_bool) == Some(true);
+                if own.contains(episode) || shown || text(3).trim().is_empty() || !learning::in_scope(&lesson, text(4)) {
                     continue;
                 }
-                let request = arm_messages(&messages, &shown, &lesson, arm == "with");
-                let result = background(flow, &format!("replay-{arm}"), request, None, cancel).await?;
-                // Empty or truncated generations are inconclusive and retried, never graded.
-                if result.result.content.trim().is_empty() || result.result.finish_reason != "stop" || result.model_id.is_empty() {
-                    return Err(RpcError::internal("terminal replay did not finish an answer"));
+                let Some(at_ms) = row.get(1).and_then(Value::as_u64) else { continue };
+                let Some((messages, shown)) = learning::episode_record(flow, episode, at_ms).await? else { continue };
+                let key = format!("{}/{episode}", lesson.id);
+                let prior = rows(
+                    flow,
+                    "MATCH (r:TerminalReplay {key: $key}) RETURN r.state, r.with_answer, r.without_answer, r.with_model, r.without_model, r.expected_command, r.attempts",
+                    json!({"key": key}),
+                    1,
+                )
+                .await?;
+                let attempts = prior.first().and_then(|r| r.get(6)).and_then(Value::as_u64).unwrap_or(0);
+                if prior.first().and_then(|r| r.first()).and_then(Value::as_str) == Some("done") || attempts >= MAX_ATTEMPTS {
+                    continue;
                 }
-                if arm == "with" {
-                    with = Some(result.result.content);
-                    with_model = result.model_id;
-                } else {
-                    without = Some(result.result.content);
-                    without_model = result.model_id;
+                match compare(flow, &key, episode, &lesson, &messages, &shown, text(3), prior.first(), cancel).await {
+                    Err(error) if error.code == codes::CANCELLED || cancel.is_cancelled() => return Err(error),
+                    Err(error) => {
+                        tracing::warn!(replay = %key, %error, attempt = attempts + 1, "terminal replay failed");
+                        let props = json!({"state": "failed", "attempts": attempts + 1, "error": learning::cut(&error.message, 300)});
+                        let edges = vec![edge("TerminalReplay", &key, "FOR", "Knowledge", &lesson.id), edge("TerminalReplay", &key, "FROM", "TerminalEpisode", episode)];
+                        put(flow, vec![json!({"label": "TerminalReplay", "key": key, "props": props})], edges).await?;
+                    }
+                    Ok(()) => {}
                 }
-                persist(flow, &key, episode, &lesson, "pending", with.as_deref(), without.as_deref(), &with_model, &without_model, expected, "pending").await?;
+                return Ok(()); // At most one comparison per idle cycle.
             }
-            check_cancel(cancel)?;
-            if with_model != without_model || with_model.is_empty() {
-                persist(flow, &key, episode, &lesson, "retry", None, None, "", "", expected, "inconclusive_model_changed").await?;
-                return Ok(());
-            }
-            let with = with.as_deref().unwrap_or("");
-            let without = without.as_deref().unwrap_or("");
-            let hit = |answer: &str| proposed_command(answer).is_some_and(|command| same_command(&command, expected));
-            let verdict = match (hit(with), hit(without)) {
-                (true, false) => "helped",
-                (false, true) => "hurt",
-                _ => "no_observed_effect",
-            };
-            // Persist both actual answers before scoring; repeat puts use one key. If the worker
-            // stops between feedback and the done marker, the same event is merged on recovery.
-            persist(flow, &key, episode, &lesson, "compared", Some(with), Some(without), &with_model, &without_model, expected, verdict).await?;
-            learning::record_feedback(flow, &format!("replay/{key}"), episode, &lesson.id, verdict, "recorded_context_replay", &format!("terminal-replay://{key}")).await?;
-            persist(flow, &key, episode, &lesson, "done", Some(with), Some(without), &with_model, &without_model, expected, verdict).await?;
-            return Ok(()); // At most one comparison per idle cycle.
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn compare(
+    flow: &Flow,
+    key: &str,
+    episode: &str,
+    lesson: &KnowledgeItem,
+    messages: &[ChatMessage],
+    shown: &[Shown],
+    expected: &str,
+    prior: Option<&Vec<Value>>,
+    cancel: &CancellationToken,
+) -> Result<(), RpcError> {
+    if messages.is_empty() {
+        return Ok(());
+    }
+    // The observed successful command is the external checker; it is not added as an answer to
+    // either prompt. Both prompts otherwise use the same frozen evidence. A learned lesson's text
+    // stays as it was learned (one the user edits is no longer the learner's), so answers saved for
+    // the same oracle are still valid.
+    let reusable = prior.is_some_and(|r| r.get(5).and_then(Value::as_str) == Some(expected));
+    let saved = |index| if reusable { prior.and_then(|r| r.get(index)).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned) } else { None };
+    let mut with = saved(1);
+    let mut without = saved(2);
+    let mut with_model = saved(3).unwrap_or_default();
+    let mut without_model = saved(4).unwrap_or_default();
+    for arm in ["without", "with"] {
+        check_cancel(cancel)?;
+        if (arm == "with" && with.is_some()) || (arm == "without" && without.is_some()) {
+            continue;
+        }
+        let request = arm_messages(messages, shown, lesson, arm == "with");
+        let result = background(flow, &format!("replay-{arm}"), request, None, cancel).await?;
+        // Empty or truncated generations are inconclusive and retried, never graded.
+        if result.result.content.trim().is_empty() || result.result.finish_reason != "stop" || result.model_id.is_empty() {
+            return Err(RpcError::internal("terminal replay did not finish an answer"));
+        }
+        if arm == "with" {
+            with = Some(result.result.content);
+            with_model = result.model_id;
+        } else {
+            without = Some(result.result.content);
+            without_model = result.model_id;
+        }
+        persist(flow, key, episode, lesson, "pending", with.as_deref(), without.as_deref(), &with_model, &without_model, expected, "pending").await?;
+    }
+    check_cancel(cancel)?;
+    if with_model != without_model || with_model.is_empty() {
+        persist(flow, key, episode, lesson, "retry", None, None, "", "", expected, "inconclusive_model_changed").await?;
+        return Ok(());
+    }
+    let with = with.as_deref().unwrap_or("");
+    let without = without.as_deref().unwrap_or("");
+    let hit = |answer: &str| proposed_command(answer).is_some_and(|command| same_command(&command, expected));
+    let verdict = match (hit(with), hit(without)) {
+        (true, false) => "helped",
+        (false, true) => "hurt",
+        _ => "no_observed_effect",
+    };
+    // Persist both actual answers before scoring; repeat puts use one key. If the worker stops
+    // between feedback and the done marker, the same event is merged on recovery.
+    persist(flow, key, episode, lesson, "compared", Some(with), Some(without), &with_model, &without_model, expected, verdict).await?;
+    learning::record_feedback(flow, &format!("replay/{key}"), episode, &lesson.id, verdict, "held_out_replay", &format!("terminal-replay://{key}")).await?;
+    persist(flow, key, episode, lesson, "done", Some(with), Some(without), &with_model, &without_model, expected, verdict).await
 }
 
 fn arm_messages(messages: &[ChatMessage], shown: &[Shown], lesson: &KnowledgeItem, with: bool) -> Vec<ChatMessage> {
@@ -139,9 +190,9 @@ async fn persist(
     expected: &str,
     verdict: &str,
 ) -> Result<(), RpcError> {
-    let props = json!({"lesson_id": lesson.id, "state": state, "verdict": verdict,
-        "oracle": "exact observed successful command; recorded context, no execution", "expected_command": expected,
-        "lesson_text": lesson.text, "created_ms": now_ms(), "with_model": with_model, "without_model": without_model,
+    let props = json!({"state": state, "verdict": verdict,
+        "oracle": "exact observed successful command of a held-out episode; recorded context, no execution", "expected_command": expected,
+        "created_ms": now_ms(), "with_model": with_model, "without_model": without_model,
         "with_answer": with.unwrap_or(""), "without_answer": without.unwrap_or("")});
     put(
         flow,

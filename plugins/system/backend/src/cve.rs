@@ -5,7 +5,7 @@
 //!
 //! The advisory is kept in the graph (and reused for a day):
 //! `(:Advisory {key: id, aliases, title, summary, published, modified, cvss_*, cwe, epss*,
-//! epss_percentile, kev, ransomware, fetched_ms, found, checked, skipped})`, what it covers as
+//! epss_percentile, kev, ransomware, kev_added, fetched_ms, found, checked, skipped})-[:SEEN_ON]->(:Machine)`, what it covers as
 //! `(:AdvisoryCpe)-[:OF]->(:Advisory)` and `(:AdvisoryRange)-[:OF]->(:AdvisoryPackage)-[:OF]->(:Advisory)`,
 //! its references as `-[:CITES {tags}]->(:Reference {key: url})`. What it was compared with on this
 //! Mac is `(:Advisory)-[:AFFECTS {verdict*, version, fixed_in, fix}]->(:App | :Formula | :Package | :OS)`.
@@ -135,7 +135,10 @@ pub fn record(report: &CveReport, present: &std::collections::HashSet<cc_protoco
     let unit = batch.unit();
     let me = r("Advisory", report.id.clone());
     let node = unit.node("Advisory", report.id.clone());
-    node.p("kev", report.kev.is_some()).p("ransomware", report.kev.as_ref().is_some_and(|k| k.ransomware)).p("verdict_text", report.verdict_text.clone());
+    node.p("kev", report.kev.is_some())
+        .p("ransomware", report.kev.as_ref().is_some_and(|k| k.ransomware))
+        .p("kev_added", report.kev.as_ref().map_or(serde_json::Value::Null, |k| k.added.clone().into()))
+        .p("verdict_text", report.verdict_text.clone());
     let mut linked = 0;
     // One edge per thing: the matches come worst first (affected, unknown, fixed, not affected),
     // so a package affected in one project and fixed in another is affected.
@@ -203,6 +206,12 @@ impl Batch {
         let seen: graph::Batch = mac.as_ref().map(Mac::graph).unwrap_or_default();
         let present = seen.refs();
         graph::put(seen);
+        if mac.is_some() {
+            let keys = |label: &str| present.iter().filter(|r| r.label == label).map(|r| r.key.clone()).collect();
+            inventory::retire_unseen("App", &keys("App")).await;
+            inventory::retire_unseen("Formula", &keys("Formula")).await;
+            inventory::retire_gone_repos(&keys("Repo")).await;
+        }
         Ok(Batch { client, feeds, mac, present })
     }
 
@@ -354,7 +363,7 @@ async fn advisory(client: &reqwest::Client, id: &str) -> Advisory {
     let fresh = fetch(client, id).await;
     // A lookup that failed is not kept; an older copy stands in for it.
     if fresh.skipped.is_empty() {
-        keep(id, &fresh);
+        keep(id, &fresh, cached.as_ref());
         return fresh;
     }
     match cached {
@@ -366,12 +375,26 @@ async fn advisory(client: &reqwest::Client, id: &str) -> Advisory {
     }
 }
 
-/// Keep a fresh advisory: in RAM, and in the graph.
-fn keep(id: &str, advisory: &Advisory) {
+/// Keep a fresh advisory: in RAM, and in the graph, where the CPEs, packages and ranges the older
+/// copy had beyond the fresh one's are retired.
+fn keep(id: &str, advisory: &Advisory, old: Option<&Advisory>) {
     CACHE.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert_with(BTreeMap::new).insert(id.to_owned(), advisory.clone());
     if let Some(batch) = advisory_batch(id, advisory) {
         graph::put(batch);
         mark_stored(id);
+        let Some(old) = old else { return };
+        let mut gone: Vec<_> = (advisory.cpes.len()..old.cpes.len()).map(|n| r("AdvisoryCpe", format!("{id}#cpe{n}"))).collect();
+        for (n, package) in old.packages.iter().enumerate() {
+            let key = format!("{id}#pkg{n}");
+            let kept = advisory.packages.get(n).map_or(0, |p| p.ranges.len());
+            gone.extend((kept..package.ranges.len()).map(|j| r("AdvisoryRange", format!("{key}#{j}"))));
+            if n >= advisory.packages.len() {
+                gone.push(r("AdvisoryPackage", key));
+            }
+        }
+        if !gone.is_empty() {
+            graph::retire(gone, "not in the advisory any more");
+        }
     }
 }
 
@@ -413,11 +436,9 @@ fn advisory_batch(id: &str, a: &Advisory) -> Option<graph::Batch> {
     if let Some(e) = &a.epss {
         node.t("epss", e.score).p("epss_percentile", e.percentile);
     }
-    // Something must hold a fresh advisory before anything points at it: its references, else
-    // this Mac.
-    if a.references.is_empty() && a.cpes.is_empty() && a.packages.is_empty() {
-        unit.edge(me.clone(), "SEEN_ON", graph::machine()?);
-    }
+    // This Mac holds the advisory: its references, CPEs and packages are new with it, so they
+    // cannot (memory refuses a group of new nodes that reaches nothing stored).
+    unit.edge(me.clone(), "SEEN_ON", graph::machine()?);
     for (n, reference) in a.references.iter().enumerate() {
         unit.node("Reference", reference.url.clone());
         unit.edge(me.clone(), "CITES", r("Reference", reference.url.clone())).pl("tags", reference.tags.clone()).p("n", n as u64).p("fetched_ms", at);
@@ -1412,32 +1433,62 @@ fn candidates(vendor: &str, product: &str, mac: &Mac) -> Vec<Candidate> {
     found
 }
 
-/// An affected Homebrew formula whose fix Homebrew does not ship yet: no upgrade can fix it, so
-/// none is offered.
+/// An affected Homebrew formula: what installed uses it, and, when Homebrew does not ship the fix
+/// yet, the command that still closes it: removing it when nothing uses it, else building the
+/// project's newest source (`--HEAD`), which has the fix. Otherwise no command is offered.
 fn homebrew_reach(matches: &mut [CveMatch]) {
-    for m in matches.iter_mut().filter(|m| m.verdict == "affected" && m.place == "Homebrew" && !m.fixed_in.is_empty()) {
-        let Some(newest) = brew_newest(&m.what) else { continue };
-        if version_cmp(&newest, &m.fixed_in) == Some(Ordering::Less) {
-            m.why = format!("{}; Homebrew's newest {} is {newest}, so no upgrade fixes it yet", m.why, m.what);
-            m.fix = None;
+    for m in matches.iter_mut().filter(|m| m.verdict == "affected" && m.place == "Homebrew") {
+        let users = brew_users(&m.what);
+        if let Some(users) = &users {
+            m.why = match users.len() {
+                0 => format!("{}; nothing installed uses it", m.why),
+                n => format!("{}; used by {}{}", m.why, users.iter().take(6).cloned().collect::<Vec<_>>().join(", "), if n > 6 { format!(" and {} more", n - 6) } else { String::new() }),
+            };
         }
+        if m.fixed_in.is_empty() {
+            continue;
+        }
+        let Some((newest, head)) = brew_newest(&m.what) else { continue };
+        if version_cmp(&newest, &m.fixed_in) != Some(Ordering::Less) {
+            continue;
+        }
+        let name = m.what.clone();
+        m.why = format!("{}; Homebrew's newest {name} is {newest}, so an upgrade cannot fix it yet", m.why);
+        m.fix = if users.as_ref().is_some_and(Vec::is_empty) {
+            m.why.push_str("; removing it closes the flaw (undo: brew install ");
+            m.why.push_str(&name);
+            m.why.push(')');
+            Some(format!("brew uninstall {name}"))
+        } else if head {
+            m.why.push_str(&format!("; building {name} from its project's newest source (HEAD) has the fix, outside Homebrew's tested releases (undo: brew uninstall --ignore-dependencies {name} && brew install {name})"));
+            Some(format!("brew uninstall --ignore-dependencies {name} && brew install --HEAD {name}"))
+        } else {
+            None
+        };
     }
 }
 
-/// Homebrew's newest version of a formula (its local catalogue, as of the last `brew update`),
-/// remembered for an hour.
-fn brew_newest(name: &str) -> Option<String> {
-    static NEWEST: Mutex<BTreeMap<String, (u64, String)>> = Mutex::new(BTreeMap::new());
-    if let Some((at, version)) = NEWEST.lock().ok()?.get(name)
+/// The installed formulae that use a formula (`brew uses --installed`).
+fn brew_users(name: &str) -> Option<Vec<String>> {
+    let out = crate::util::run("brew", &["uses", "--installed", name], Duration::from_secs(30)).ok().filter(|out| out.ok)?;
+    Some(out.stdout.split_whitespace().map(str::to_owned).collect())
+}
+
+/// Homebrew's newest version of a formula (its local catalogue, as of the last `brew update`) and
+/// whether it can be built from the project's newest source, remembered for an hour.
+fn brew_newest(name: &str) -> Option<(String, bool)> {
+    static NEWEST: Mutex<BTreeMap<String, (u64, String, bool)>> = Mutex::new(BTreeMap::new());
+    if let Some((at, version, head)) = NEWEST.lock().ok()?.get(name)
         && at + 3_600_000 > now_ms()
     {
-        return Some(version.clone());
+        return Some((version.clone(), *head));
     }
     let out = crate::util::run("brew", &["info", "--json=v2", name], Duration::from_secs(30)).ok().filter(|out| out.ok)?;
     let info: Value = serde_json::from_str(&out.stdout).ok()?;
     let version = info.pointer("/formulae/0/versions/stable")?.as_str()?.to_owned();
-    NEWEST.lock().ok()?.insert(name.to_owned(), (now_ms(), version.clone()));
-    Some(version)
+    let head = info.pointer("/formulae/0/versions/head").is_some_and(|h| !h.is_null());
+    NEWEST.lock().ok()?.insert(name.to_owned(), (now_ms(), version.clone(), head));
+    Some((version, head))
 }
 
 /// Whether one CPE covers a version: Some(true) inside, Some(false) outside, None unknown.

@@ -1,5 +1,6 @@
 //! Metadata-only protection collectors. No collector grants itself privilege, opens a listener,
-//! or interprets model text. The native Endpoint Security producer is explicitly user-started.
+//! or interprets model text. The native Endpoint Security producer is the sensor service the
+//! person installs; its events reach the collector in this process.
 
 mod endpoint;
 mod input;
@@ -8,7 +9,8 @@ mod time;
 
 use crate::procs::Snapshot;
 use cc_protocol::contracts::system::{ProtectionConfig, ProtectionSensor, SecurityObservation};
-pub use endpoint::{deep_capture_command, deep_install_command, endpoint_capture};
+pub use endpoint::{deep_install_command, open_installer, service_installed};
+use endpoint::service_capture;
 use std::collections::HashMap;
 
 pub struct Collection {
@@ -18,7 +20,6 @@ pub struct Collection {
 
 pub struct Collector {
     packet: packet::PacketWatch,
-    endpoint: input::Tail,
     imports: HashMap<String, input::Tail>,
     dropped: u64,
 }
@@ -27,7 +28,6 @@ impl Collector {
     pub fn new() -> Self {
         Self {
             packet: packet::PacketWatch::new(),
-            endpoint: input::Tail::new(),
             imports: HashMap::new(),
             dropped: 0,
         }
@@ -36,15 +36,12 @@ impl Collector {
     /// Blocking, bounded work; the caller runs this outside the asynchronous runtime's workers.
     pub fn collect(&mut self, config: &ProtectionConfig, _snapshot: &Snapshot) -> Collection {
         let mut result = self.packet.collect(config.packet_watch);
+        service_capture(config.deep_watch);
         if config.deep_watch {
-            let path = crate::util::data_dir().join("protection-events.jsonl");
-            let (events, status) =
-                self.endpoint
-                    .read(&path, input::Kind::Endpoint, "endpoint", "Endpoint events");
+            let (events, status) = endpoint::take();
             result.observations.extend(events);
             result.sensors.push(status);
         } else {
-            self.endpoint.reset();
             result.sensors.push(ProtectionSensor {
                 id: "endpoint".into(), label: "Endpoint events".into(), state: "disabled".into(),
                 detail: "Deep monitoring is off. Enabling it does not install or start a privileged collector.".into(),

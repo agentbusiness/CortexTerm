@@ -195,13 +195,11 @@ impl Commands {
         Ok(Some(job))
     }
 
-    /// Write the job's own properties on its Run node (they are not the Run's: a later write of
-    /// the Run leaves them).
-    async fn record(&self, id: &str, props: Map<String, Value>) {
-        if let Some(store) = &self.store
-            && let Err(error) = store.put_props(id, props).await
-        {
-            tracing::warn!(%error, id, "a command job's state could not be written");
+    /// Write the job's own properties on its Run node, through the store's outbox after the Run
+    /// itself (they are not the Run's: a later write of the Run leaves them).
+    fn record(&self, id: &str, props: Map<String, Value>) {
+        if let Some(store) = &self.store {
+            store.job(id, props);
         }
     }
 
@@ -244,7 +242,7 @@ impl Commands {
             props.insert("duration_ms".into(), json!(job.duration_ms));
             props.insert("job_state".into(), json!("lost"));
             props.insert("job_text".into(), json!(job.text));
-            self.record(&id, props).await;
+            self.record(&id, props);
             let text = |i: usize| row.get(i).and_then(Value::as_str).unwrap_or("").to_owned();
             let ended = CommandEnded { id, node: text(3), session_id: text(4), job };
             (self.emit)(svc::topics::COMMAND_ENDED, serde_json::to_value(&ended).unwrap_or(Value::Null));
@@ -415,7 +413,7 @@ impl Commands {
         for (name, value) in [("caller_app", &caller.app), ("caller_node", &caller.node), ("caller_session", &caller.session_id), ("caller_by", &caller.by)] {
             props.insert(name.into(), json!(value));
         }
-        self.record(&id, props).await;
+        self.record(&id, props);
 
         let me = self.clone();
         let limit = if p.timeout_ms > 0 { Duration::from_millis(p.timeout_ms) } else if p.options.background { BACKGROUND } else { TIMEOUT };
@@ -552,7 +550,7 @@ impl Commands {
             props.insert("job_text".into(), json!(job.text));
             props.insert("tail".into(), json!(job.tail));
             props.insert("trace_line".into(), job.trace_line.clone().map_or(Value::Null, Value::String));
-            me.record(&run.id, props).await;
+            me.record(&run.id, props);
             if !caller.node.is_empty() {
                 let event = CommandEnded { id: run.id.clone(), node: caller.node.clone(), session_id: caller.session_id.clone(), job: job.clone() };
                 (me.emit)(svc::topics::COMMAND_ENDED, serde_json::to_value(&event).unwrap_or(Value::Null));
@@ -748,8 +746,18 @@ pub fn sandboxed_command(home: &Path, cwd: &Path, command: &str) -> Result<Strin
     let dir = data.join("sandbox");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let file = dir.join(format!("{:016x}.sb", hasher.finish()));
-    if !file.exists() {
+    if file.exists() {
+        // In use: its time says so, so the pruning below keeps it.
+        let _ = std::fs::File::options().append(true).open(&file).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+    } else {
         std::fs::write(&file, &profile).map_err(|e| format!("{}: {e}", file.display()))?;
+        // Profiles not used for a week go.
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let stale = entry.metadata().and_then(|meta| meta.modified()).ok().and_then(|at| at.elapsed().ok()).is_some_and(|age| age.as_secs() > 7 * 86_400);
+            if stale {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
     let mut line = vec![sandbox.exec.to_string_lossy().into_owned()];
     for (key, value) in &sandbox.params {

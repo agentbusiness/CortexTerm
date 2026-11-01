@@ -8,7 +8,7 @@
  */
 
 import { useState } from 'react';
-import { ServiceProblem, ago, definePlugin, errorMessage, setShared, useClient, useQuery } from '@cortex/sdk';
+import { Menu, ServiceProblem, ago, definePlugin, errorMessage, setShared, useClient, useQuery } from '@cortex/sdk';
 import './backup.css';
 
 /** `source.backup.*` (`protocol/src/contracts/source.rs`, `Backup`). */
@@ -65,12 +65,9 @@ function Repository({ backup, onSaved }: { backup: Backup; onSaved: () => Promis
       {picking && (
         <div className="cx-backup-pick">
           <div className="cx-backup-pickrow">
-            <label className="field cx-backup-field">
-              <select aria-label="Your repositories" value={picked} disabled={!repos.data || busy} onChange={(event) => setPicked(event.target.value)}>
-                <option value="">{repos.data ? 'Pick one of your repositories' : repos.error ? 'Your repositories could not be listed' : 'Listing your repositories…'}</option>
-                {(repos.data ?? []).map((repo) => <option key={repo.full_name} value={repo.full_name}>{repo.full_name}{repo.private ? ' (private)' : ''}</option>)}
-              </select>
-            </label>
+            <div className="field cx-backup-field">
+              <Menu label="" value={picked || (repos.data ? 'Pick one of your repositories' : repos.error ? 'Your repositories could not be listed' : 'Listing your repositories…')} disabled={!repos.data || busy} items={(repos.data ?? []).map((repo) => ({ key: repo.full_name, label: `${repo.full_name}${repo.private ? ' (private)' : ''}`, selected: repo.full_name === picked, onSelect: () => setPicked(repo.full_name) }))} />
+            </div>
             <button className="detent" type="button" data-action="use-repo" disabled={!picked || busy} onClick={() => void use(async () => picked)}>Use this one</button>
           </div>
           <div className="cx-backup-pickrow">

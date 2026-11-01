@@ -62,6 +62,8 @@ fn main() {
             eprintln!("cc-updater: cannot create {}: {error}", env.data_dir.display());
             return 1;
         }
+        // Downloads left by an install that did not finish (this process was replaced or stopped).
+        let _ = std::fs::remove_dir_all(env.data_dir.join("work"));
         let mut hello = Hello::new("cc-updater", env!("CARGO_PKG_VERSION"), "update", "update@1");
         hello.provides = PROVIDES.iter().map(|m| (*m).to_owned()).collect();
         let plugin = Arc::new(UpdaterPlugin { updater: Updater::new(env.data_dir.clone()), stop: CancellationToken::new() });

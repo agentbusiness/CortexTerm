@@ -212,7 +212,8 @@ pub fn bounded(text: &str, limit: usize) -> String {
 }
 
 /// Shrink observations in place so journal/replay lesson indices and tool-call pairs stay valid.
-/// Instructions, the current request, recalled lessons and the latest check remain intact.
+/// Instructions, the current request and the latest check remain intact; recalled memory is
+/// shortened only when nothing else is left to shrink.
 pub fn shrink(messages: &mut [ChatMessage]) -> bool {
     if let Some(current) = messages.iter().position(|message| message.role == "user" && message.content.starts_with("Current terminal context")) {
         if let Some(message) = messages[1..current].iter_mut().find(|message| {
@@ -228,6 +229,11 @@ pub fn shrink(messages: &mut [ChatMessage]) -> bool {
             message.content = bounded(&message.content, 800);
             return true;
         }
+    }
+    // Last, the longest saved memory is shortened (a shortened item no longer counts as shown).
+    if let Some(message) = messages.iter_mut().filter(|message| message.role == "user" && message.content.starts_with("Saved CortexTerm memory") && message.content.len() > 400).max_by_key(|message| message.content.len()) {
+        message.content = bounded(&message.content, 300);
+        return true;
     }
     false
 }

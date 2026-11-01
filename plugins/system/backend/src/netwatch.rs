@@ -13,7 +13,7 @@
 //! a terminal command started names that command.
 //!
 //! What it learns is kept in the graph: each program online as `(:Binary {key: path, trust, app,
-//! signed, team, flagged_online})`, the networks it talks to as `(:Binary)-[:CONNECTED
+//! signed, team, flagged_online})-[:ON]->(:Machine)`, the networks it talks to as `(:Binary)-[:CONNECTED
 //! {bytes_out*, bytes_in*, ports}]->(:Network {key: ASN, owner, country})` (bytes counted since it
 //! was first seen), its hourly upload in the stream `net.upload` (14 days) and the digest in the
 //! stream `net.digest` (a week).
@@ -376,6 +376,9 @@ struct ProcInfo {
 pub struct Watch {
     state: State,
     saved: Instant,
+    /// The day (Unix ms / DAY) the byte counts were last written: they are written once a day,
+    /// so their history is a sample a day, not one per save.
+    bytes_day: u64,
     /// (pid, proto, local port, remote, remote port) -> bytes out at the last sample.
     flows: HashMap<(u32, String, u16, IpAddr, u16), u64>,
     /// The same flows' (bytes out, bytes in) at the last sample.
@@ -397,6 +400,7 @@ impl Watch {
         Ok(Watch {
             state,
             saved: Instant::now(),
+            bytes_day: 0,
             flows: HashMap::new(),
             bytes: HashMap::new(),
             starts: HashMap::new(),
@@ -745,9 +749,19 @@ impl Watch {
         found
     }
 
-    /// Write what changed: each program's networks with the bytes so far.
+    /// Write what changed: each program's networks, with the bytes so far once a day.
     pub fn save(&mut self) {
+        // Each program hangs from this Mac; until its root node is known nothing is written (the
+        // programs stay dirty and go with a later save).
+        let Some(machine) = graph::machine() else {
+            self.saved = Instant::now();
+            tracing::info!("network watcher: this Mac's root node is not known yet; what it learnt is written later");
+            return;
+        };
         let hour = now_ms() / HOUR;
+        let day = now_ms() / DAY;
+        let bytes = day != self.bytes_day;
+        self.bytes_day = day;
         for (key, profile) in self.state.apps.iter_mut() {
             roll(profile, hour, key);
         }
@@ -755,20 +769,22 @@ impl Watch {
             self.state.unsigned_seen.clear();
         }
         let mut batch = Batch::new();
-        for (trust, profile) in self.state.apps.iter_mut().filter(|(_, p)| p.dirty && !p.exe.is_empty() && !p.nets.is_empty()) {
+        for (trust, profile) in self.state.apps.iter_mut().filter(|(_, p)| (p.dirty || bytes) && !p.exe.is_empty() && !p.nets.is_empty()) {
             profile.dirty = false;
-            batch.units.push(program_unit(trust, profile));
+            batch.units.push(program_unit(trust, profile, bytes, &machine));
         }
         graph::put(batch);
         self.saved = Instant::now();
     }
 }
 
-/// A program online, its signer and the networks it talks to.
-fn program_unit(trust: &str, profile: &Profile) -> graph::Unit {
+/// A program online (`ON` this Mac), its signer and the networks it talks to; `bytes`: with the
+/// bytes so far.
+fn program_unit(trust: &str, profile: &Profile, bytes: bool, machine: &cc_protocol::contracts::memory::GraphRef) -> graph::Unit {
     let mut unit = graph::Unit::default();
     let me = r("Binary", profile.exe.clone());
     unit.node("Binary", profile.exe.clone()).p("trust", trust).p("app", profile.name.clone()).ps("signed", &profile.signed).ps("team", &profile.team);
+    unit.edge(me.clone(), "ON", machine.clone());
     if !profile.team.is_empty() {
         unit.node("Signer", profile.team.clone());
         unit.edge(me.clone(), "SIGNED_BY", r("Signer", profile.team.clone()));
@@ -777,7 +793,11 @@ fn program_unit(trust: &str, profile: &Profile) -> graph::Unit {
         let net = r("Network", asn.to_string());
         unit.node("Network", asn.to_string()).ps("owner", &usage.owner).ps("country", &usage.country);
         let ports: Vec<u64> = usage.ports.iter().take(64).map(|p| u64::from(*p)).collect();
-        unit.edge(me.clone(), "CONNECTED", net).t("bytes_out", usage.bytes_out).t("bytes_in", usage.bytes_in).p("ports", ports);
+        let edge = unit.edge(me.clone(), "CONNECTED", net);
+        edge.p("ports", ports);
+        if bytes {
+            edge.t("bytes_out", usage.bytes_out).t("bytes_in", usage.bytes_in);
+        }
     }
     unit
 }

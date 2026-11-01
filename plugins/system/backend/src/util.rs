@@ -29,7 +29,8 @@ pub fn cortex_home() -> PathBuf {
 
 /// This plugin's data folder: `$CORTEX_PLUGIN_DATA`, else `<home>/plugins-data/cc-system` (the
 /// frame names it after the executable). Nothing is kept in it: it holds only the probe's
-/// write check, and the files earlier versions kept until `migrate` moves them into the graph.
+/// write check, the files earlier versions kept until `migrate` moves them into the graph, and
+/// off macOS (no Keychain) the reputation keys.
 pub fn data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("CORTEX_PLUGIN_DATA").filter(|v| !v.is_empty()) {
         return PathBuf::from(dir);

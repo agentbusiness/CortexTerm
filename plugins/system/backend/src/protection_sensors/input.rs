@@ -18,7 +18,6 @@ const FRESH_MS: u64 = 120_000;
 
 #[derive(Clone, Copy)]
 pub(super) enum Kind {
-    Endpoint,
     Suricata,
     Zeek,
 }
@@ -62,9 +61,7 @@ pub(super) struct Tail {
     attached_at: u64,
     last_good: u64,
     dropped: u64,
-    producer_dropped: u64,
     parser_unknown: u64,
-    stopped: bool,
     scans: HashMap<(String, String), (u64, BTreeSet<u16>, u64)>,
     sweeps: HashMap<(String, u16), (u64, BTreeSet<String>, u64)>,
 }
@@ -80,17 +77,11 @@ impl Tail {
             attached_at: 0,
             last_good: 0,
             dropped: 0,
-            producer_dropped: 0,
             parser_unknown: 0,
-            stopped: false,
             scans: HashMap::new(),
             sweeps: HashMap::new(),
         }
     }
-    pub fn reset(&mut self) {
-        *self = Self::new();
-    }
-
     pub fn read(
         &mut self,
         path: &Path,
@@ -103,7 +94,7 @@ impl Tail {
             id: id.into(),
             label: label.into(),
             state: "starting".into(),
-            dropped: self.dropped + self.producer_dropped,
+            dropped: self.dropped,
             last_at: self.last_good,
             ..Default::default()
         };
@@ -217,11 +208,9 @@ impl Tail {
             }
         }
         status.last_at = self.last_good;
-        status.dropped = self.dropped.saturating_add(self.producer_dropped);
+        status.dropped = self.dropped;
         let behind = meta.len().saturating_sub(self.offset);
-        status.state = if self.stopped {
-            "unavailable"
-        } else if self.last_good == 0 {
+        status.state = if self.last_good == 0 {
             if now.saturating_sub(self.attached_at) <= FRESH_MS {
                 "starting"
             } else {
@@ -246,13 +235,7 @@ impl Tail {
             },
             behind,
             self.parser_unknown,
-            if matches!(kind, Kind::Endpoint) && self.stopped {
-                "The native producer ended; deep capture is stopped."
-            } else if matches!(kind, Kind::Endpoint) {
-                "Native Endpoint Security sensor must remain running with its required permissions."
-            } else {
-                "Coverage is limited to traffic observed by the selected network sensor; an idle log does not prove connectivity."
-            },
+            "Coverage is limited to traffic observed by the selected network sensor; an idle log does not prove connectivity.",
             if changed {
                 " File rotated or truncated; continuity is incomplete."
             } else {
@@ -264,34 +247,6 @@ impl Tail {
 
     fn parse(&mut self, kind: Kind, value: &Value, now: u64, id: &str) -> Vec<SecurityObservation> {
         match kind {
-            Kind::Endpoint => {
-                if value["schema"] != 1 {
-                    self.parser_unknown = self.parser_unknown.saturating_add(1);
-                    return Vec::new();
-                }
-                let Some(at) = value["at"]
-                    .as_u64()
-                    .filter(|at| *at <= now + 60_000 && now.saturating_sub(*at) < FRESH_MS)
-                else {
-                    self.parser_unknown = self.parser_unknown.saturating_add(1);
-                    return Vec::new();
-                };
-                self.last_good = at;
-                self.stopped = value["record"] == "stopped";
-                self.producer_dropped = self
-                    .producer_dropped
-                    .max(value["dropped"].as_u64().unwrap_or(0));
-                if value["record"] == "heartbeat" || self.stopped {
-                    return Vec::new();
-                }
-                match endpoint_observation(&value["observation"]) {
-                    Some(event) => vec![event],
-                    None => {
-                        self.parser_unknown = self.parser_unknown.saturating_add(1);
-                        Vec::new()
-                    }
-                }
-            }
             Kind::Suricata => {
                 let Some(at) = time::timestamp(&value["timestamp"]) else {
                     self.parser_unknown += 1;
@@ -433,8 +388,8 @@ fn ip(value: &Value) -> Option<String> {
         .map(|ip| ip.to_string())
 }
 
-/// The endpoint producer and stdin sink share this strict allow-list. Raw JSON fields such as
-/// command arguments, environment, file contents and arbitrary summary text cannot pass through.
+/// The endpoint reader's strict allow-list. Raw JSON fields such as command arguments,
+/// environment, file contents and arbitrary summary text cannot pass through.
 pub(super) fn endpoint_observation(value: &Value) -> Option<SecurityObservation> {
     let at = value["at"].as_u64()?;
     let pid = value["pid"]

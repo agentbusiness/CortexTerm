@@ -10,19 +10,19 @@
 //! global `memory.knowledge.upsert` items of kind `fact` (source `inferred`, by `terminal`). Their
 //! names start with `place <path>: `, so upserting the same name again updates the fact instead
 //! of adding a twin, and `memory.knowledge.list` finds them again:
-//! - `place <path>: habits`: "In ~/dev/web-api you usually run `make dev` (12 runs, ok 92%)";
-//! - `place <path>: fix for <command>`: a command that failed, then passed within ten minutes
-//!   with another command run (successfully) in between: "In ~/dev/web-api, `cargo test` failed
-//!   3 times and then passed after `docker compose up -d db`".
+//! - `place <path>: habits`: "In ~/dev/web-api you usually run `make dev` (12 runs, ok 92%)".
+//!
+//! What fixed a failure is the terminal flow's lessons, which check the fix: the `fix for` facts
+//! this learner once wrote (whatever command ran in between) are withdrawn.
 //!
 //! `terminal.habits` returns the habits with those facts as `notes`; `terminal.places` adds the
 //! folders known from memory to those of the Run store.
 
 use crate::lock;
-use crate::store::Store;
+use crate::store::{Store, folder_chain, folder_key};
 pub use crate::store::Memory;
 use cc_protocol::contracts::memory::{KnowledgeItem, KnowledgeListResult, KnowledgeUpsertParams, methods as memory};
-use cc_protocol::contracts::terminal::{Habit, Run};
+use cc_protocol::contracts::terminal::Habit;
 use cc_protocol::{RpcError, to_value};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -36,12 +36,8 @@ const PREFIX: &str = "place ";
 const QUIET: Duration = Duration::from_secs(20);
 /// ...and at most this often.
 const EVERY: Duration = Duration::from_secs(180);
-/// A failure counts as fixed when the same command passes within this time.
-const FIX_WINDOW_MS: u64 = 10 * 60 * 1000;
 /// A habit needs this many Runs.
 const MIN_RUNS: u64 = 3;
-/// Commands that look around rather than change anything: never the fix.
-const TRIVIAL: &[&str] = &["cd", "ls", "ll", "la", "l", "pwd", "clear", "echo", "cat", "less", "more", "history", "exit", "z", "tree", "which", "type"];
 
 /// The folder and the folders above it, nearest first: for a folder below the home folder up to
 /// (not including) the home folder, else up to (not including) `/`.
@@ -70,10 +66,6 @@ fn tilde(path: &str) -> String {
 
 fn percent(share: f32) -> u32 {
     (share * 100.0).round() as u32
-}
-
-fn trivial(command: &str) -> bool {
-    command.split_whitespace().next().is_none_or(|word| TRIVIAL.contains(&word))
 }
 
 /// Programs whose first word is a subcommand (`git push`, `npm install`).
@@ -123,48 +115,6 @@ pub fn shapes(line: &str) -> Vec<String> {
         .collect()
 }
 
-/// The latest learned fix per failing command: (command, failures, fix).
-fn fixes(runs: &[Run]) -> Vec<(String, u32, String)> {
-    let mut found: HashMap<String, (u32, String)> = HashMap::new();
-    for (i, run) in runs.iter().enumerate() {
-        if run.exit_code != Some(0) {
-            continue;
-        }
-        let mut failures = 0u32;
-        let mut fix: Option<&str> = None;
-        let mut next_start = run.started;
-        for earlier in runs[..i].iter().rev() {
-            if earlier.command == run.command {
-                let failed = earlier.exit_code.is_some_and(|code| code != 0);
-                let end = earlier.ended.unwrap_or(earlier.started);
-                if !failed || next_start.saturating_sub(end) > FIX_WINDOW_MS {
-                    break;
-                }
-                failures += 1;
-                next_start = earlier.started;
-            } else if failures == 0 {
-                if run.started.saturating_sub(earlier.ended.unwrap_or(earlier.started)) > FIX_WINDOW_MS {
-                    break;
-                }
-                if fix.is_none() && earlier.exit_code == Some(0) && !trivial(&earlier.command) {
-                    fix = Some(&earlier.command);
-                }
-            } else {
-                // Another command before the failures: the streak is over.
-                break;
-            }
-        }
-        if failures > 0
-            && let Some(fix) = fix
-        {
-            found.insert(run.command.clone(), (failures, fix.to_owned()));
-        }
-    }
-    let mut fixes: Vec<(String, u32, String)> = found.into_iter().map(|(command, (n, fix))| (command, n, fix)).collect();
-    fixes.sort();
-    fixes
-}
-
 /// What to remember about `cwd`: (name, text) facts.
 pub async fn facts(store: &Store, cwd: &str) -> Result<Vec<(String, String)>, RpcError> {
     let place = tilde(cwd);
@@ -177,13 +127,6 @@ pub async fn facts(store: &Store, cwd: &str) -> Result<Vec<(String, String)>, Rp
             .collect::<Vec<_>>()
             .join(", ");
         facts.push((format!("{PREFIX}{cwd}: habits"), format!("In {place} you usually run {list}")));
-    }
-    for (command, failures, fix) in fixes(&store.folder_runs(cwd, 500).await?) {
-        let times = if failures == 1 { "once".to_owned() } else { format!("{failures} times") };
-        facts.push((
-            format!("{PREFIX}{cwd}: fix for {command}"),
-            format!("In {place}, `{command}` failed {times} and then passed after `{fix}`"),
-        ));
     }
     Ok(facts)
 }
@@ -246,6 +189,12 @@ impl Learner {
     /// Write what the Runs say about `cwd` into memory now.
     pub async fn learn(&self, cwd: &str) -> Result<usize, RpcError> {
         let facts = facts(&self.store, cwd).await?;
+        // `fix for` facts named whatever command ran in between; they are no longer kept.
+        for item in self.learned().await? {
+            if item.by == "terminal" && fact_place(&item) == Some(cwd) && item.name.contains(": fix for ") {
+                (self.memory)(memory::KNOWLEDGE_WITHDRAW, json!({ "id": item.id, "reason": "A command run in between is not proof of a fix", "by": "terminal" })).await?;
+            }
+        }
         let mut written = 0;
         for (name, text) in facts {
             if lock(&self.written).get(&name) == Some(&text) {
@@ -262,12 +211,15 @@ impl Learner {
             };
             let item = (self.memory)(memory::KNOWLEDGE_UPSERT, to_value(&params)?).await?;
             // The habit is about its folder: the edge the model follows from a place to what was learned there.
-            if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                let edge = json!({
-                    "nodes": [{"label": "Folder", "key": cwd}],
-                    "edges": [{"from": {"label": "Knowledge", "key": id}, "rel": "ABOUT", "to": {"label": "Folder", "key": cwd}}],
-                });
-                if let Err(error) = (self.memory)(memory::GRAPH_PUT, edge).await {
+            // The Folder is the terminal's own node for that place, with its chain of IN edges.
+            if let Some(id) = item.get("id").and_then(|v| v.as_str())
+                && let Some(folder) = folder_key(cwd)
+            {
+                let chain = folder_chain(&folder);
+                let mut edges = vec![json!({"from": {"label": "Knowledge", "key": id}, "rel": "ABOUT", "to": {"label": "Folder", "key": folder}})];
+                edges.extend(chain.windows(2).map(|w| json!({"from": {"label": "Folder", "key": w[0]}, "rel": "IN", "to": {"label": "Folder", "key": w[1]}})));
+                let nodes: Vec<_> = chain.iter().map(|key| json!({"label": "Folder", "key": key})).collect();
+                if let Err(error) = (self.memory)(memory::GRAPH_PUT, json!({"nodes": nodes, "edges": edges})).await {
                     tracing::info!("habit {name}: cannot link it to {cwd}: {}", error.message);
                 }
             }

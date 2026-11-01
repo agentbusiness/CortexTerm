@@ -11,6 +11,7 @@ mod flow;
 mod config;
 mod routing;
 mod learning;
+mod recall;
 mod replay;
 mod security;
 

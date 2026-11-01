@@ -7,12 +7,14 @@
 //!   fullscreen, usual_ms})` `-[:IN_SHELL]->(:Shell)`, `-[:IN]->(:Folder {key: path})` (with the
 //!   folder's chain `(:Folder)-[:IN]->(:Folder)` up to the home folder, or `/`), `-[:RAN]->(:Program
 //!   {key: name, path})` for each program the line runs, `-[:FOLLOWS]->(:CommandRun)` the previous
-//!   Run in the same shell; `(:Repo {key: root, remote})-[:AT]->(:Folder)` when the folder is in a
-//!   git repository. (`ended_ms` is the memory plugin's own, for retired nodes: a Run's end is
-//!   `finished_ms`.)
-//! - **Streams**: `shell.<term_id>`, every Run's `started` and `finished` events in order (the
-//!   shell's command history; the record is the Run with `event`); `run.<id>.output`, the Run's
-//!   output lines (30 days), one record per line `{at, level, text, ansi?}`: line `n` is offset `n`.
+//!   Run in the same shell, `-[:MOVED_TO]->(:Folder)` where it took the shell (`cd`),
+//!   `-[:REACHED]->(:SshHost {key: host})` the machine an `ssh`, `scp`, `sftp`, `rsync` or `mosh`
+//!   went to; `branch`, the git branch it ran on; `(:Repo {key: root, remote})-[:AT]->(:Folder)`
+//!   when the folder is in a git repository. A closed shell is retired (`ended_ms` is the memory
+//!   plugin's own, for retired nodes: a Run's end is `finished_ms`).
+//! - **Streams**: `shell.<term_id>`, every Run's `started` and `finished` events in order (30
+//!   days: the Run nodes are the history); `run.<id>.output`, the Run's output lines (30 days),
+//!   one record per line `{at, level, text, ansi?}`: line `n` is offset `n`.
 //!
 //! Writes never wait: Runs, events and lines go into an in-process outbox that a writer task sends
 //! every 200 ms (sooner when many lines wait), each Run with its edges in one `memory.graph.put`.
@@ -47,9 +49,9 @@ const FLUSH_LINES: usize = 2000;
 /// While the memory plugin is away, output lines wait up to this much text; later lines are
 /// counted and dropped (Runs and their events always wait).
 const MAX_WAITING_BYTES: usize = 64 * 1024 * 1024;
-/// A Run's output is kept this long; a shell's history for good (ten years).
+/// A Run's output and its shell's events are kept this long (the Run nodes keep the history).
 const OUTPUT_DAYS: u32 = 30;
-const SHELL_DAYS: u32 = 3650;
+const SHELL_DAYS: u32 = 30;
 /// Nodes and edges per `memory.graph.put` (the plugin takes 5000).
 const PUT_MAX: usize = 4000;
 /// Records per stream call and rows per query page (the plugin's maximum).
@@ -278,12 +280,19 @@ struct Outbox {
     runs: HashMap<String, PendingRun>,
     /// Shell events, in order: (topic, record).
     events: Vec<(String, Value)>,
+    /// A command job's properties per Run id, sent after the Runs (so the node and its edges are
+    /// stored first).
+    props: HashMap<String, Map<String, Value>>,
     /// Output lines per Run id, in order.
     lines: HashMap<String, Vec<Line>>,
     waiting_lines: usize,
     waiting_bytes: usize,
     dropped: u64,
     shells: HashMap<String, ShellInfo>,
+    /// Runs that moved their shell to another folder: (run id, folder).
+    moves: Vec<(String, String)>,
+    /// Shells that closed.
+    closed: Vec<String>,
     /// The last Run started in each shell (this process).
     last_in_shell: HashMap<String, String>,
     seq: u64,
@@ -455,6 +464,27 @@ impl Store {
         }
     }
 
+    /// A Run moved its shell to `folder` (`cd`).
+    pub fn moved(&self, run_id: &str, folder: &str) {
+        if let Some(folder) = folder_key(folder) {
+            crate::lock(&self.outbox).moves.push((run_id.to_owned(), folder));
+            self.wake.notify_one();
+        }
+    }
+
+    /// A shell closed: its node is retired.
+    pub fn shell_ended(&self, term_id: &str) {
+        crate::lock(&self.outbox).closed.push(term_id.to_owned());
+        self.wake.notify_one();
+    }
+
+    /// Properties of a Run that are not the Run's own (a command job's state); a later write of
+    /// the Run leaves them.
+    pub fn job(&self, run_id: &str, props: Map<String, Value>) {
+        crate::lock(&self.outbox).props.entry(run_id.to_owned()).or_default().extend(props);
+        self.wake.notify_one();
+    }
+
     /// Output lines of a Run, in order.
     pub fn lines(&self, run_id: &str, lines: Vec<Line>) {
         if lines.is_empty() || !valid_id(run_id) {
@@ -534,6 +564,8 @@ impl Store {
     /// leaves everything waiting (the error is returned).
     async fn flush(&self, written: &mut Written) -> Result<(), RpcError> {
         self.flush_runs(written).await?;
+        self.flush_moves(written).await?;
+        self.flush_props().await?;
         self.flush_events().await?;
         self.flush_lines().await
     }
@@ -668,6 +700,13 @@ impl Store {
             }
         }
         if extras {
+            if let Some(branch) = crate::marks::git_branch(Path::new(&run.cwd)) {
+                batch.nodes[0].props.insert("branch".into(), json!(branch));
+            }
+            for host in ssh_hosts(&run.command) {
+                batch.nodes.push(node("SshHost", &host, Map::new()));
+                batch.edges.push(edge(me, "REACHED", ("SshHost", &host)));
+            }
             for (name, found) in written.programs_of(&run.command, &run.cwd, path) {
                 if !written.programs.contains(&name) && !batch.programs.contains(&name) {
                     let mut props = Map::new();
@@ -686,10 +725,67 @@ impl Store {
         batch
     }
 
-    /// Properties of a Run that are not the Run's own (a command job's state), written at once.
-    pub(crate) async fn put_props(&self, id: &str, props: Map<String, Value>) -> Result<(), RpcError> {
-        let batch = Batch { nodes: vec![node("CommandRun", id, props)], ..Batch::default() };
-        self.put(&batch).await
+    /// Where Runs took their shells, then the shells that closed (after their Runs).
+    async fn flush_moves(&self, written: &mut Written) -> Result<(), RpcError> {
+        let moves = std::mem::take(&mut crate::lock(&self.outbox).moves);
+        let mut batch = Batch::default();
+        for (run_id, folder) in &moves {
+            batch.folders(written, folder);
+            batch.edges.push(edge(("CommandRun", run_id), "MOVED_TO", ("Folder", folder)));
+        }
+        match self.put(&batch).await {
+            Ok(()) => written.note(&batch),
+            Err(error) if retryable(&error) => {
+                crate::lock(&self.outbox).moves.splice(0..0, moves);
+                return Err(error);
+            }
+            Err(error) => tracing::debug!("run store: where {} Runs moved their shells was refused: {}", moves.len(), error.message),
+        }
+        let closed = std::mem::take(&mut crate::lock(&self.outbox).closed);
+        if closed.is_empty() {
+            return Ok(());
+        }
+        let refs: Vec<GraphRef> = closed.iter().map(|term| GraphRef { label: "Shell".into(), key: term.clone() }).collect();
+        match self.call::<Value>(memory::GRAPH_RETIRE, json!({"refs": refs, "reason": "closed"})).await {
+            Ok(_) => Ok(()),
+            Err(error) if retryable(&error) => {
+                crate::lock(&self.outbox).closed.splice(0..0, closed);
+                Err(error)
+            }
+            Err(error) => {
+                tracing::debug!("run store: closed shells were not retired: {}", error.message);
+                Ok(())
+            }
+        }
+    }
+
+    async fn flush_props(&self) -> Result<(), RpcError> {
+        let props = std::mem::take(&mut crate::lock(&self.outbox).props);
+        let mut left = HashMap::new();
+        let mut failure = None;
+        for (id, props) in props {
+            if failure.is_some() {
+                left.insert(id, props);
+                continue;
+            }
+            let batch = Batch { nodes: vec![node("CommandRun", &id, props.clone())], ..Batch::default() };
+            match self.put(&batch).await {
+                Ok(()) => {}
+                Err(error) if retryable(&error) => {
+                    left.insert(id, props);
+                    failure = Some(error);
+                }
+                Err(error) => tracing::warn!(%id, "run store: a command job's state was refused: {}", error.message),
+            }
+        }
+        if !left.is_empty() {
+            let mut outbox = crate::lock(&self.outbox);
+            for (id, mut newer) in std::mem::take(&mut outbox.props) {
+                left.entry(id).or_insert_with(Map::new).append(&mut newer);
+            }
+            outbox.props = left;
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     pub(crate) async fn put(&self, batch: &Batch) -> Result<(), RpcError> {
@@ -1019,22 +1115,6 @@ impl Store {
             .collect())
     }
 
-    /// The last finished Runs in `cwd`, oldest first.
-    pub async fn folder_runs(&self, cwd: &str, limit: u32) -> Result<Vec<Run>, RpcError> {
-        let rows = self
-            .query(
-                &format!(
-                    "MATCH (r:CommandRun)-[:IN]->(f:Folder {{key: $cwd}}) WHERE r.command <> '' AND r.finished_ms IS NOT NULL \
-                     OPTIONAL MATCH (r)-[:IN_SHELL]->(s:Shell) RETURN {RUN_COLUMNS} ORDER BY r.started_ms DESC LIMIT $limit"
-                ),
-                json!({"cwd": cwd, "limit": limit.min(PAGE)}),
-            )
-            .await?;
-        let mut runs: Vec<Run> = rows.iter().map(|row| row_run(row)).collect();
-        runs.reverse();
-        Ok(runs)
-    }
-
     /// The offset after a Run's last stored line (its line count).
     pub async fn stored_lines(&self, run_id: &str) -> Result<u64, RpcError> {
         let topic = output_topic(run_id);
@@ -1261,6 +1341,52 @@ impl Written {
         }
         out
     }
+}
+
+/// The machines a command line connects to with `ssh`, `mosh`, `scp`, `sftp` or `rsync`: the
+/// host as typed (an alias from `~/.ssh/config` stays the alias), without the user or a port.
+pub fn ssh_hosts(command: &str) -> Vec<String> {
+    // ssh options that take a value.
+    const VALUED: &str = "BbcDEeFIiJLlmOoPpQRSWw";
+    let Ok(cmds) = crate::assess::parse(command) else { return Vec::new() };
+    let mut hosts: Vec<String> = Vec::new();
+    for cmd in &cmds {
+        let words: Vec<&crate::assess::Word> = cmd.words.iter().skip_while(|w| w.text.contains('=') && !w.text.starts_with('-')).collect();
+        let Some(program) = words.first().map(|w| w.text.rsplit('/').next().unwrap_or(&w.text)) else { continue };
+        let found: Option<String> = match program {
+            // The first word that is not an option or an option's value.
+            "ssh" | "mosh" | "sftp" => {
+                let mut skip = false;
+                words[1..]
+                    .iter()
+                    .find(|w| {
+                        if std::mem::take(&mut skip) {
+                            return false;
+                        }
+                        if let Some(flags) = w.text.strip_prefix('-') {
+                            skip = program != "mosh" && flags.len() == 1 && VALUED.contains(flags);
+                            return false;
+                        }
+                        true
+                    })
+                    .map(|w| w.text.trim_start_matches("ssh://").to_owned())
+            }
+            // `[user@]host:path`
+            "scp" | "rsync" => words[1..].iter().find_map(|w| {
+                let (host, _) = w.text.split_once(':')?;
+                (!w.text.starts_with('-') && !host.is_empty() && !host.contains('/')).then(|| host.to_owned())
+            }),
+            _ => None,
+        };
+        let Some(found) = found else { continue };
+        let host = found.rsplit('@').next().unwrap_or(&found);
+        let host = host.split([':', '/']).next().unwrap_or(host).trim_matches(['[', ']']);
+        let ok = !host.is_empty() && host.len() <= 253 && host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+        if ok && !hosts.iter().any(|h| h == host) {
+            hosts.push(host.to_owned());
+        }
+    }
+    hosts
 }
 
 /// The repository's `origin` (or first) remote, without credentials.

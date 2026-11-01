@@ -1,9 +1,9 @@
 //! Persistence: a snapshot of everything that starts by itself (KnockKnock's list: launch items,
 //! login items inside apps, cron, periodic and at jobs, emond, shell startup files, SSH's
 //! authorized keys, git's hooks path, the npm registry, editor tasks that run on folder open,
-//! authorization plugins, startup items), kept in the graph as `(:StartItem {key, what,
-//! fingerprint*, target, source: baseline})-[:ON]->(:Machine)`, `-[:STARTS]->(:Binary)` for what it
-//! starts; an item that went is retired. The first sweep records it; later sweeps report what was
+//! authorization plugins, startup items), kept in the graph as `(:StartItem {key, label,
+//! fingerprint*, program, source: baseline})-[:ON]->(:Machine)`, `-[:STARTS]->(:Binary)` for what
+//! it starts (as the login-items database's items in `deep`); an item that went is retired. The first sweep records it; later sweeps report what was
 //! added or changed, and each change goes to the stream `persistence.changes`, kept a month (the
 //! incident timeline reads them). Loaded once at start and kept in RAM.
 //!
@@ -65,14 +65,16 @@ fn lock_baseline() -> std::sync::MutexGuard<'static, Option<Baseline>> {
 /// The baseline and the month of changes, from the graph (at start).
 pub async fn load() -> Result<usize, String> {
     let rows = graph::query_all(
-        "MATCH (s:StartItem) WHERE s.source = 'baseline' AND (s.state IS NULL OR s.state <> 'gone') RETURN s.key, s.what, s.fingerprint, s.target, s.last_ms ORDER BY s.key",
+        "MATCH (s:StartItem) WHERE s.source = 'baseline' AND (s.state IS NULL OR s.state <> 'gone') RETURN s.key, s.label, s.fingerprint, s.program, s.last_ms, s.what, s.target ORDER BY s.key",
         json!({}),
     )
     .await?;
     let mut baseline = Baseline::default();
     for row in &rows {
         baseline.at = baseline.at.max(graph::number(&row[4]));
-        baseline.items.insert(graph::text(&row[0]), Item { what: graph::text(&row[1]), value: graph::text(&row[2]), target: graph::text(&row[3]) });
+        // `what` and `target` are the names before 0.1.21.
+        let either = |new: &serde_json::Value, old: &serde_json::Value| if new.is_null() { graph::text(old) } else { graph::text(new) };
+        baseline.items.insert(graph::text(&row[0]), Item { what: either(&row[1], &row[5]), value: graph::text(&row[2]), target: either(&row[3], &row[6]) });
     }
     for entry in graph::stream_read(CHANGES, now_ms().saturating_sub(30 * DAY_MS)).await? {
         if let Ok(change) = serde_json::from_value::<Change>(entry.value) {
@@ -92,7 +94,14 @@ pub fn changes() -> Vec<Change> {
 /// An item as its graph unit.
 pub fn item_unit(key: &str, item: &Item, machine: &cc_protocol::contracts::memory::GraphRef) -> graph::Unit {
     let mut unit = graph::Unit::default();
-    unit.node("StartItem", key).p("what", item.what.clone()).p("target", item.target.clone()).p("source", "baseline").t("fingerprint", item.value.clone());
+    // `what` and `target` are removed: the names before 0.1.21.
+    unit.node("StartItem", key)
+        .p("label", item.what.clone())
+        .p("program", item.target.clone())
+        .p("source", "baseline")
+        .t("fingerprint", item.value.clone())
+        .p("what", serde_json::Value::Null)
+        .p("target", serde_json::Value::Null);
     unit.edge(r("StartItem", key), "ON", machine.clone());
     if item.target.starts_with('/') {
         unit.node("Binary", item.target.clone());

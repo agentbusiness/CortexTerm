@@ -10,11 +10,12 @@
 .ct-protection summary{cursor:pointer;line-height:1.5;}
 .ct-protection summary:hover{color:var(--ink);}
 .ct-protection-setup{padding:8px 0;color:var(--ink-2);font:14px/1.5 "Source Serif 4",Georgia,serif;}
-.ct-protection-command{white-space:pre-wrap;overflow-wrap:anywhere;margin:8px 0;padding:10px;border:1px solid var(--rule-2);color:var(--ink);font:12px/1.6 var(--font-mono);user-select:text;}
 .ct-protection-import{display:flex;align-items:flex-end;flex-wrap:wrap;gap:10px;margin:10px 0;}
-.ct-protection-import label{display:flex;flex-direction:column;gap:5px;min-width:0;flex:1 1 220px;}
-.ct-protection-import label:first-child{flex:0 1 220px;}
-.ct-protection-import input,.ct-protection-import select{width:100%;min-width:0;box-sizing:border-box;background:var(--ground);border:1px solid var(--rule-2);border-radius:0;color:var(--ink);font:12px/1.5 var(--font-mono);padding:6px 8px;caret-color:var(--rubric-lift);}
+.ct-protection-import :is(label,.ct-protection-field){display:flex;flex-direction:column;gap:5px;min-width:0;flex:1 1 220px;}
+.ct-protection-field{flex:0 1 220px !important;}
+.ct-protection-import input{width:100%;min-width:0;height:28px;box-sizing:border-box;background:var(--ground);border:1px solid var(--rule-2);border-radius:0;color:var(--ink);font:12px var(--font-mono);padding:0 8px;caret-color:var(--rubric-lift);}
+.ct-protection-import :is(.pick,.detent),.ct-sec-keys :is(input,.detent){height:28px;box-sizing:border-box;}
+.ct-protection-import .pick{width:100%;justify-content:space-between;}
 .ct-protection-import input::placeholder{color:var(--ink-2);}
 .ct-protection-imports{list-style:none;margin:0;padding:0;}
 .ct-protection-imports li{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 0;border-top:1px solid var(--rule);}
@@ -165,8 +166,8 @@
   .ct-sec-row .ct-sec-hits,.ct-sec-row-side{display:none;}
   .ct-protection-facts{grid-template-columns:minmax(0,1fr);gap:1px;}
   .ct-protection-facts dd{margin-bottom:5px;}
-  .ct-protection-import label:first-child{flex-basis:100%;}
-  .ct-protection-import input,.ct-protection-import select{font-size:16px;}
+  .ct-protection-field{flex-basis:100% !important;}
+  .ct-protection-import input{font-size:16px;}
   .ct-protection-sensor-head{flex-wrap:wrap;gap:4px 10px;}
   .ct-protection-exceptions>ul>li{flex-wrap:wrap;}
 }

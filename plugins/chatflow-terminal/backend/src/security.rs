@@ -237,6 +237,8 @@ pub struct Evidence {
     pub fix: Option<String>,
     /// The ATT&CK and other ids the notes give, which an answer may cite too.
     pub notes: Vec<(String, String)>,
+    /// An answer the facts already settle (a CVE alert): shown as it is, the model is not asked.
+    pub answer: Option<String>,
 }
 
 impl Evidence {

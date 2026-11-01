@@ -15,7 +15,7 @@ use cc_protocol::contracts::skills::{self, Description, SkillInfo, SkillResult};
 use cc_protocol::{Ctx, PluginEnv, RpcError, codes, parse_params};
 use crate::security::{self, Evidence, Subject};
 use crate::learning::{self, Learner};
-use crate::{config, routing};
+use crate::{config, recall, routing};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -36,6 +36,8 @@ const COMMAND_STEP: &str = "command_step";
 const MAX_CHECKS: usize = 8;
 const MAX_TOOL_TURNS: usize = 16;
 const MAX_CONFIG_CALLS: usize = 3;
+/// Memory lookups (`recall`) one turn may make.
+const MAX_RECALLS: usize = 4;
 /// Keep the small-model working window bounded even when a borrowed model advertises more.
 const CONTEXT_TOKENS: u64 = 8192;
 /// A check that runs longer is stopped.
@@ -89,6 +91,8 @@ struct Followup {
     turn_id: String,
     question: String,
     command_id: Option<String>,
+    /// The commands already run for this request, in order, with their exit.
+    tried: Vec<String>,
 }
 
 #[derive(Default)]
@@ -96,6 +100,8 @@ struct Turns {
     active: HashMap<String, Active>,
     latest: HashMap<String, String>,
     waiting: HashMap<String, Followup>,
+    /// Per session: the commands already run for the request a continuation is about.
+    tried: HashMap<String, Vec<String>>,
     /// Finished Runs already followed up, including proposals handled by terminal_event.
     handled_runs: VecDeque<String>,
     background: Option<CancellationToken>,
@@ -347,9 +353,15 @@ impl Flow {
                 Some(security::Subject::Finding(text)) if run.exit_code == Some(0) => flow.recheck(&text, &run.command).await,
                 _ => None,
             };
+            let mut tried = pending.tried;
+            tried.push(format!("`{}` ({outcome})", run.command.trim()));
+            let earlier = if tried.len() > 1 { format!("Already run for this request: {}. Do not offer any of them again; if nothing else can help, say so.\n\n", tried.join(", ")) } else { String::new() };
+            if let Ok(mut turns) = flow.turns.lock() {
+                turns.tried.insert(pending.session.clone(), tried);
+            }
             let input = TurnInput {
                 session_id: pending.session,
-                text: format!("I ran `{}` ({outcome}). My original request: {}\n\n{}Read this Run's recorded output, explain the result, and continue the discussion. Use inline code for quoted output. Only put a NEW command for me to run in a ```sh block; do not suggest the completed command again.", run.command, pending.question, recheck.map(|line| format!("{line}\n\n")).unwrap_or_default()),
+                text: format!("I ran `{}` ({outcome}). My original request: {}\n\n{}{earlier}Read this Run's recorded output, explain the result, and continue the discussion. Use inline code for quoted output. Only put a NEW command for me to run in a ```sh block; do not suggest the completed command again.", run.command, pending.question, recheck.map(|line| format!("{line}\n\n")).unwrap_or_default()),
                 intent: if run.exit_code.is_some_and(|code| code != 0) { "fix" } else { "ask" }.into(),
                 term_id: Some(run.term_id),
                 run_id: Some(run.id),
@@ -480,11 +492,12 @@ impl Flow {
         let mut step = 0;
         let mut lookups = 0;
         let mut config_calls = 0;
+        let mut recalls = 0;
         let mut rounds = 0;
         let mut seen: HashMap<String, String> = HashMap::new();
         let wants_command = intent == "fix" || (input.continuing.is_none() && asks_for_command(&input.text));
         let services = self.services(&selection_query).await;
-        let mut tools = vec![run_tool()];
+        let mut tools = vec![run_tool(), recall::tool()];
         if !skills.is_empty() {
             tools.push(skill_tool());
         }
@@ -502,6 +515,7 @@ impl Flow {
                 match tool.name.as_str() {
                     "skill" => lookups < routing::MAX_LOOKUPS,
                     "config" => config_calls < MAX_CONFIG_CALLS,
+                    "recall" => recalls < MAX_RECALLS,
                     _ => step < MAX_CHECKS,
                 }
             }).cloned().collect();
@@ -604,6 +618,18 @@ impl Flow {
                     if (name.starts_with("config-") || name.contains("/config-") || routing::configuration_request(args["query"].as_str().unwrap_or(""), &choices, &skills)) && !tools.iter().any(|tool| tool.name == "config") {
                         tools.push(config::tool());
                     }
+                    let mut reply = ChatMessage::new("tool", format!("{result}\n\n(Their message: \"{}\")", input.text.trim()));
+                    reply.tool_call_id = Some(call.id.clone());
+                    reply.name = Some(call.name.clone());
+                    messages.push(reply);
+                    continue;
+                }
+                if call.name == "recall" {
+                    self.phase(session, seq, "reading what CortexTerm remembers").await;
+                    recalls += 1;
+                    let result = security::guard(&recall::call(self, &call.arguments, cwd.as_deref().unwrap_or(""), &self.env.home.to_string_lossy()).await);
+                    let _ = self.journal(session, COMMAND_STEP, json!({"command": format!("recall {}", call.arguments), "tool": "recall", "running": false, "output": result, "run_id": run_id})).await;
+                    guarded = guarded.or_else(|| security::guarded_reasons(&result));
                     let mut reply = ChatMessage::new("tool", format!("{result}\n\n(Their message: \"{}\")", input.text.trim()));
                     reply.tool_call_id = Some(call.id.clone());
                     reply.name = Some(call.name.clone());
@@ -749,6 +775,14 @@ impl Flow {
     async fn explain_security(&self, input: &TurnInput, subject: Subject, run_id: &str, cancel: &CancellationToken) -> Result<(), RpcError> {
         let session = &input.session_id;
         let evidence = self.security_evidence(input, &subject).await;
+        if let Some(answer) = &evidence.answer {
+            let seq = self.journal(session, kinds::ASSISTANT_MESSAGE, json!({"text": answer, "streaming": false, "run_id": run_id})).await?;
+            if let Some(fix) = &evidence.fix {
+                self.propose(input, session, seq, run_id, answer, fix.clone()).await?;
+            }
+            self.journal(session, kinds::STATUS, json!({"state": "done", "run_id": run_id})).await?;
+            return Ok(());
+        }
         // The evidence last, right before the answer: the nearest strong cue wins.
         let user = format!("{}\n\nEvidence:\n{}\n\nFill the form from this evidence only.", input.text.trim(), security::guard(&evidence.text()));
         let (cwd, mut recalled) = self.recall_memory(input, "explain").await;
@@ -976,11 +1010,22 @@ impl Flow {
             Some(term_id) => self.fact("terminal.assess", json!({"term_id": term_id, "input": command})).await,
             None => None,
         };
+        let tried = match self.turns.lock() {
+            Ok(turns) if input.continuing.is_some() => turns.tried.get(session).cloned().unwrap_or_default(),
+            Ok(mut turns) => { turns.tried.remove(session); Vec::new() }
+            Err(_) => Vec::new(),
+        };
+        // A loop: the command that just ran, offered again.
+        if tried.last().is_some_and(|last| last.starts_with(&format!("`{}` (", command.trim()))) {
+            let shown = format!("{text}\n\n`{}` just ran; it is not offered again.", command.trim());
+            self.set(session, seq, "text", json!(shown)).await?;
+            return Ok(());
+        }
         if let Some(term_id) = &input.term_id
             && let Ok(mut turns) = self.turns.lock()
             && turns.latest.get(session).is_some_and(|latest| latest == run_id)
         {
-            turns.waiting.insert(term_id.clone(), Followup { session: session.into(), turn_id: run_id.into(), question: input.continuing.clone().unwrap_or_else(|| input.text.clone()), command_id: None });
+            turns.waiting.insert(term_id.clone(), Followup { session: session.into(), turn_id: run_id.into(), question: input.continuing.clone().unwrap_or_else(|| input.text.clone()), command_id: None, tried });
         }
         self.journal(session, COMMAND_PROPOSAL, json!({"command": command, "assessment": assessment, "run_id": run_id, "term_id": input.term_id})).await?;
         Ok(())
@@ -1406,28 +1451,33 @@ impl Flow {
         }
     }
 
-    /// A CVE alert: what on this Mac is affected and what fixes each copy, from the system plugin's
-    /// check. A copy nothing can fix yet gets no command, and the model is told not to invent one.
+    /// A CVE alert: what on this Mac is affected, what uses it and what closes it, as the CVE watch
+    /// last recorded it in the graph (a read, never a fresh check). The facts settle the answer, so
+    /// it is written here; the model is not asked.
     async fn cve_evidence(&self, text: &str, evidence: &mut Evidence) {
         let Some(id) = text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')).find(|w| w.starts_with("CVE-")) else { return };
-        let Some(ctx) = self.ctx.get() else { return };
-        let Ok(Ok(report)) = tokio::time::timeout(Duration::from_secs(60), ctx.call("system.cve", json!({"id": id}))).await else {
-            evidence.lines.push(format!("{id} could not be checked again just now."));
-            return;
-        };
-        let mut fixable = false;
-        for m in report["matches"].as_array().into_iter().flatten().filter(|m| m["verdict"] == "affected").take(4) {
-            let fix = m["fix"].as_str().unwrap_or("");
-            evidence.lines.push(format!("Affected copy: {} {} ({}): {}. {}", m["what"].as_str().unwrap_or("?"), m["version"].as_str().unwrap_or(""), m["place"].as_str().unwrap_or(""),
-                m["why"].as_str().unwrap_or(""), if fix.is_empty() { "No command fixes this copy yet.".to_owned() } else { format!("What fixes it: {fix}") }));
+        let cypher = "MATCH (a:Advisory {key: $id})-[e:AFFECTS]->(t) WHERE e.verdict = 'affected' RETURN t.key, e.version, e.place, e.why, e.fix LIMIT 4";
+        let Some(found) = self.fact(crate::learning::GRAPH_QUERY, json!({"cypher": cypher, "params": {"id": id}, "limit": 4})).await else { return };
+        let mut copies = Vec::new();
+        for row in found["rows"].as_array().into_iter().flatten().filter_map(Value::as_array) {
+            let cell = |i: usize| row.get(i).and_then(Value::as_str).unwrap_or("").to_owned();
+            let fix = cell(4);
+            copies.push(format!("- **{} {}** ({}): {}.", cell(0), cell(1), cell(2), cell(3)));
             if !fix.is_empty() && !fix.starts_with("Update ") && evidence.fix.is_none() {
-                evidence.fix = Some(fix.to_owned());
-                fixable = true;
+                evidence.fix = Some(fix);
+            } else if fix.starts_with("Update ") {
+                copies.push(format!("  {fix}."));
             }
         }
-        if !fixable {
-            evidence.lines.push("No command can fix this yet. Say so, and say what to wait for. Do not offer brew update, brew upgrade or any other command.".into());
+        if copies.is_empty() {
+            return;
         }
+        let todo = if evidence.fix.is_some() {
+            "Run the command below. The alert closes by itself once the CVE watch (every 3 hours) finds the fix installed."
+        } else {
+            "Nothing on this Mac can install the fix yet. The CVE watch checks every 3 hours and offers a command as soon as one fixes it; the alert closes by itself once it is fixed."
+        };
+        evidence.answer = Some(format!("**{id} on this Mac:**\n{}\n\n**What to do:** {todo}", copies.join("\n")));
     }
 
     /// One read through the frame, best effort: a plugin that is missing or slow leaves its fact out.

@@ -571,11 +571,17 @@ impl Memory {
     /// Open the database and create the main project (with its settings root and this Mac's root
     /// node) on first start.
     pub async fn ensure_main(&self) -> Result<(), RpcError> {
-        self.settings().await?;
+        // The Machine first: the settings root hangs off it.
         self.graph_store().await?;
+        self.settings().await?;
         // Projects put before their folders were linked.
         for project in self.app().await?.projects().await? {
             self.project_folder(&project).await;
+        }
+        match self.streams().await?.drop_expired().await {
+            Ok(0) => {}
+            Ok(dropped) => tracing::info!(dropped, "dropped the streams whose records all expired"),
+            Err(error) => tracing::warn!(error = %error.message, "the expired streams were not dropped"),
         }
         Ok(())
     }
@@ -1570,7 +1576,7 @@ impl Memory {
             methods::KNOWLEDGE_SEARCH => {
                 let p: KnowledgeSearchParams = parse_params(params)?;
                 let store = self.scoped_store(p.project_id.as_deref(), false, "knowledge").await?;
-                to_value(&store.knowledge_search(&p.text, p.kind.as_deref(), p.limit).await?)
+                to_value(&store.knowledge_search(&p.text, p.kind.as_deref(), p.limit, p.include_history).await?)
             }
             methods::KNOWLEDGE_LINK | methods::KNOWLEDGE_UNLINK => {
                 let p: KnowledgeLinkParams = parse_params(params)?;

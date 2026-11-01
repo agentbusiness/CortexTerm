@@ -189,6 +189,7 @@ pub async fn run() -> Moved {
                 unit.node("Signer", team);
                 unit.edge(me.clone(), "SIGNED_BY", r("Signer", team));
             }
+            unit.edge(me.clone(), "ON", machine.clone());
             let ports: Vec<u64> = profile.ports.iter().map(|p| u64::from(*p)).collect();
             for asn in &profile.asns {
                 let owner = tables.as_ref().map(|t| t.asn_owner(*asn)).unwrap_or_default();

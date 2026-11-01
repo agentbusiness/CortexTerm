@@ -19,6 +19,8 @@ pub mod agents;
 pub mod browser;
 #[cfg(feature = "chatflow")]
 pub mod chatflow;
+#[cfg(feature = "cleanup")]
+pub mod cleanup;
 #[cfg(feature = "container")]
 pub mod container;
 #[cfg(feature = "filebrowser")]
@@ -70,6 +72,7 @@ pub const CATEGORIES: &[(&str, &str)] = &[
     ("update", "update@1"),
     ("mesh", "mesh@1"),
     ("system", "system@1"),
+    ("cleanup", "cleanup@1"),
 ];
 
 /// Families: any number of plugins, each in its own category `<family>-<name>` (lowercase letters,

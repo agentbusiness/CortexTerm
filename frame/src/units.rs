@@ -843,7 +843,14 @@ fn recover_batches(root: &Path, dir: &Path, saved: &mut PluginsFile) -> Result<(
         if path.extension().and_then(|s| s.to_str()) != Some("json") { continue; }
         let bytes = std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let mut batch: InstallBatch = serde_json::from_slice(&bytes).map_err(|e| format!("{} is corrupt: {e}", path.display()))?;
-        if batch.result.is_some() { continue; }
+        if batch.result.is_some() {
+            // A finished install answers a repeated request for a day; then it goes.
+            let old = std::fs::metadata(&path).and_then(|meta| meta.modified()).ok().and_then(|at| at.elapsed().ok()).is_some_and(|age| age.as_secs() > 86_400);
+            if old {
+                let _ = std::fs::remove_file(&path);
+            }
+            continue;
+        }
         let mut errors = Vec::new();
         for (id, previous) in &batch.previous {
             if let Err(error) = crate::package::load(root, id, &previous.current) {

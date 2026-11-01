@@ -2,11 +2,11 @@
 //! (`memory@1`, docs/GRAPH-MODEL.md): nodes and edges, temporal properties for values that
 //! change, streams for histories. Nothing is written to files.
 //!
-//! Writes go through one ordered outbox in RAM: [`put`], [`retire`] and [`append`] return at once,
-//! and a writer sends the calls in order. While memory is not reachable (starting, restarting,
-//! busy) the writes wait in RAM and are sent again; a write memory refuses (a bad batch) is logged
-//! and dropped, so it never blocks the ones after it. Reads ([`query`], [`stream_read`]) ask
-//! memory directly.
+//! Writes go through one ordered outbox in RAM: [`put`], [`retire`], [`append`] and
+//! [`set_setting`] return at once, and a writer sends the calls in order. While memory is not
+//! reachable (starting, restarting, busy) the writes wait in RAM and are sent again; a write
+//! memory refuses (a bad batch) is logged and dropped, so it never blocks the ones after it.
+//! Reads ([`query`], [`stream_read`], [`setting`]) ask memory directly.
 //!
 //! The plugin starts before memory may answer: [`ready`] turns true once this Mac's root node is
 //! known, the old files are moved in (`migrate`) and every module has loaded what it keeps. Until
@@ -49,6 +49,8 @@ enum Op {
     Put(GraphPutParams),
     Retire(GraphRetireParams),
     Append(StreamAppendParams),
+    /// `memory.settings.set` params.
+    Setting(Value),
 }
 
 impl Op {
@@ -57,6 +59,7 @@ impl Op {
             Op::Put(p) => (methods::GRAPH_PUT, serde_json::to_value(p).unwrap_or(Value::Null)),
             Op::Retire(p) => (methods::GRAPH_RETIRE, serde_json::to_value(p).unwrap_or(Value::Null)),
             Op::Append(p) => (methods::STREAM_APPEND, serde_json::to_value(p).unwrap_or(Value::Null)),
+            Op::Setting(p) => (methods::SETTINGS_SET, p.clone()),
         }
     }
 }
@@ -279,6 +282,18 @@ pub fn append(topic: &str, records: Vec<Value>, retention_days: u32) {
     for chunk in records.chunks(1000) {
         enqueue(Op::Append(StreamAppendParams { topic: topic.to_owned(), records: chunk.to_vec(), retention_days: Some(retention_days) }));
     }
+}
+
+/// Set a setting (`memory.settings.set`; an object value becomes a section), in order with the
+/// other writes.
+pub fn set_setting(path: &str, value: Value) {
+    enqueue(Op::Setting(json!({"path": path, "value": value, "by": "system"})));
+}
+
+/// A setting's value (`memory.settings.list` of its path: an empty object when it is not set).
+pub async fn setting(path: &str) -> Result<Value, String> {
+    let answer = call(methods::SETTINGS_LIST, json!({"prefix": path})).await?;
+    Ok(answer["settings"].clone())
 }
 
 /// Wait until every write so far was sent (or `limit` passed). True when the outbox is empty.
@@ -506,7 +521,9 @@ pub fn hashed(prefix: &str, text: &str) -> String {
 }
 
 /// The chain of `Folder` nodes from `path` up to the home folder (as the memory plugin writes a
-/// project's folders), or up to `/` outside it, each `IN` its parent. Returns the folder's ref.
+/// project's folders), or up to `/` outside it, each `IN` its parent, the top one `ON` this Mac.
+/// Returns the folder's ref. Before the Mac's root node is known the top has no `ON` edge, and
+/// memory refuses the chain unless a folder of it is stored with an edge already.
 pub fn folder(unit: &mut Unit, path: &std::path::Path) -> GraphRef {
     let home = crate::util::home();
     let mut chain: Vec<String> = Vec::new();
@@ -529,9 +546,10 @@ pub fn folder(unit: &mut Unit, path: &std::path::Path) -> GraphRef {
     for pair in chain.windows(2) {
         unit.edge(r("Folder", pair[0].clone()), "IN", r("Folder", pair[1].clone()));
     }
-    if chain.len() == 1 && let Some(machine) = machine() {
-        // A top folder alone has no parent to connect it.
-        unit.edge(r("Folder", chain[0].clone()), "ON", machine);
+    if let (Some(top), Some(machine)) = (chain.last(), machine()) {
+        // The top folder hangs from this Mac, so the chain is anchored even when every folder in
+        // it is new (memory refuses a group of new nodes that reaches nothing stored).
+        unit.edge(r("Folder", top.clone()), "ON", machine);
     }
     r("Folder", chain[0].clone())
 }

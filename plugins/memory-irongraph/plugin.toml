@@ -33,6 +33,12 @@ dir = "ui/card-index"
 id = "memory-irongraph.card-index"
 slot = "card.index@1"
 
+# Settings > Memory: what CortexTerm learned, why, how it fared, Forget.
+[[ui.package]]
+dir = "ui/settings-memory"
+id = "memory-irongraph.settings-memory"
+slot = "settings.memory@1"
+
 # The plugin's data (skills): packed at the same path; the app reads and edits it live in
 # the live folder (<home>/live/plugins/memory-irongraph/data).
 [data]

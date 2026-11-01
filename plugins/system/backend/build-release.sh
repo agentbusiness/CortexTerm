@@ -61,9 +61,13 @@ destination='Library/Application Support/CortexTerm/Security'
 mkdir -p "$stage/root/$destination"
 ditto "$bundle" "$stage/root/$destination/CortexTermEventSensor.app"
 rm -f "$stage/root/$destination/CortexTermEventSensor.app/Contents/Resources/CortexTermEventSensor.pkg"
+# The service that starts the sensor at boot; the postinstall script starts it right away.
+mkdir -p "$stage/root/Library/LaunchDaemons"
+cp "$native/ai.cortexterm.event-sensor.plist" "$stage/root/Library/LaunchDaemons/"
+chmod 644 "$stage/root/Library/LaunchDaemons/ai.cortexterm.event-sensor.plist"
 chmod -R go-w "$stage/root"
-pkgbuild --root "$stage/root" --ownership recommended --identifier ai.cortexterm.event-sensor.installer \
-  --version 1.0.0 --install-location / --sign "$installer_identity" "$stage/CortexTermEventSensor.pkg"
+pkgbuild --root "$stage/root" --scripts "$native/installer-scripts" --ownership recommended --identifier ai.cortexterm.event-sensor.installer \
+  --version 1.1.0 --install-location / --sign "$installer_identity" "$stage/CortexTermEventSensor.pkg"
 pkgutil --check-signature "$stage/CortexTermEventSensor.pkg"
 xcrun notarytool submit "$stage/CortexTermEventSensor.pkg" --keychain-profile "$notary_profile" --wait
 xcrun stapler staple "$stage/CortexTermEventSensor.pkg"

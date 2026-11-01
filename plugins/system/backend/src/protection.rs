@@ -1,13 +1,24 @@
 //! Local security incidents. Collection is facts; correlation and severity are code; the model
 //! can gather bounded read-only evidence and explain it. Nothing in this module runs a shell.
-//! State is app-local in IronGraph. A missing collector is never an all-clear.
+//! State is app-local in IronGraph. A missing collector is never an all-clear:
+//!
+//! - setting `protection.config`: the [`ProtectionConfig`];
+//! - `(:ProtectionIncident {key: id, incident_key, first_at, last_at, title, severity, state,
+//!   revision, omitted_observations})-[:ON]->(:Machine)`, `-[:INVOLVES]->(:Binary)` for each
+//!   executable it observed, `-[:ABOUT]->` what a sweep group's findings are about;
+//! - `(:ProtectionException {key: id, incident_key, created_at, expires_at, reason,
+//!   observation_keys, max_severity})-[:FOR]->(:ProtectionIncident)`, retired when it ends;
+//! - stream `protection.observations`: `{incident, observation}` each time an observation enters
+//!   an incident or changes (14 days); the latest of each counts;
+//! - stream `protection.investigations`: `{incident, investigation}` on each change (14 days).
 
 use crate::graph::{self, Props};
 use crate::procs::Snapshot;
 use crate::util::now_ms;
+use cc_protocol::contracts::memory::GraphRef;
 use cc_protocol::contracts::system::*;
 use regex::Regex;
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,6 +29,9 @@ const RETENTION: u64 = 14 * DAY;
 const MAX_INCIDENTS: usize = 100;
 const MAX_OBSERVATIONS: usize = 64;
 const MAX_QUEUE: usize = 2048;
+const CONFIG: &str = "protection.config";
+const OBSERVATIONS: &str = "protection.observations";
+const INVESTIGATIONS: &str = "protection.investigations";
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static LOST: AtomicU64 = AtomicU64::new(0);
 static QUEUE: Mutex<VecDeque<SecurityObservation>> = Mutex::new(VecDeque::new());
@@ -104,7 +118,7 @@ pub fn keys_changed(status: &KeysStatus) {
             label,
             if set { "starting" } else { "disabled" },
             if set {
-                "Key saved. No authenticated lookup has been verified in this session yet; a saved key is not a successful check."
+                "Key saved; checking that it works."
             } else {
                 "No key is configured; online lookups for this service are disabled."
             },
@@ -120,6 +134,21 @@ pub fn observe(observation: SecurityObservation) {
         LOST.fetch_add(1, Ordering::Relaxed);
     }
     queue.push_back(observation);
+}
+
+/// Observations that entered an incident or changed, to its history.
+fn note<'a>(incident: &str, observations: impl IntoIterator<Item = &'a SecurityObservation>) {
+    let records: Vec<Value> = observations.into_iter().map(|observation| json!({"incident": incident, "observation": observation})).collect();
+    if !records.is_empty() {
+        graph::append(OBSERVATIONS, records, 14);
+    }
+}
+
+/// The incident's investigation as it is now, to its history.
+fn investigated(incident: &SecurityIncident) {
+    if let Some(investigation) = &incident.investigation {
+        graph::append(INVESTIGATIONS, vec![json!({"incident": incident.id, "investigation": investigation})], 14);
+    }
 }
 
 pub fn drain() -> Vec<SecurityObservation> {
@@ -187,6 +216,8 @@ pub struct Store {
     notified: HashMap<String, (u64, u8)>,
     saved: HashMap<String, u64>,
     context: VecDeque<SecurityObservation>,
+    /// Sweep group incident key -> the nodes its findings are about.
+    about: HashMap<String, Vec<GraphRef>>,
 }
 
 impl Default for Store {
@@ -202,6 +233,7 @@ impl Default for Store {
             notified: HashMap::new(),
             saved: HashMap::new(),
             context: VecDeque::new(),
+            about: HashMap::new(),
         }
     }
 }
@@ -209,94 +241,91 @@ impl Default for Store {
 impl Store {
     pub async fn load() -> Result<Self, String> {
         let mut store = Self::default();
-        let rows = graph::query(
-            "MATCH (p:ProtectionState {key: 'local'}) RETURN p.config, p.exceptions",
-            json!({}),
-        )
-        .await?;
-        if let Some(row) = rows.first() {
-            if let Some(text) = row.first().and_then(|v| v.as_str()) {
-                let config = if text.len() <= 64 * 1024 {
-                    serde_json::from_str::<ProtectionConfig>(text)
-                        .ok()
-                        .filter(|c| validate_config(c).is_ok())
-                } else {
-                    None
-                };
-                if let Some(config) = config {
-                    store.config = config;
-                } else {
+        let now = now_ms();
+        // Before 0.1.21 the settings, exceptions and whole incidents were JSON text on
+        // `ProtectionState` and `ProtectionIncident.payload`; they are moved into the setting, the
+        // nodes and the streams once.
+        let old = graph::query("MATCH (p:ProtectionState {key: 'local'}) WHERE p.state IS NULL OR p.state <> 'gone' RETURN p.config, p.exceptions", json!({})).await?;
+        let old = old.first();
+        let unset = |value: &Value| value.as_object().is_some_and(|members| members.is_empty());
+        let mut config = graph::setting(CONFIG).await?;
+        if let Some(text) = old.and_then(|row| row[0].as_str()).filter(|_| unset(&config)) {
+            config = serde_json::from_str(text).unwrap_or(Value::Null);
+        }
+        if !unset(&config) {
+            match serde_json::from_value::<ProtectionConfig>(config).ok().filter(|c| validate_config(c).is_ok()) {
+                Some(config) => store.config = config,
+                None => {
                     store.repair_required = true;
-                    store.config = ProtectionConfig {
-                        packet_watch: false,
-                        deep_watch: false,
-                        investigate: false,
-                        imports: Vec::new(),
-                    };
+                    store.config = ProtectionConfig { packet_watch: false, deep_watch: false, investigate: false, imports: Vec::new() };
                     health(
                         "protection-state",
                         "Saved protection settings",
                         "unavailable",
-                        "The saved configuration is invalid or unsupported. Protection collectors and AI are disabled; the original graph payload is preserved until you explicitly save repaired settings. Other system monitoring can still start.",
+                        "The saved configuration is invalid or unsupported. Protection collectors and AI are disabled; the saved setting is kept until you explicitly save repaired settings. Other system monitoring can still start.",
                     );
                 }
-            }
-            if let Some(text) = row.get(1).and_then(|v| v.as_str()) {
-                if text.len() <= 256 * 1024 {
-                    if let Ok(exceptions) = serde_json::from_str(text) {
-                        store.exceptions = exceptions;
-                    } else {
-                        store.repair_required = true;
-                        health(
-                            "protection-exceptions",
-                            "Saved notification exceptions",
-                            "degraded",
-                            "Saved exceptions were invalid and are not active. The original payload is preserved until settings are explicitly saved.",
-                        );
-                    }
-                } else {
-                    store.repair_required = true;
-                    health(
-                        "protection-exceptions",
-                        "Saved notification exceptions",
-                        "degraded",
-                        "Saved exceptions exceeded the storage limit and are not active.",
-                    );
-                }
-                store.exceptions.retain(|e| {
-                    e.created_at <= now_ms()
-                        && e.expires_at > now_ms()
-                        && e.expires_at <= now_ms().saturating_add(3_600_000)
-                        && e.expires_at <= e.created_at.saturating_add(3_600_000)
-                        && e.observation_keys.len() <= MAX_OBSERVATIONS
-                        && e.observation_keys.iter().all(|key| {
-                            key.len() == 32 && key.bytes().all(|b| b.is_ascii_hexdigit())
-                        })
-                });
-                store.exceptions.truncate(100);
             }
         }
-        let rows = graph::query("MATCH (p:ProtectionIncident) WHERE p.state IS NULL OR p.state <> 'gone' RETURN p.payload ORDER BY p.updated_ms DESC LIMIT 100", json!({})).await?;
+        let mut gone = Vec::new();
+        let mut moved = Vec::new();
+        let rows = graph::query("MATCH (p:ProtectionIncident) WHERE p.payload IS NOT NULL AND (p.state IS NULL OR p.state <> 'gone') RETURN p.key, p.payload", json!({})).await?;
         for row in rows {
-            let Some(text) = row
-                .first()
-                .and_then(|v| v.as_str())
-                .filter(|s| s.len() <= 1_048_576)
-            else {
+            let Ok(incident) = serde_json::from_str::<SecurityIncident>(row[1].as_str().unwrap_or("")) else {
                 LOST.fetch_add(1, Ordering::Relaxed);
+                gone.push(graph::r("ProtectionIncident", graph::text(&row[0])));
                 continue;
             };
-            let Ok(mut incident) = serde_json::from_str::<SecurityIncident>(text) else {
-                LOST.fetch_add(1, Ordering::Relaxed);
-                continue;
-            };
-            if incident.last_at.saturating_add(RETENTION) < now_ms() {
+            moved.push(incident.id.clone());
+            store.incidents.push_back(incident);
+        }
+        let rows = graph::query(
+            "MATCH (p:ProtectionIncident) WHERE p.incident_key IS NOT NULL AND p.state <> 'gone' RETURN p.key, p.incident_key, p.first_at, p.last_at, p.title, p.severity, p.state, p.revision, p.omitted_observations ORDER BY p.last_at DESC LIMIT 100",
+            json!({}),
+        )
+        .await?;
+        let mut observations: HashMap<String, BTreeMap<String, SecurityObservation>> = HashMap::new();
+        let mut investigations: HashMap<String, SecurityInvestigation> = HashMap::new();
+        if !rows.is_empty() {
+            for entry in graph::stream_read(OBSERVATIONS, now.saturating_sub(RETENTION)).await? {
+                if let (Some(id), Ok(event)) = (entry.value["incident"].as_str(), serde_json::from_value::<SecurityObservation>(entry.value["observation"].clone())) {
+                    observations.entry(id.to_owned()).or_default().insert(event.id.clone(), event);
+                }
+            }
+            for entry in graph::stream_read(INVESTIGATIONS, now.saturating_sub(RETENTION)).await? {
+                if let (Some(id), Ok(investigation)) = (entry.value["incident"].as_str(), serde_json::from_value(entry.value["investigation"].clone())) {
+                    investigations.insert(id.to_owned(), investigation);
+                }
+            }
+        }
+        for row in rows {
+            let id = graph::text(&row[0]);
+            if moved.contains(&id) {
                 continue;
             }
+            let mut events: Vec<SecurityObservation> = observations.remove(&id).unwrap_or_default().into_values().collect();
+            events.sort_by_key(|e| e.at);
+            events.drain(..events.len().saturating_sub(MAX_OBSERVATIONS));
+            store.incidents.push_back(SecurityIncident {
+                investigation: investigations.remove(&id),
+                key: graph::text(&row[1]),
+                first_at: graph::number(&row[2]),
+                last_at: graph::number(&row[3]),
+                title: graph::text(&row[4]),
+                severity: graph::text(&row[5]),
+                state: graph::text(&row[6]),
+                revision: graph::number(&row[7]),
+                omitted_observations: graph::number(&row[8]),
+                observations: events,
+                id,
+            });
+        }
+        let mut kept = VecDeque::new();
+        for mut incident in std::mem::take(&mut store.incidents) {
             // Before 0.1.18 the sweep made one incident per finding; its findings are now one
             // incident per group.
-            if incident.key.starts_with("finding:") {
-                graph::retire(vec![graph::r("ProtectionIncident", &incident.id)], "one incident per group now");
+            if incident.last_at.saturating_add(RETENTION) < now || incident.key.starts_with("finding:") {
+                gone.push(graph::r("ProtectionIncident", &incident.id));
                 continue;
             }
             incident.observations.truncate(MAX_OBSERVATIONS);
@@ -308,13 +337,55 @@ impl Store {
                 }
             }
             // Do not re-notify just because CT restarted.
-            store.notified.insert(
-                incident.id.clone(),
-                (incident.last_at, rank(&incident.severity)),
-            );
-            store.incidents.push_back(incident);
+            store.notified.insert(incident.id.clone(), (incident.last_at, rank(&incident.severity)));
+            kept.push_back(incident);
         }
+        store.incidents = kept;
         store.incidents.make_contiguous().sort_by_key(|i| i.last_at);
+        let mut exceptions: Vec<SecurityException> = old.and_then(|row| row[1].as_str()).and_then(|text| serde_json::from_str(text).ok()).unwrap_or_default();
+        let migrated = exceptions.len();
+        let rows = graph::query("MATCH (e:ProtectionException) WHERE e.state IS NULL OR e.state <> 'gone' RETURN e.key, e.incident_key, e.created_at, e.expires_at, e.reason, e.observation_keys, e.max_severity", json!({})).await?;
+        exceptions.extend(rows.iter().map(|row| SecurityException {
+            id: graph::text(&row[0]),
+            incident_key: graph::text(&row[1]),
+            created_at: graph::number(&row[2]),
+            expires_at: graph::number(&row[3]),
+            reason: graph::text(&row[4]),
+            observation_keys: graph::texts(&row[5]),
+            max_severity: graph::text(&row[6]),
+        }));
+        for (n, e) in exceptions.into_iter().enumerate() {
+            let valid = e.created_at <= now
+                && e.expires_at > now
+                && e.expires_at <= now.saturating_add(3_600_000)
+                && e.expires_at <= e.created_at.saturating_add(3_600_000)
+                && e.observation_keys.len() <= MAX_OBSERVATIONS
+                && e.observation_keys.iter().all(|key| key.len() == 32 && key.bytes().all(|b| b.is_ascii_hexdigit()));
+            if valid && store.exceptions.len() < 100 {
+                if n < migrated {
+                    store.save_exception(&e);
+                }
+                store.exceptions.push(e);
+            } else if n >= migrated {
+                gone.push(graph::r("ProtectionException", e.id));
+            }
+        }
+        for incident in store.incidents.iter().filter(|i| moved.contains(&i.id)) {
+            let mut batch = Self::node(incident);
+            batch.units[0].nodes[0].p("payload", Value::Null).p("updated_ms", Value::Null);
+            graph::put(batch);
+            note(&incident.id, &incident.observations);
+            investigated(incident);
+        }
+        if old.is_some() {
+            if !store.repair_required {
+                graph::set_setting(CONFIG, serde_json::to_value(&store.config).unwrap_or(Value::Null));
+            }
+            gone.push(graph::r("ProtectionState", "local"));
+        }
+        if !gone.is_empty() {
+            graph::retire(gone, "security incident retention");
+        }
         store.loaded = true;
         Ok(store)
     }
@@ -323,45 +394,92 @@ impl Store {
         if !self.loaded || self.repair_required {
             return;
         }
+        graph::set_setting(CONFIG, serde_json::to_value(&self.config).unwrap_or(Value::Null));
+    }
+
+    /// An exception, `FOR` the incident it mutes (`ON` this Mac when that is no longer kept).
+    fn save_exception(&self, exception: &SecurityException) {
         let mut batch = graph::Batch::new();
         let unit = batch.unit();
-        unit.node("ProtectionState", "local")
-            .p(
-                "config",
-                serde_json::to_string(&self.config).unwrap_or_default(),
-            )
-            .p(
-                "exceptions",
-                serde_json::to_string(&self.exceptions).unwrap_or_default(),
-            );
-        if let Some(machine) = graph::machine() {
-            unit.edge(graph::r("ProtectionState", "local"), "ON", machine);
+        unit.node("ProtectionException", &exception.id)
+            .p("incident_key", exception.incident_key.clone())
+            .p("created_at", exception.created_at)
+            .p("expires_at", exception.expires_at)
+            .p("reason", exception.reason.clone())
+            .pl("observation_keys", exception.observation_keys.clone())
+            .p("max_severity", exception.max_severity.clone());
+        let me = graph::r("ProtectionException", &exception.id);
+        match self.incidents.iter().rev().find(|i| i.key == exception.incident_key) {
+            Some(incident) => {
+                unit.edge(me, "FOR", graph::r("ProtectionIncident", &incident.id));
+            }
+            None => {
+                if let Some(machine) = graph::machine() {
+                    unit.edge(me, "ON", machine);
+                }
+            }
         }
         graph::put(batch);
     }
 
-    fn save(incident: &SecurityIncident) {
+    /// The incident's node, `ON` this Mac and `INVOLVES` the executables of its observations.
+    fn node(incident: &SecurityIncident) -> graph::Batch {
         let mut batch = graph::Batch::new();
         let unit = batch.unit();
         unit.node("ProtectionIncident", &incident.id)
-            .p("updated_ms", incident.last_at)
-            .p(
-                "payload",
-                serde_json::to_string(incident).unwrap_or_default(),
-            );
-        if let Some(machine) = graph::machine() {
-            unit.edge(graph::r("ProtectionIncident", &incident.id), "ON", machine);
+            .p("incident_key", incident.key.clone())
+            .p("first_at", incident.first_at)
+            .p("last_at", incident.last_at)
+            .p("title", incident.title.clone())
+            .p("severity", incident.severity.clone())
+            .p("state", incident.state.clone())
+            .p("revision", incident.revision)
+            .p("omitted_observations", incident.omitted_observations);
+        let me = graph::r("ProtectionIncident", &incident.id);
+        let mut binaries: Vec<&String> = incident.observations.iter().filter_map(|e| e.executable.as_ref()).filter(|p| p.starts_with('/')).collect();
+        binaries.sort();
+        binaries.dedup();
+        for path in &binaries {
+            unit.node("Binary", path.as_str());
+            unit.edge(me.clone(), "INVOLVES", graph::r("Binary", path.as_str()));
         }
-        graph::put(batch);
+        // This Mac holds the incident: the binaries may be new with it, so they cannot.
+        if let Some(machine) = graph::machine() {
+            unit.edge(me, "ON", machine);
+        }
+        batch
+    }
+
+    /// Write the incident; `about` are the nodes its sweep group is about, linked apart so that
+    /// one not in the graph refuses only that edge.
+    fn save(incident: &SecurityIncident, about: &HashMap<String, Vec<GraphRef>>) {
+        graph::put(Self::node(incident));
+        if let Some(targets) = about.get(&incident.key) {
+            let mut batch = graph::Batch::new();
+            let unit = batch.unit();
+            for target in targets {
+                unit.edge(graph::r("ProtectionIncident", &incident.id), "ABOUT", target.clone());
+            }
+            graph::put(batch);
+        }
+    }
+
+    /// What the sweep's findings in these groups are about (incident key -> nodes).
+    pub fn set_about(&mut self, about: HashMap<String, Vec<GraphRef>>) {
+        let incidents = &self.incidents;
+        self.about.retain(|key, _| incidents.iter().any(|i| &i.key == key));
+        self.about.extend(about);
     }
 
     fn prune(&mut self, now: u64) {
-        let before = self.exceptions.len();
-        self.exceptions.retain(|e| e.expires_at > now);
-        if before != self.exceptions.len() {
-            self.save_config();
-        }
         let mut gone = Vec::new();
+        self.exceptions.retain(|e| {
+            let active = e.expires_at > now;
+            if !active {
+                gone.push(graph::r("ProtectionException", &e.id));
+            }
+            active
+        });
         self.incidents.retain(|i| {
             if i.last_at.saturating_add(RETENTION) < now {
                 gone.push(graph::r("ProtectionIncident", &i.id));
@@ -409,7 +527,7 @@ impl Store {
                     state: "queued".into(),
                     ..Default::default()
                 });
-                Self::save(incident);
+                investigated(incident);
             }
         }
         self.config = config;
@@ -569,6 +687,7 @@ impl Store {
             self.context.push_back(event);
             return None;
         }
+        let created = index.is_none();
         let index = index.unwrap_or_else(|| {
             self.incidents.push_back(SecurityIncident {
                 id: format!(
@@ -607,12 +726,14 @@ impl Store {
             .iter()
             .any(|old| observation_key(old) == fp);
         let mut new_evidence = true;
+        let mut changed = event.clone();
         if let Some(old) = incident
             .observations
             .iter_mut()
             .find(|old| observation_key(old) == fp && old.summary == event.summary)
         {
             old.count = old.count.saturating_add(event.count);
+            changed = old.clone();
             new_evidence = false;
         } else {
             incident.observations.push(event.clone());
@@ -687,11 +808,18 @@ impl Store {
                     },
                     ..Default::default()
                 });
+                investigated(incident);
             }
+        }
+        if created {
+            note(&incident.id, &incident.observations);
         }
         if new_evidence || now.saturating_sub(*self.saved.get(&incident.id).unwrap_or(&0)) > 30_000
         {
-            Self::save(incident);
+            Self::save(incident, &self.about);
+            if !created {
+                note(&incident.id, [&changed]);
+            }
             self.saved.insert(incident.id.clone(), now);
         }
         let excepted = self.exceptions.iter().any(|e| {
@@ -737,7 +865,7 @@ impl Store {
         for incident in self.incidents.iter_mut().filter(|i| i.key == key && i.state == "open") {
             incident.state = "dismissed".into();
             incident.revision = incident.revision.saturating_add(1);
-            Self::save(incident);
+            Self::save(incident, &self.about);
         }
     }
 
@@ -760,7 +888,7 @@ impl Store {
             if before == self.exceptions.len() {
                 return Err("The exception is no longer active.".into());
             }
-            self.save_config();
+            graph::retire(vec![graph::r("ProtectionException", &action.id)], "revoked");
             return Ok(());
         }
         let incident = self
@@ -784,9 +912,13 @@ impl Store {
                     );
                 }
                 let now = now_ms();
-                self.exceptions.retain(|e| e.incident_key != incident.key);
-                if self.exceptions.len() >= 100 {
+                let replaced: Vec<_> = self.exceptions.iter().filter(|e| e.incident_key == incident.key).map(|e| graph::r("ProtectionException", &e.id)).collect();
+                if self.exceptions.len() - replaced.len() >= 100 {
                     return Err("Remove an existing exception first (maximum 100).".into());
+                }
+                self.exceptions.retain(|e| e.incident_key != incident.key);
+                if !replaced.is_empty() {
+                    graph::retire(replaced, "replaced");
                 }
                 self.exceptions.push(SecurityException { id: format!("exception-{}-{}", now, SEQUENCE.fetch_add(1, Ordering::Relaxed)), incident_key: incident.key.clone(), created_at: now, expires_at: now + 3_600_000, reason: "User muted the recorded patterns for this exact entity for one hour; new behaviours and severity escalations are not covered. Collection continues.".into(), observation_keys: incident.observations.iter().map(observation_key).collect(), max_severity: incident.severity.clone() });
             }
@@ -805,12 +937,15 @@ impl Store {
                     state: "queued".into(),
                     ..Default::default()
                 });
+                investigated(incident);
             }
             _ => return Err("Unsupported incident action.".into()),
         }
         incident.revision = incident.revision.saturating_add(1);
-        Self::save(incident);
-        self.save_config();
+        Self::save(incident, &self.about);
+        if action.action == "allow_hour" && let Some(exception) = self.exceptions.last() {
+            self.save_exception(exception);
+        }
         Ok(())
     }
 
@@ -835,7 +970,7 @@ impl Store {
             checked_at: now_ms(),
             ..Default::default()
         });
-        Self::save(incident);
+        investigated(incident);
         Some(incident.clone())
     }
 
@@ -863,7 +998,7 @@ impl Store {
         } else {
             incident.investigation = Some(result);
         }
-        Self::save(incident);
+        investigated(incident);
     }
 
     pub fn status(&mut self) -> ProtectionStatus {
@@ -894,8 +1029,8 @@ impl Store {
             at: now, config: self.config.clone(), sensors,
             incidents,
             exceptions: self.exceptions.clone(),
-            deep_capture_command: None,
             deep_install_command: None,
+            deep_service: false,
             packet_capture_help: "Packet monitoring needs access to macOS BPF capture devices. CT never requests sudo automatically. If unavailable, connection watching still runs; scan detection does not. Capture observes selected interface metadata, without packet payload retention.".into(),
             visibility: "This Mac and explicitly configured local sensor logs. Other devices' unicast traffic and probes stopped at your router are not automatically visible. Packet loss, sleep, VPNs and missing permissions can leave gaps; no findings is not an all-clear.".into(),
         }
