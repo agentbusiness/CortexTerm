@@ -710,6 +710,7 @@ impl Watcher {
 
 /// Under the home folder: what a script run in the sandbox may neither read nor write (keys,
 /// tokens, keychains, browser profiles, wallets, notes).
+#[cfg(target_os = "macos")]
 const SECRET_PATHS: &[&str] = &[
     ".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".config/gcloud", ".config/gh", ".netrc", ".npmrc", ".pypirc",
     ".git-credentials", "Library/Keychains", "Library/Cookies", "Library/Safari", "Library/Messages", "Library/Mail",

@@ -60,6 +60,25 @@ pub fn service_problem() -> Option<String> {
     SERVICE_PROBLEM.lock().ok()?.clone()
 }
 
+/// Whether the process at the other end of the socket runs as root.
+#[cfg(target_os = "linux")]
+fn served_by_root(stream: &std::os::unix::net::UnixStream) -> bool {
+    let mut cred = libc::ucred { pid: 0, uid: u32::MAX, gid: u32::MAX };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let read = unsafe {
+        libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&raw mut cred).cast(), &mut len)
+    };
+    read == 0 && cred.uid == 0
+}
+
+/// Whether the process at the other end of the socket runs as root.
+#[cfg(not(target_os = "linux"))]
+fn served_by_root(stream: &std::os::unix::net::UnixStream) -> bool {
+    let (mut uid, mut gid) = (u32::MAX, u32::MAX);
+    let read = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    read == 0 && uid == 0
+}
+
 /// While deep monitoring is on, read the installed sensor service's events: no terminal, no
 /// sudo. The socket must belong to root and be served by a root process.
 pub fn service_capture(on: bool) {
@@ -84,9 +103,7 @@ pub fn service_capture(on: bool) {
             let owned = std::fs::symlink_metadata(SOCKET).is_ok_and(|meta| meta.uid() == 0);
             match std::os::unix::net::UnixStream::connect(SOCKET) {
                 Ok(stream) if owned => {
-                    let (mut uid, mut gid) = (u32::MAX, u32::MAX);
-                    let root = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } == 0 && uid == 0;
-                    if !root {
+                    if !served_by_root(&stream) {
                         problem(Some("The sensor socket is not served by root; it was not read.".into()));
                     } else {
                         let end = stream.try_clone().ok();

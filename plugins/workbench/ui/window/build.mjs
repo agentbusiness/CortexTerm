@@ -99,6 +99,9 @@ async function buildPage() {
       target: 'es2023',
       sourcemap: true,
       assetsInlineLimit: 0,
+      // The page is one bundle (the workbench, CodeMirror and xterm) the frame serves from disk,
+      // never over a network, so Vite's 500 kB web-page warning does not apply.
+      chunkSizeWarningLimit: 2048,
       rolldownOptions: { external: Object.keys(VENDOR) },
     },
   });

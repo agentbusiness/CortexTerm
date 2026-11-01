@@ -221,6 +221,7 @@ fn sample() -> Result<HashMap<u32, (String, Vec<Flow>)>, String> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn sample() -> Result<HashMap<u32, (String, Vec<Flow>)>, String> { Err("network watcher is unavailable on this OS".into()) }
 
+#[cfg(target_os = "macos")]
 fn endpoint(text: &str) -> Option<(IpAddr, u16)> {
     let (host, port) = match text.rsplit_once(':') {
         Some((host, port)) if !host.contains(':') => (host, port),
@@ -420,11 +421,9 @@ impl Watch {
             return info.clone();
         }
         let entry = snapshot.get(&pid);
-        let mut exe = entry.map(|e| e.exe.clone()).unwrap_or_default();
+        let exe = entry.map(|e| e.exe.clone()).unwrap_or_default();
         #[cfg(target_os = "macos")]
-        if exe.is_empty() {
-            exe = libproc::libproc::proc_pid::pidpath(pid as i32).unwrap_or_default();
-        }
+        let exe = if exe.is_empty() { libproc::libproc::proc_pid::pidpath(pid as i32).unwrap_or_default() } else { exe };
         let name = entry.map(|e| e.proc.name.clone()).unwrap_or_else(|| name.to_owned());
         let app = entry.map(|e| e.proc.app.clone()).unwrap_or_else(|| crate::procs::app_of(&exe, &name, pid, u32::MAX));
         let command = entry.map(|e| e.proc.command.clone()).unwrap_or_default();

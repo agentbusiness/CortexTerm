@@ -22,17 +22,26 @@ use crate::feeds;
 use crate::graph::{self, Batch, Props, r};
 use crate::netwatch;
 use crate::sweep::Part;
-use crate::util::{now_ms, plural, run};
+use crate::util::{now_ms, plural};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Mutex;
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::{IpAddr, Ipv4Addr};
+use std::time::Duration;
+#[cfg(target_os = "macos")]
+use crate::util::run;
+#[cfg(target_os = "macos")]
 use std::io::Read;
-use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+#[cfg(target_os = "macos")]
+use std::net::UdpSocket;
+#[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 
 const DAY: u64 = 24 * 3_600_000;
+#[cfg(target_os = "macos")]
 const SHORT: Duration = Duration::from_secs(5);
 
 /// This Mac's network as it is now.
@@ -185,20 +194,24 @@ pub struct Change {
     pub alert: bool,
 }
 
+#[cfg(target_os = "macos")]
 fn field<'a>(text: &'a str, name: &str) -> Option<&'a str> {
     text.lines().find_map(|line| line.trim().strip_prefix(name)).map(|rest| rest.trim_start_matches([' ', ':', '=']).trim())
 }
 
 /// `{a, b}` -> [a, b].
+#[cfg(target_os = "macos")]
 fn list(text: &str) -> Vec<String> {
     text.trim_matches(['{', '}']).split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect()
 }
 
+#[cfg(target_os = "macos")]
 fn mac(text: &str) -> Option<String> {
     let parts: Vec<u8> = text.split(':').filter_map(|p| u8::from_str_radix(p, 16).ok()).collect();
     (parts.len() == 6).then(|| parts.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":"))
 }
 
+#[cfg(target_os = "macos")]
 fn out(program: &str, args: &[&str]) -> String {
     run(program, args, SHORT).map(|o| o.stdout).unwrap_or_default()
 }
@@ -369,6 +382,7 @@ pub fn network_changes() -> Vec<Change> {
 }
 
 /// Run a program for a fixed window (it does not end by itself) and return what it printed.
+#[cfg(target_os = "macos")]
 fn run_for(program: &str, args: &[&str], window: Duration) -> Option<String> {
     let mut child = Command::new(program).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
     let mut stdout = child.stdout.take()?;
@@ -388,10 +402,12 @@ struct Ssdp {
     ip: String,
     location: String,
     server: String,
+    #[cfg(target_os = "macos")]
     st: String,
 }
 
 /// UPnP discovery: M-SEARCH for every device and for internet gateways, 3 s of answers.
+#[cfg(target_os = "macos")]
 fn ssdp() -> Result<Vec<Ssdp>, String> {
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
     socket.set_read_timeout(Some(Duration::from_millis(300))).map_err(|e| e.to_string())?;
@@ -556,12 +572,14 @@ fn linux_local_checks() -> Local {
     Local { part, net, answers: Vec::new(), arp, vpn, resolver: None, v6_interface }
 }
 
+#[cfg(target_os = "macos")]
 fn capital(text: &str) -> String {
     let mut chars = text.chars();
     chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_default()
 }
 
 /// 5 s of DNS queries; names that look machine-generated (long, random-looking labels).
+#[cfg(target_os = "macos")]
 fn dns_capture(part: &mut Part, interface: &str) {
     let Some(text) = run_for("/usr/sbin/tcpdump", &["-l", "-n", "-i", interface, "udp", "port", "53"], Duration::from_secs(5)) else {
         part.skipped.push("DNS watch: tcpdump did not start".into());
@@ -584,6 +602,7 @@ fn dns_capture(part: &mut Part, interface: &str) {
 }
 
 /// Long, high-entropy labels with long consonant runs.
+#[cfg(target_os = "macos")]
 fn generated(label: &str) -> bool {
     if label.len() < 12 {
         return false;
