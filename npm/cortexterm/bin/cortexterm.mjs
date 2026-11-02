@@ -7,10 +7,11 @@
 // Arguments go to the app (`--headless`, `--safe`). `npx cortexterm runner` keeps it running without
 // a local chat model: launchd on macOS, systemd on Linux (boot and SSH logout). `runner join <invitation>`
 // joins the mesh, `runner off` stops it. Development uses the same installer via ./cortexterm runner.
+// Every desktop start also puts a CortexTerm starter in /Applications (Linux: the app menu).
 
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { accessSync, chmodSync, closeSync, constants, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
 import { homedir } from 'node:os';
@@ -409,6 +410,102 @@ async function runner(args) {
   return 0;
 }
 
+// The app starter: CortexTerm in /Applications (~/Applications when that is not writable) on macOS, a
+// .desktop entry on Linux, so the app starts from Launchpad, Spotlight or the app menu. It starts the
+// newest app installed in ~/.cortexterm/app (npx cortexterm when there is none), or in development this
+// checkout's ./cortexterm. Every start writes it again, only where it changed.
+const sh = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
+
+function starterScript() {
+  const lines = ['#!/bin/sh', `export PATH=${sh(process.env.PATH || '/usr/local/bin:/usr/bin:/bin')}`, `export CORTEX_HOME=${sh(HOME)}`];
+  const log = sh(START_LOG);
+  lines.push(`mkdir -p ${sh(dirname(START_LOG))}`);
+  if (DEV_ROOT) {
+    lines.push(`exec ${sh(join(DEV_ROOT, 'cortexterm'))} >>${log} 2>&1`);
+  } else {
+    const app = process.platform === 'darwin' ? 'CortexTerm.app/Contents/MacOS/CortexTerm' : 'cortexterm/CortexTerm';
+    lines.push(
+      `apps=${sh(APPS)}`,
+      'for v in $(ls "$apps" 2>/dev/null | grep -E \'^[0-9]+\\.[0-9]+\\.[0-9]+$\' | sort -t. -k1,1nr -k2,2nr -k3,3nr); do',
+      `  [ -f "$apps/$v/${READY}" ] && exec "$apps/$v/${app}" >>${log} 2>&1`,
+      'done',
+      `exec npx --yes cortexterm >>${log} 2>&1`,
+    );
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+/** Write `content` to `path` when it differs; true when it was written. */
+function place(path, content, mode) {
+  try {
+    if (readFileSync(path).equals(Buffer.from(content))) return false;
+  } catch { /* Not there yet. */ }
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, content, mode ? { mode } : undefined);
+  if (mode) chmodSync(path, mode);
+  return true;
+}
+
+/** The app icon: this checkout's, or the newest installed app's. */
+function starterIcon(name) {
+  if (DEV_ROOT) return join(DEV_ROOT, 'ui', 'shell', 'assets', name);
+  const chosen = installed()[0];
+  if (!chosen) return null;
+  return process.platform === 'darwin'
+    ? join(APPS, chosen, 'CortexTerm.app', 'Contents', 'Resources', name)
+    : join(APPS, chosen, 'cortexterm', 'ui', 'shell', 'assets', name);
+}
+
+function writable(dir) {
+  try { accessSync(dir, constants.W_OK); return true; } catch { return false; }
+}
+
+function installStarter() {
+  try {
+    if (process.platform === 'darwin') {
+      const folder = writable('/Applications') ? '/Applications' : join(homedir(), 'Applications');
+      const contents = join(folder, 'CortexTerm.app', 'Contents');
+      const icon = starterIcon('CortexTerm.icns');
+      const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleName</key><string>CortexTerm</string>
+<key>CFBundleDisplayName</key><string>CortexTerm</string>
+<key>CFBundleIdentifier</key><string>ai.cortexterm.starter</string>
+<key>CFBundleExecutable</key><string>CortexTerm</string>
+<key>CFBundleIconFile</key><string>CortexTerm.icns</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>LSUIElement</key><true/>
+</dict></plist>
+`;
+      let changed = place(join(contents, 'Info.plist'), plist);
+      changed = place(join(contents, 'MacOS', 'CortexTerm'), starterScript(), 0o755) || changed;
+      if (icon && existsSync(icon)) changed = place(join(contents, 'Resources', 'CortexTerm.icns'), readFileSync(icon)) || changed;
+      if (changed) say(`CortexTerm is in ${folder}`);
+    } else if (process.platform === 'linux') {
+      const script = join(HOME, 'starter', 'cortexterm');
+      const iconSource = starterIcon('cortexterm-512.png');
+      const icon = join(HOME, 'starter', 'cortexterm.png');
+      if (iconSource && existsSync(iconSource)) place(icon, readFileSync(iconSource));
+      place(script, starterScript(), 0o755);
+      const apps = join(process.env.XDG_DATA_HOME || join(homedir(), '.local', 'share'), 'applications');
+      const entry = `[Desktop Entry]
+Type=Application
+Name=CortexTerm
+Comment=AI terminal with a local model
+Exec="${script.replace(/(["`$\\])/g, '\\$1')}"
+Icon=${icon}
+Terminal=false
+Categories=System;TerminalEmulator;Development;
+StartupWMClass=CortexTerm
+`;
+      if (place(join(apps, 'cortexterm.desktop'), entry)) say(`CortexTerm is in the app menu (${apps})`);
+    }
+  } catch (error) {
+    say(`cannot install the app starter (${error.message})`);
+  }
+}
+
 async function foreground(args) {
   const appArgs = args.filter((arg) => arg !== '--foreground');
   let command;
@@ -419,6 +516,7 @@ async function foreground(args) {
     if (!chosen) return 1;
     command = executable(join(APPS, chosen));
   }
+  installStarter();
   return await new Promise((resolve) => {
     const child = spawn(command, appArgs, { stdio: 'inherit' });
     const forward = (signal) => { if (child.exitCode === null) child.kill(signal); };
@@ -449,14 +547,20 @@ async function main() {
     return 0;
   }
   if (args[0] === 'runner') return runner(args.slice(1));
+  if (args[0] === 'starter') {
+    installStarter();
+    return 0;
+  }
   if (args.includes('--foreground')) return foreground(args);
   const pid = running();
   if (pid) {
+    installStarter();
     say(`CortexTerm is already running (pid ${pid})`);
     return 0;
   }
   const chosen = await ensureApp();
   if (!chosen) return 1;
+  installStarter();
   // Its own session, detached from this terminal: closing the terminal does not quit it.
   mkdirSync(join(HOME, 'logs'), { recursive: true });
   const log = openSync(START_LOG, 'a');

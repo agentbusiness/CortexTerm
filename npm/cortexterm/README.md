@@ -11,6 +11,11 @@ Later runs start the installed app at once; the app updates its frame and plugin
 runs on its own: you can close the terminal (its start output goes to `~/.cortexterm/logs/start.log`);
 running the command again while it runs only says so.
 
+Each start also puts a CortexTerm starter where the system keeps apps: `CortexTerm.app` in
+`/Applications` on macOS (`~/Applications` when that is not writable), a `cortexterm.desktop` entry in
+`~/.local/share/applications` on Linux. It starts the newest installed app, so after the first
+`npx cortexterm` you can start it from Launchpad, Spotlight or the app menu.
+
 Arguments go to the app: `npx cortexterm --headless`, `npx cortexterm --safe`.
 
 ## Background runner (macOS and Linux)
