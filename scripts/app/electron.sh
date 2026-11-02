@@ -16,6 +16,18 @@ electron_mac_branded() {
   ditto "$source_app" "$dst/dist/CortexTerm.app"
   local macos="$dst/dist/CortexTerm.app/Contents/MacOS"
   [ -f "$macos/Electron" ] && mv "$macos/Electron" "$macos/CortexTerm"
+  # The helpers too, so Activity Monitor shows "CortexTerm Helper (Renderer)", not "Electron Helper":
+  # Electron looks for "Electron Helper.app" first, then "<CFBundleName> Helper.app".
+  local frameworks="$dst/dist/CortexTerm.app/Contents/Frameworks" helper base name
+  for helper in "$frameworks"/Electron\ Helper*.app; do
+    [ -d "$helper" ] || continue
+    base="${helper##*/}"
+    base="${base%.app}"
+    name="CortexTerm${base#Electron}"
+    mv "$helper/Contents/MacOS/$base" "$helper/Contents/MacOS/$name"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleName $name" "$helper/Contents/Info.plist"
+    mv "$helper" "$frameworks/$name.app"
+  done
   local plist="$dst/dist/CortexTerm.app/Contents/Info.plist" key
   for key in CFBundleName CFBundleDisplayName CFBundleExecutable; do
     /usr/libexec/PlistBuddy -c "Set :$key CortexTerm" "$plist" 2>/dev/null || /usr/libexec/PlistBuddy -c "Add :$key string CortexTerm" "$plist"
