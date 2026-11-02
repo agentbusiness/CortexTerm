@@ -53,6 +53,8 @@ else
   scripts/build-app.sh build || exit 1
   [ "$build_only" = 0 ] || exit 0
 fi
+# The starter in /Applications (Linux: the app menu) starts this checkout.
+node npm/cortexterm/bin/cortexterm.mjs starter || true
 # The development start runs this build, never a frame an update staged in ~/.cortexterm/frame.
 export CORTEX_NO_HANDOVER=1
 exec "$app" "$@"
