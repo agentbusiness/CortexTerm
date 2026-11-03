@@ -17,7 +17,7 @@ pub struct Config {
     /// Borrow the model of another app on this Mac (a local member of the mesh) instead of
     /// loading Gemma, and yield Gemma when such an app asks.
     pub borrow: bool,
-    /// The llama-server binary (default: beside this executable).
+    /// The llama-server binary (default: `llama/llama-server` beside this executable).
     pub server_bin: Option<String>,
     /// Where models live (default `~/.cortex-models`, the folder every Cortex app shares).
     pub models_dir: Option<String>,

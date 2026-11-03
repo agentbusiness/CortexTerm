@@ -8,6 +8,7 @@ mod borrow;
 mod catalog;
 mod config;
 mod engine;
+mod gpu;
 mod local;
 mod progress;
 mod server;
@@ -92,6 +93,10 @@ async fn probe(engine: Arc<Engine>) -> ProbeReport {
             .map(|info| format!("borrowed {} from {}", info["model_id"].as_str().unwrap_or("?"), engine.lender_name().unwrap_or_else(|| "another app on this Mac".into())))
             .map_err(|e| e.message);
         return ProbeReport::from_checks(vec![check("model answers", started, outcome)]);
+    }
+    if engine.without_gpu() {
+        let detail = Ok("no GPU here: a member's model serves when one lends it".to_owned());
+        return ProbeReport::from_checks(vec![check("no local model", started, detail)]);
     }
     if !engine.installed() {
         engine.install_in_background();

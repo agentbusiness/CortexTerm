@@ -1,7 +1,7 @@
-//! Another app's model on this Mac, through the mesh (one model per machine): the apps on this
-//! machine are members of each other's mesh without pairing, and their cards show the model each
-//! one holds. `look` finds one this app accepts; `call` forwards a `model.*` call to it
-//! (`mesh.call`), stream items as the model produces them.
+//! Another app's model, through the mesh: on this machine (one model per machine: the apps here
+//! are members of each other's mesh without pairing), or, on a machine without a GPU, on any
+//! member. Cards show the model each member holds and lends. `look` finds one this app accepts;
+//! `call` forwards a `model.*` call to it (`mesh.call`), stream items as the model produces them.
 
 use cc_protocol::contracts::mesh::PeersResult;
 use cc_protocol::contracts::model::tags;
@@ -22,14 +22,15 @@ pub struct Lender {
 
 /// A model of another app on this Mac that this app accepts: a `coding` one always (Qwen ranks
 /// above this app's Gemma), an `office` one only while Gemma is not loaded here (two Gemmas
-/// would not both stay).
-pub async fn look(ctx: &Ctx, own_loaded: bool) -> Option<Lender> {
+/// would not both stay). `anywhere` (this machine has no GPU): a reachable member's on any
+/// machine, this machine's first.
+pub async fn look(ctx: &Ctx, own_loaded: bool, anywhere: bool) -> Option<Lender> {
     let peers = tokio::time::timeout(Duration::from_secs(3), ctx.call("mesh.peers", json!({}))).await.ok()?.ok()?;
     let peers: PeersResult = serde_json::from_value(peers).ok()?;
     let mut found: Vec<(usize, Lender)> = peers
         .peers
         .into_iter()
-        .filter(|peer| peer.member.local && peer.reachable)
+        .filter(|peer| (anywhere || peer.member.local) && peer.reachable)
         .filter_map(|peer| {
             let card = peer.card?;
             let software = card.software;
@@ -41,6 +42,7 @@ pub async fn look(ctx: &Ctx, own_loaded: bool) -> Option<Lender> {
             } else {
                 return None;
             };
+            let rank = if peer.member.local { rank } else { rank + 2 };
             Some((rank, Lender { node: peer.member.node, name: peer.member.name, software, model_id: model.model_id }))
         })
         .collect();

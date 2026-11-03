@@ -44,6 +44,9 @@ the mesh's files) takes the same change. A change to anything outside the standa
   CortexTerm accepts Gemma or Qwen; CortexCode needs Qwen. When CortexCode needs Qwen next to a running
   Gemma, the Gemma holder yields after its current turn.
 - Memory tiers: Gemma 4 E4B above 8 GB, Gemma 4 E2B on 8 GB Macs.
+- A model runs only on a GPU: Metal on macOS, CUDA or Vulkan on Linux. A machine without one loads no
+  model and lends none; it uses a member's model through the mesh. CortexCode on Linux needs 16 GB
+  of GPU memory for Qwen.
 - Every prompt, stage, schema, skill and tool text must work on both Gemma and Qwen. Try each change on
   both. CortexCode's lens applies: a small model follows the nearest strong cue at the moment it decides.
 - The model explains; it never decides whether a command runs. That decision is the risk engine's (code).

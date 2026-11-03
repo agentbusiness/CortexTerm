@@ -4,7 +4,7 @@
 [plugin]
 id = "system"
 name = "System"
-version = "0.1.27"
+version = "0.1.28"
 description = "The machine itself, read without sudo: CPU, memory, GPU, power, disk, network and thermal samples; processes grouped by app or as a tree, with their ports; signals for your own processes; per-process GPU; watchers that post the obvious (runaway CPU, memory climb, disk full, new open port, new launch item); SSH hosts and keys, read only; scheduled commands and the daily workstation security sweep."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
