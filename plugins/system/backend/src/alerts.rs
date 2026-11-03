@@ -147,6 +147,17 @@ impl AlertStore {
         }
     }
 
+    /// Close every open alert and forget when each fired, so what is still true fires again.
+    pub fn clear(&mut self) {
+        for stored in self.alerts.iter_mut().filter(|s| !s.alert.dismissed) {
+            stored.alert.dismissed = true;
+            let mut batch = Batch::new();
+            batch.unit().node("Alert", stored.alert.id.clone()).p("dismissed", true);
+            graph::put(batch);
+        }
+        self.last.clear();
+    }
+
     /// The alert's node (with its kind's) as it is now.
     fn write(&self, alert: &Alert, key: &str, quiet_until: Option<u64>, about: Option<GraphRef>) {
         let Some(machine) = graph::machine() else { return };

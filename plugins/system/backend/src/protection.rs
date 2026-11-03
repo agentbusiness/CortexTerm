@@ -869,6 +869,15 @@ impl Store {
         }
     }
 
+    /// Every open incident is dismissed (a clean plate before a sweep).
+    pub fn dismiss_all(&mut self) {
+        for incident in self.incidents.iter_mut().filter(|i| i.state == "open") {
+            incident.state = "dismissed".into();
+            incident.revision = incident.revision.saturating_add(1);
+            Self::save(incident, &self.about);
+        }
+    }
+
     pub fn action(&mut self, action: &ProtectionAction) -> Result<(), String> {
         if !self.loaded {
             return Err("Protection memory is still starting.".into());
