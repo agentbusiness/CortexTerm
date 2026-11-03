@@ -24,7 +24,7 @@
 use crate::{assess, threat};
 use crate::marks::ShellEnv;
 use crate::store::{self, Store};
-use cc_protocol::contracts::service::{self as svc, Caller, CommandEnded, CommandMatched, Job, NeedsApproval, Share, ShareList, SharedMethod};
+use cc_protocol::contracts::service::{self as svc, Audience, Caller, CommandEnded, CommandMatched, Job, NeedsApproval, Share, ShareList, SharedMethod};
 use cc_protocol::contracts::terminal::{CommandRunParams, Run, RunOutputParams, topics};
 use cc_protocol::{Ctx, ItemSink, RpcError, codes};
 use cc_sandbox_kit::sandbox::Policy;
@@ -854,6 +854,8 @@ pub fn shares() -> ShareList {
                 method("terminal.command.jobs.get", "One command's state, exit code, last lines and trace (kept as long as its Run); with size or at, what it did to the machine.", get),
                 method("terminal.command.output.read", "A command's output lines.", output),
             ],
+            // For apps: each app's model runs commands with that app's own `run` tool.
+            audience: Audience::Apps,
         }],
     }
 }

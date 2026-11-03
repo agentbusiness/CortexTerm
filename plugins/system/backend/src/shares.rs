@@ -2,7 +2,7 @@
 //! service, with a description and a params schema for every method, written for people and
 //! models alike. Members read them; the mesh lends only these.
 
-use cc_protocol::contracts::service::{Share, ShareList, SharedMethod};
+use cc_protocol::contracts::service::{Audience, Share, ShareList, SharedMethod};
 use serde_json::{Value, json};
 
 fn method(name: &str, description: &str, params: Value) -> SharedMethod {
@@ -61,6 +61,7 @@ pub fn shares() -> ShareList {
             method("system.trace.graph.get", "A trace's graph: its programs and the folders, hosts and ports they used.", id("The trace id.")),
             method("system.trace.delete", "Stop a trace if it records, and delete it.", id("The trace id.")),
         ],
+        audience: Audience::Models,
     };
     let create = schedule_fields();
     let mut edit = schedule_fields();
@@ -84,6 +85,7 @@ pub fn shares() -> ShareList {
             ),
             method("system.schedule.runs.read", "One run in the size asked for: line, summary, series or records (records with kinds [\"output\"] is its output).", read_params("The run's trace id.")),
         ],
+        audience: Audience::Models,
     };
     ShareList { shares: vec![trace, schedule] }
 }
