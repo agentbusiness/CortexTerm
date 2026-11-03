@@ -1186,6 +1186,14 @@ async fn dispatch(shared: Arc<Shared>, method: &str, params: Value) -> Result<Va
             to_value(&shared.marked(report))
         }
         methods::SWEEP_RUN => to_value(&shared.run_sweep().await),
+        methods::SWEEP_CLEAN => {
+            {
+                let _serial = shared.protection_actions.lock().await;
+                lock(&shared.alerts).clear();
+                lock(&shared.protection).dismiss_all();
+            }
+            to_value(&shared.run_sweep().await)
+        }
         methods::CHECK => to_value(&shared.check(parse_params(params)?).await?),
         methods::KEYS_SET => {
             let KeysSetParams { name, value } = parse_params(params)?;
@@ -1697,6 +1705,7 @@ fn main() {
             methods::ALERT_ACT,
             methods::SWEEP,
             methods::SWEEP_RUN,
+            methods::SWEEP_CLEAN,
             methods::FINDING_DECIDE,
             methods::FINDING_VERIFY,
             methods::SECURITY_HISTORY,
