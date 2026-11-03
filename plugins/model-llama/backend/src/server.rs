@@ -28,7 +28,7 @@ pub fn binary(config: &Config) -> Result<PathBuf, String> {
         return Ok(PathBuf::from(path));
     }
     let exe = std::env::current_exe().map_err(|e| format!("cannot find this executable: {e}"))?;
-    let path = exe.parent().map(|dir| dir.join("llama-server")).ok_or("the executable has no directory")?;
+    let path = exe.parent().map(|dir| dir.join("llama").join("llama-server")).ok_or("the executable has no directory")?;
     if path.is_file() { Ok(path) } else { Err(format!("llama-server is missing beside {}", exe.display())) }
 }
 
@@ -99,11 +99,13 @@ pub struct Launch<'a> {
     pub config: &'a Config,
     pub data_dir: PathBuf,
     pub kv_type: String,
+    /// The GPU's llama.cpp device (`gpu::Gpu::device`); the drafter follows it.
+    pub device: String,
 }
 
 impl Server {
     pub async fn start(launch: Launch<'_>) -> Result<Server, String> {
-        let Launch { spec, dir, config, data_dir, kv_type } = launch;
+        let Launch { spec, dir, config, data_dir, kv_type, device } = launch;
         let bin = binary(config)?;
         let port = free_port()?;
         let weights = dir.join(spec.weights.name);
@@ -114,6 +116,8 @@ impl Server {
             "draft-mtp".into(),
             "--spec-draft-model".into(),
             dir.join(spec.drafter.name).display().to_string(),
+            "--device".into(),
+            device,
             "-ngl".into(),
             "999".into(),
             "-c".into(),

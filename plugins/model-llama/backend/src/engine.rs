@@ -9,12 +9,15 @@
 //!   the mesh): new calls then wait for its model (up to two minutes) instead of loading Gemma.
 //! - No such app: Gemma is loaded on the first call that needs it (installing it first when
 //!   needed), unloaded after `idle_unload_s` without a request and at critical memory pressure.
+//! - No usable GPU (`gpu`): Gemma is never installed or loaded and nothing is lent; every call goes
+//!   to a reachable member's model, on this machine or another one.
 //!
 //! A watcher looks every 5 s.
 
 use crate::borrow::{self, Lender};
 use crate::catalog::{self, InstallProgress, Spec};
 use crate::config::Config;
+use crate::gpu::{self, Gpu};
 use crate::local;
 use crate::progress::{Publisher, Tracker};
 use crate::server::{Launch, Server};
@@ -64,6 +67,8 @@ pub struct Engine {
     models: PathBuf,
     publish: Publisher,
     memory: u64,
+    /// The GPU Gemma runs on; None: this machine runs no model of its own.
+    gpu: Option<Gpu>,
     variant: Mutex<&'static Spec>,
     /// The loaded llama-server. The lock is held while loading, so one load runs at a time.
     server: tokio::sync::Mutex<Option<Arc<Server>>>,
@@ -82,10 +87,24 @@ pub struct Engine {
     kv: Mutex<Option<(String, Option<(String, bool)>)>>,
 }
 
+#[cfg(target_os = "macos")]
 fn physical_memory() -> u64 {
     sysctl_u64(c"hw.memsize").unwrap_or(0)
 }
 
+#[cfg(not(target_os = "macos"))]
+fn physical_memory() -> u64 {
+    meminfo_kb("MemTotal:").unwrap_or(0) * 1024
+}
+
+/// A `/proc/meminfo` line's value in kB.
+#[cfg(not(target_os = "macos"))]
+fn meminfo_kb(key: &str) -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    text.lines().find_map(|line| line.strip_prefix(key)?.trim().strip_suffix("kB")?.trim().parse().ok())
+}
+
+#[cfg(target_os = "macos")]
 fn sysctl_u64(name: &std::ffi::CStr) -> Option<u64> {
     let mut value = 0u64;
     let mut length = std::mem::size_of::<u64>();
@@ -98,8 +117,18 @@ fn sysctl_u64(name: &std::ffi::CStr) -> Option<u64> {
 }
 
 /// `kern.memorystatus_vm_pressure_level` 4 = critical.
+#[cfg(target_os = "macos")]
 fn pressure_critical() -> bool {
     sysctl_u64(c"kern.memorystatus_vm_pressure_level") == Some(4)
+}
+
+/// Linux has no pressure level: critical when under 3% of memory is still available.
+#[cfg(not(target_os = "macos"))]
+fn pressure_critical() -> bool {
+    match (meminfo_kb("MemAvailable:"), meminfo_kb("MemTotal:")) {
+        (Some(available), Some(total)) => available * 100 < total * 3,
+        _ => false,
+    }
 }
 
 impl Engine {
@@ -115,7 +144,12 @@ impl Engine {
                 root
             }
         };
-        let memory = physical_memory();
+        let gpu = crate::server::binary(&config).ok().and_then(|bin| gpu::find(&bin));
+        // A Mac's GPU shares its memory; elsewhere the GPU's own memory decides the variant.
+        let memory = match &gpu {
+            Some(gpu) if gpu.backend != "metal" => gpu.memory_bytes,
+            _ => physical_memory(),
+        };
         // The chosen model (setting `model.variant`); the memory plugin is waited for a few seconds
         // at most, and when it answers later the choice applies if no model is loaded yet.
         let (selected, late) = match &ctx {
@@ -134,6 +168,7 @@ impl Engine {
             models,
             publish,
             memory,
+            gpu,
             variant: Mutex::new(variant),
             server: tokio::sync::Mutex::new(None),
             ctx,
@@ -219,13 +254,14 @@ impl Engine {
     async fn watch_once(self: &Arc<Self>) {
         let loaded = self.server.try_lock().ok().and_then(|slot| slot.clone());
         let lender = match (&self.ctx, self.config.borrow) {
-            (Some(ctx), true) => borrow::look(ctx, loaded.is_some()).await,
+            (Some(ctx), borrow) if borrow || self.gpu.is_none() => borrow::look(ctx, loaded.is_some(), self.gpu.is_none()).await,
             _ => None,
         };
         let was = self.borrowed();
         if was != lender {
             match &lender {
-                Some(lender) => tracing::info!(app = %lender.name, model = %lender.model_id, "another app's model runs on this Mac; borrowing it"),
+                Some(lender) => tracing::info!(app = %lender.name, model = %lender.model_id, "borrowing a member's model"),
+                None if self.gpu.is_none() => tracing::info!("no member lends a model now; this machine has no GPU to run one"),
                 None => tracing::info!("the model of the other app on this Mac is gone; Gemma loads on the next call that needs it"),
             }
             if lender.is_some() {
@@ -283,6 +319,9 @@ impl Engine {
             if let Some(lender) = self.borrowed() {
                 return Ok(Target::Borrowed(lender));
             }
+            if self.gpu.is_none() {
+                return Err(no_gpu());
+            }
             if !self.yield_pending() {
                 break;
             }
@@ -295,7 +334,7 @@ impl Engine {
     /// Gemma takes no new calls, in-flight ones finish, then it is unloaded; calls wait for that
     /// app's model. Answered once Gemma is out of memory.
     async fn yield_to(self: &Arc<Self>, to_tag: &str) -> YieldResult {
-        if to_tag == tags::OFFICE || !self.config.borrow {
+        if to_tag == tags::OFFICE || !self.config.borrow || self.gpu.is_none() {
             return YieldResult { yielded: false };
         }
         *self.yielded.lock().unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
@@ -339,7 +378,8 @@ impl Engine {
         let wanted = self.config.kv_type.clone();
         let known_bad = wanted != "f16" && self.kv_known(spec).await == Some((wanted.clone(), false));
         let kv = if wanted == "f16" || known_bad { "f16".to_owned() } else { wanted.clone() };
-        let launch = |kv_type: String| Launch { spec, dir: dir.clone(), config: &self.config, data_dir: self.data_dir.clone(), kv_type };
+        let device = self.gpu.as_ref().map(|gpu| gpu.device.clone()).ok_or_else(|| no_gpu().message)?;
+        let launch = |kv_type: String| Launch { spec, dir: dir.clone(), config: &self.config, data_dir: self.data_dir.clone(), kv_type, device: device.clone() };
         match Server::start(launch(kv.clone())).await {
             Ok(server) => {
                 if kv != "f16" {
@@ -357,6 +397,9 @@ impl Engine {
     }
 
     async fn ensure_installed(&self, spec: &'static Spec) -> Result<PathBuf, RpcError> {
+        if self.gpu.is_none() {
+            return Err(no_gpu());
+        }
         if catalog::installed(spec, &self.models) {
             return Ok(spec.dir(&self.models));
         }
@@ -395,6 +438,11 @@ impl Engine {
 
     pub fn install_progress(&self) -> Option<InstallProgress> {
         self.install.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// This machine runs no model of its own (no usable GPU).
+    pub fn without_gpu(&self) -> bool {
+        self.gpu.is_none()
     }
 
     pub fn is_borrowing(&self) -> bool {
@@ -439,7 +487,7 @@ impl Engine {
             slots: self.config.parallel,
             kv_type: server.map(|s| s.kv_type.clone()).unwrap_or_else(|| self.config.kv_type.clone()),
             speculative: "draft-mtp".into(),
-            backend: "metal".into(),
+            backend: self.gpu.as_ref().map_or("none", |gpu| gpu.backend).into(),
             tensor_api: None,
             engine_revision: ENGINE_REVISION.into(),
             extra,
@@ -466,11 +514,19 @@ impl Engine {
                 Err(error) => tracing::warn!(%error, "the other app's model.info failed; reporting the local model"),
             }
         }
+        // No model here: the mesh's card shows none, and nothing offers one.
+        if self.gpu.is_none() {
+            return Err(no_gpu());
+        }
         let server = self.server.try_lock().ok().and_then(|slot| slot.clone());
         to_value(&self.local_info(server.as_deref()))
     }
 
     fn variants(&self) -> VariantsResult {
+        // Without a GPU there is no model to choose.
+        if self.gpu.is_none() {
+            return VariantsResult { variants: Vec::new() };
+        }
         let active = self.spec().id;
         VariantsResult {
             variants: catalog::CATALOG
@@ -647,6 +703,10 @@ impl Engine {
             server.stop();
         }
     }
+}
+
+fn no_gpu() -> RpcError {
+    RpcError::new(codes::UNAVAILABLE, "this machine has no GPU to run a model (Metal, CUDA or Vulkan), and no member of the mesh lends one now").retryable()
 }
 
 /// The slots of a Gemma that is not loaded: all free.

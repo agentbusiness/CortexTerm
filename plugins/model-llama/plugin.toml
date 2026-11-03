@@ -3,20 +3,21 @@
 [plugin]
 id = "model-llama"
 name = "Model (Gemma on llama.cpp)"
-version = "0.1.6"
-description = "Gemma 4 (tag office) on upstream llama.cpp's llama-server with Metal and MTP drafts: E4B above 8 GB, E2B on 8 GB Macs. One model per machine: while another app on this Mac (CortexCode) offers a model through the mesh, calls are borrowed from it and Gemma stays unloaded; an app about to load another kind of model asks Gemma to yield (model.yield)."
+version = "0.1.7"
+description = "Gemma 4 (tag office) on upstream llama.cpp's llama-server with MTP drafts, on Metal on macOS and on the CPU on Linux: E4B above 8 GB, E2B on 8 GB machines. One model per machine: while another app on this machine (CortexCode) offers a model through the mesh, calls are borrowed from it and Gemma stays unloaded; an app about to load another kind of model asks Gemma to yield (model.yield)."
 license = "UNLICENSED"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
 # The logic plugin: a supervised process speaking CPP/1 to the frame. It supervises one llama-server
-# child (built from the vendored llama.cpp by build.sh, shipped beside the executable) on loopback.
+# child (built from the vendored llama.cpp by build.sh, shipped in llama/ beside the executable with
+# its GPU backends) on loopback.
 [backend]
 category = "model"
 contract = "model@1"
 dir = "backend"
 build = ["sh", "build.sh"]
 exec = "backend/target/release/cc-model-llama"
-assets = ["backend/target/release/llama-server"]
+assets = ["backend/target/release/llama"]
 swap = "drain_first"
 hello_timeout_ms = 60000
 # A first start may download the model (2.6 or 4.2 GB) before the probe's generation check.
