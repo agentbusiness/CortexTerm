@@ -1068,8 +1068,8 @@ impl Flow {
         Ok(())
     }
 
-    /// The shared services of this machine the model may look with: their read actions only, and
-    /// not the command service (its own `run` does that).
+    /// The shared services of this machine the model may look with: those their provider declares
+    /// for models (`Share::for_models`), their read actions only.
     async fn services(&self, query: &str) -> Vec<Share> {
         let Some(offered) = self.fact(mesh_methods::SERVICES, json!({})).await else { return Vec::new() };
         let mut out: Vec<Share> = Vec::new();
@@ -1078,7 +1078,7 @@ impl Flow {
                 continue;
             }
             let Ok(mut share) = serde_json::from_value::<Share>(offer["share"].clone()) else { continue };
-            if share.service == "terminal.command" || out.iter().any(|s| s.service == share.service) {
+            if !share.for_models() || out.iter().any(|s| s.service == share.service) {
                 continue;
             }
             share.methods.retain(|m| svc::access_of(&m.method) == Some(Access::Read));
