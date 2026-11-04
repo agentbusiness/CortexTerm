@@ -20,9 +20,10 @@ Its code was copied from CortexCode (`../CortexCode`) and reshaped. Both apps fo
 - the wire shape of every contract both apps have (`model@1`, `mesh@1`, `notify@1`, `skills@1`,
   `terminal@1`, `chatflow@1`);
 - the mesh: ALPNs, pairing, membership log, card, claims, lending, `mesh.link`, `mesh.session.start`;
-- model and resource sharing: model tags (`coding`, `office`), one model per machine, the yield
-  handshake, one models folder for every Cortex app (`~/.cortex-models`, `docs/SHARED-MODELS.md`;
-  `shared-models/`);
+- model and resource sharing: model tags (`coding`, `office`), every app keeps and lends its own
+  model (no second copy of one model on a computer; another app on this computer ranks after the
+  other computers), one models folder for every Cortex app (`~/.cortex-models`,
+  `docs/SHARED-MODELS.md`; `shared-models/`);
 - shared services (`protocol/src/contracts/service.rs`): the verbs and what each may do, the
   `<category>.shares` declaration, who a service is for (its `audience`: models, apps or peers),
   where a call may come from, the caller, run options, jobs and read sizes, and the
@@ -40,9 +41,8 @@ the mesh's files) takes the same change. A change to anything outside the standa
 
 ## Models
 
-- One model per machine. Before loading a model, look for a running one on this machine and borrow it.
-  CortexTerm accepts Gemma or Qwen; CortexCode needs Qwen. When CortexCode needs Qwen next to a running
-  Gemma, the Gemma holder yields after its current turn.
+- Every app keeps and lends its own model: CortexTerm runs Gemma next to CortexCode's Qwen, and
+  nobody asks another app to unload. CortexTerm accepts Gemma or Qwen for its calls; CortexCode needs Qwen.
 - Memory tiers: Gemma 4 E4B above 8 GB, Gemma 4 E2B on 8 GB Macs.
 - A model runs only on a GPU: Metal on macOS, CUDA or Vulkan on Linux. A machine without one loads no
   model and lends none; it uses a member's model through the mesh. CortexCode on Linux needs 16 GB
