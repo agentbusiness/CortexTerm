@@ -4,7 +4,7 @@
 id = "model-llama"
 name = "Model (Gemma on llama.cpp)"
 version = "0.1.8"
-description = "Gemma 4 (tag office) on upstream llama.cpp's llama-server with MTP drafts, on Metal on macOS and on the CPU on Linux: E4B above 8 GB, E2B on 8 GB machines. One model per machine: while another app on this machine (CortexCode) offers a model through the mesh, calls are borrowed from it and Gemma stays unloaded; an app about to load another kind of model asks Gemma to yield (model.yield)."
+description = "Gemma 4 (tag office) on upstream llama.cpp's llama-server with MTP drafts, on Metal on macOS and on the CPU on Linux: E4B above 8 GB, E2B on 8 GB machines. Gemma stays this app's own while other apps on the machine run theirs (each lends its own); only a machine without a usable GPU borrows a member's model."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
 
@@ -24,7 +24,7 @@ hello_timeout_ms = 60000
 probe_timeout_ms = 600000
 provides = [
   "model.info", "model.chat", "model.complete", "model.tokenize", "model.count", "model.slots",
-  "model.hibernate", "model.hold", "model.prewarm", "model.variants", "model.select", "model.yield",
+  "model.hibernate", "model.hold", "model.prewarm", "model.variants", "model.select",
 ]
 publishes = ["model.progress", "model.install"]
 
@@ -36,4 +36,3 @@ parallel = 2            # llama-server slots (the pool is ctx * parallel)
 ubatch = 256
 kv_type = "f16"         # "q8_0" only where flash attention works (checked once, falls back to f16)
 idle_unload_s = 600     # unload Gemma after this long without a request
-borrow = true           # borrow another app's model on this Mac (through the mesh) instead of loading Gemma

@@ -1,5 +1,6 @@
 //! `cc-model-llama`: CortexTerm's model plugin (`model@1`). Gemma 4 on a supervised upstream
-//! llama-server, or the model of another app on this Mac borrowed through the mesh (see `engine`).
+//! llama-server, or, on a machine without a usable GPU, a member's model borrowed through the mesh
+//! (see `engine`).
 //!
 //! Started by the frame. Without a frame, `cc-model-llama call <method> [<params json>]` serves one
 //! call (items on stdout, then the result; `CORTEX_HOME` and `CORTEX_PLUGIN_DATA` must be set).
@@ -37,7 +38,6 @@ const PROVIDES: &[&str] = &[
     methods::PREWARM,
     methods::VARIANTS,
     methods::SELECT,
-    methods::YIELD,
 ];
 
 #[derive(Default)]
@@ -90,7 +90,7 @@ async fn probe(engine: Arc<Engine>) -> ProbeReport {
     if engine.is_borrowing() {
         let info = engine.info().await;
         let outcome = info
-            .map(|info| format!("borrowed {} from {}", info["model_id"].as_str().unwrap_or("?"), engine.lender_name().unwrap_or_else(|| "another app on this Mac".into())))
+            .map(|info| format!("borrowed {} from {}", info["model_id"].as_str().unwrap_or("?"), engine.lender_name().unwrap_or_else(|| "a member".into())))
             .map_err(|e| e.message);
         return ProbeReport::from_checks(vec![check("model answers", started, outcome)]);
     }

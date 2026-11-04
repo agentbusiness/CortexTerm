@@ -14,9 +14,6 @@ pub struct Config {
     /// f16 | q8_0 (q8_0 needs flash attention; checked once, f16 otherwise).
     pub kv_type: String,
     pub idle_unload_s: u64,
-    /// Borrow the model of another app on this Mac (a local member of the mesh) instead of
-    /// loading Gemma, and yield Gemma when such an app asks.
-    pub borrow: bool,
     /// The llama-server binary (default: `llama/llama-server` beside this executable).
     pub server_bin: Option<String>,
     /// Where models live (default `~/.cortex-models`, the folder every Cortex app shares).
@@ -32,7 +29,6 @@ impl Default for Config {
             ubatch: 256,
             kv_type: "f16".into(),
             idle_unload_s: 600,
-            borrow: true,
             server_bin: None,
             models_dir: None,
         }
