@@ -5,7 +5,7 @@ edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.94"
 publish = false
-description = "CortexTerm model plugin (model@1): Gemma 4 on a supervised upstream llama-server, or the model of another app on this Mac borrowed through the mesh."
+description = "CortexTerm model plugin (model@1): Gemma 4 on a supervised upstream llama-server, or, on a machine without a usable GPU, a member's model borrowed through the mesh."
 
 # Own workspace: the plugin builds (and ships) on its own.
 [workspace]

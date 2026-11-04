@@ -1320,7 +1320,7 @@ impl Flow {
         for attempt in 0..32 {
             let request = serde_json::to_value(&*params).map_err(|error| RpcError::internal(error.to_string()))?;
             let count = tokio::select! {
-                // Counting can cold-load or wait for a yielded model. It is not a three-second
+                // Counting can cold-load a model. It is not a three-second
                 // machine fact; use the normal foreground wait, always cancellable.
                 result = tokio::time::timeout(Duration::from_secs(300), self.ctx()?.call("model.count", request)) => {
                     result.ok().and_then(Result::ok).and_then(|value| value["tokens"].as_u64())

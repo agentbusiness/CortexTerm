@@ -1,16 +1,11 @@
-//! Where each `model.*` call goes, and one model per machine.
+//! Where each `model.*` call goes.
 //!
-//! - Another app on this Mac (a local member of the mesh) holds a model this app accepts (Qwen,
-//!   tagged `coding`; or a Gemma while none is loaded here): every call that reaches this plugin
-//!   is forwarded to it through the mesh (borrowed), Gemma stays unloaded. The chat flow's own
-//!   calls are claimed through the mesh and routed there by the frame without passing here.
-//! - That app appears while Gemma is loaded: in-flight local calls finish, then llama-server is
-//!   stopped. The same when an app about to load a model of another tag asks (`model.yield`, from
-//!   the mesh): new calls then wait for its model (up to two minutes) instead of loading Gemma.
-//! - No such app: Gemma is loaded on the first call that needs it (installing it first when
-//!   needed), unloaded after `idle_unload_s` without a request and at critical memory pressure.
+//! - A usable GPU: Gemma is loaded on the first call that needs it (installing it first when
+//!   needed), unloaded after `idle_unload_s` without a request and at critical memory pressure. It
+//!   stays loaded while other apps on this machine run their own models: each app lends its own
+//!   (the cortex-network), and this one's is never given up for another's.
 //! - No usable GPU (`gpu`): Gemma is never installed or loaded and nothing is lent; every call goes
-//!   to a reachable member's model, on this machine or another one.
+//!   to a reachable member's model, on this machine or another one (borrowed).
 //!
 //! A watcher looks every 5 s.
 
@@ -23,8 +18,8 @@ use crate::progress::{Publisher, Tracker};
 use crate::server::{Launch, Server};
 use crate::store;
 use cc_protocol::contracts::model::{
-    ChatParams, CompleteParams, HoldParams, ModelInfo, PrewarmParams, SelectParams, SelectResult, SlotState, SlotsResult, TokenizeParams, Variant, VariantsResult, YieldParams,
-    YieldResult, methods, tags,
+    ChatParams, CompleteParams, HoldParams, ModelInfo, PrewarmParams, SelectParams, SelectResult, SlotState, SlotsResult, TokenizeParams, Variant, VariantsResult, methods,
+    tags,
 };
 use cc_protocol::{Ctx, ItemSink, RpcError, codes, parse_params, to_value};
 use serde_json::{Value, json};
@@ -35,8 +30,6 @@ use tokio_util::sync::CancellationToken;
 
 pub const ENGINE_REVISION: &str = "llama.cpp 468ad58 (unslothai b11876)";
 const WATCH_EVERY: Duration = Duration::from_secs(5);
-/// After a yield, how long calls wait for the asking app's model instead of loading Gemma.
-const BORROW_WAIT: Duration = Duration::from_secs(120);
 
 /// Where stream items go: the caller over CPP/1, or stdout (the `call` command).
 pub enum Sink {
@@ -74,10 +67,8 @@ pub struct Engine {
     server: tokio::sync::Mutex<Option<Arc<Server>>>,
     /// The frame (the mesh is reached through it); None for the `call` command.
     ctx: Option<Ctx>,
-    /// The app on this Mac whose model serves here now.
+    /// The member whose model serves here now (only on a machine without a usable GPU).
     borrowed: Mutex<Option<Lender>>,
-    /// When another app on this Mac asked Gemma to yield (its model is loading).
-    yielded: Mutex<Option<Instant>>,
     installing: tokio::sync::Mutex<()>,
     install: Arc<Mutex<Option<InstallProgress>>>,
     state: Mutex<&'static str>,
@@ -173,7 +164,6 @@ impl Engine {
             server: tokio::sync::Mutex::new(None),
             ctx,
             borrowed: Mutex::new(None),
-            yielded: Mutex::new(None),
             installing: tokio::sync::Mutex::new(()),
             install: Arc::new(Mutex::new(None)),
             state: Mutex::new("unloaded"),
@@ -246,38 +236,25 @@ impl Engine {
         self.borrowed.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
-    /// A yield asked within the last [`BORROW_WAIT`]: the asking app's model is still loading.
-    fn yield_pending(&self) -> bool {
-        self.yielded.lock().unwrap_or_else(|p| p.into_inner()).is_some_and(|at| at.elapsed() < BORROW_WAIT)
-    }
-
     async fn watch_once(self: &Arc<Self>) {
         let loaded = self.server.try_lock().ok().and_then(|slot| slot.clone());
-        let lender = match (&self.ctx, self.config.borrow) {
-            (Some(ctx), borrow) if borrow || self.gpu.is_none() => borrow::look(ctx, loaded.is_some(), self.gpu.is_none()).await,
+        // A machine with a GPU runs its own model; only one without borrows a member's.
+        let lender = match &self.ctx {
+            Some(ctx) if self.gpu.is_none() => borrow::look(ctx).await,
             _ => None,
         };
         let was = self.borrowed();
         if was != lender {
             match &lender {
                 Some(lender) => tracing::info!(app = %lender.name, model = %lender.model_id, "borrowing a member's model"),
-                None if self.gpu.is_none() => tracing::info!("no member lends a model now; this machine has no GPU to run one"),
-                None => tracing::info!("the model of the other app on this Mac is gone; Gemma loads on the next call that needs it"),
-            }
-            if lender.is_some() {
-                *self.yielded.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                None => tracing::info!("no member lends a model now; this machine has no GPU to run one"),
             }
             *self.borrowed.lock().unwrap_or_else(|p| p.into_inner()) = lender.clone();
             // The mesh's card follows (it shows no model while this one is borrowed).
             (self.publish)("model.state", json!({"state": if lender.is_some() { "borrowed" } else { self.state() }}));
         }
         let Some(server) = loaded else { return };
-        if lender.is_some() {
-            // Another app's model serves here: in-flight local calls finish, then Gemma is stopped.
-            let engine = self.clone();
-            drop(server);
-            tokio::spawn(async move { engine.unload("another app runs its model on this Mac", Duration::from_secs(600)).await });
-        } else if !server.alive() {
+        if !server.alive() {
             tracing::warn!("llama-server exited; it loads again on the next call");
             drop(server);
             *self.server.lock().await = None;
@@ -300,7 +277,7 @@ impl Engine {
     async fn unload(&self, reason: &str, wait: Duration) -> f64 {
         let started = Instant::now();
         let Some(server) = self.server.lock().await.take() else { return 0.0 };
-        self.set_state("yielding");
+        self.set_state("unloading");
         tracing::info!(reason, "unloading Gemma");
         while Arc::strong_count(&server) > 1 && started.elapsed() < wait {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -311,39 +288,17 @@ impl Engine {
         started.elapsed().as_secs_f64() * 1000.0
     }
 
-    /// Where a call goes now: another app's model on this Mac when there is one; after a yield,
-    /// wait for the asking app's model; otherwise the local Gemma (loaded now when needed).
+    /// Where a call goes now: a member's model on a machine without a usable GPU; otherwise the
+    /// local Gemma (loaded now when needed).
     async fn target(&self) -> Result<Target, RpcError> {
         *self.last_request.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
-        loop {
-            if let Some(lender) = self.borrowed() {
-                return Ok(Target::Borrowed(lender));
-            }
-            if self.gpu.is_none() {
-                return Err(no_gpu());
-            }
-            if !self.yield_pending() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+        if let Some(lender) = self.borrowed() {
+            return Ok(Target::Borrowed(lender));
+        }
+        if self.gpu.is_none() {
+            return Err(no_gpu());
         }
         self.local().await.map(Target::Local)
-    }
-
-    /// Another app on this Mac is about to load a model tagged `to_tag` (asked through the mesh):
-    /// Gemma takes no new calls, in-flight ones finish, then it is unloaded; calls wait for that
-    /// app's model. Answered once Gemma is out of memory.
-    async fn yield_to(self: &Arc<Self>, to_tag: &str) -> YieldResult {
-        if to_tag == tags::OFFICE || !self.config.borrow || self.gpu.is_none() {
-            return YieldResult { yielded: false };
-        }
-        *self.yielded.lock().unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
-        let loaded = self.server.lock().await.is_some();
-        if loaded {
-            self.unload(&format!("another app on this Mac loads a {to_tag} model"), Duration::from_secs(600)).await;
-        }
-        (self.publish)("model.state", json!({"state": "yielded"}));
-        YieldResult { yielded: loaded }
     }
 
     /// The loaded server, loading it (and installing the model) first when needed.
@@ -446,7 +401,7 @@ impl Engine {
     }
 
     pub fn is_borrowing(&self) -> bool {
-        self.borrowed().is_some() || self.yield_pending()
+        self.borrowed().is_some()
     }
 
     /// The app whose model serves here, by name.
@@ -624,10 +579,6 @@ impl Engine {
     pub async fn dispatch(self: &Arc<Self>, method: &str, params: Value, items: Option<&Sink>, cancel: CancellationToken) -> Result<Value, RpcError> {
         match method {
             methods::INFO => return self.info().await,
-            methods::YIELD => {
-                let params: YieldParams = parse_params(params)?;
-                return to_value(&self.yield_to(&params.to_tag).await);
-            }
             methods::VARIANTS => return to_value(&self.variants()),
             methods::SELECT => {
                 let params: SelectParams = parse_params(params)?;
