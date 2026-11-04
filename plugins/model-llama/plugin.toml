@@ -3,7 +3,7 @@
 [plugin]
 id = "model-llama"
 name = "Model (Gemma on llama.cpp)"
-version = "0.1.9"
+version = "0.1.11"
 description = "Gemma 4 (tag office) on upstream llama.cpp's llama-server with MTP drafts, on Metal on macOS and on the CPU on Linux: E4B above 8 GB, E2B on 8 GB machines. Gemma stays this app's own while other apps on the machine run theirs (each lends its own); only a machine without a usable GPU borrows a member's model."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
