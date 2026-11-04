@@ -671,6 +671,7 @@ fn idle_slots(parallel: u32) -> SlotsResult {
         pool_tokens: 0,
         reserved_tokens: 0,
         metrics: None,
+        loaded: false,
     }
 }
 

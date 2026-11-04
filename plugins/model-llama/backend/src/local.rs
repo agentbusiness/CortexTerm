@@ -389,6 +389,7 @@ pub async fn slots(server: &Server) -> Result<SlotsResult, RpcError> {
         pool_tokens: pool,
         reserved_tokens: 0,
         metrics: None,
+        loaded: true,
     })
 }
 
