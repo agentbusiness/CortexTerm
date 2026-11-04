@@ -1840,6 +1840,43 @@ private:
                 if (f_keep < 0.5f) {
                     update_cache = true;
                 }
+
+                // GlobalCortex patch (see PATCHES.md, from CortexCode patch 5): with recurrent,
+                // hybrid or SWA memory the common prefix is only reusable up to a context
+                // checkpoint (or within the small rollback window), so the kept fraction is what
+                // can actually be resumed, not the LCP. Upstream kept the slot whenever the LCP
+                // covered half of it (for example two conversations sharing a long tool block),
+                // then re-processed the new prompt from scratch and lost the old conversation
+                // instead of moving it to the prompt cache.
+                if (!update_cache && !ret->prompt.tokens.empty()) {
+                    const size_t n_slot = ret->prompt.tokens.size();
+                    const size_t lcp    = ret->prompt.tokens.get_common_prefix(task.tokens);
+                    size_t kept = 0;
+                    if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && n_swa == 0) {
+                        kept = lcp;
+                    } else if (lcp >= n_slot ||
+                               (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_slot - lcp <= llama_n_rs_seq(ctx_tgt))) {
+                        kept = lcp;
+                    } else {
+                        for (const auto & cp : ret->prompt.checkpoints) {
+                            if (cp.n_tokens >= 0 && (size_t) cp.n_tokens <= lcp) {
+                                kept = std::max(kept, (size_t) cp.n_tokens);
+                            }
+                        }
+                    }
+                    if ((float) kept / n_slot < 0.5f) {
+                        update_cache = true;
+                    }
+                }
+
+                // GlobalCortex patch (see PATCHES.md, from CortexCode patch 3): an empty slot
+                // pinned by id loads the best matching prompt from the host-RAM prompt cache.
+                // Upstream computes f_keep as 0/0 (NaN) for an empty slot, so the cache was never
+                // consulted and a conversation evicted to RAM was re-processed from scratch when
+                // it came back on another slot.
+                if (ret->prompt.tokens.empty()) {
+                    update_cache = true;
+                }
             }
         }
 
@@ -1901,6 +1938,14 @@ private:
 
             if (slot.prompt.n_tokens() > 0) {
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
+
+                // GlobalCortex patch (see PATCHES.md, from CortexCode patch 4): keep the purged
+                // conversation in the host-RAM prompt cache, so it resumes from there instead of
+                // being re-processed.
+                if (prompt_cache) {
+                    slot.prompt_save(*prompt_cache);
+                    prompt_cache->update();
+                }
 
                 slot.prompt_clear();
 
@@ -2677,11 +2722,21 @@ private:
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
+        // GlobalCortex patch: never the newest checkpoint of an earlier task. A caller that primes
+        // a shared history and then sends the call that extends it (and the next call extends the
+        // same history again) resumes exactly there; evicting it for being near an older
+        // checkpoint made every such call re-process up to min-step tokens.
+        int64_t newest_other = -1;
+        for (const auto & cp : slot.prompt.checkpoints) {
+            if (cp.id_task != id_task && cp.n_tokens > newest_other) {
+                newest_other = cp.n_tokens;
+            }
+        }
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin();
                 slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
                 it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+            if (it->id_task != id_task && it->n_tokens != newest_other && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 

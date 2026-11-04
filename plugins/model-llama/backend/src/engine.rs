@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-pub const ENGINE_REVISION: &str = "llama.cpp 468ad58 (unslothai b11876)";
+pub const ENGINE_REVISION: &str = "llama.cpp 468ad58 (unslothai b11876) + vendor/PATCHES.md";
 const WATCH_EVERY: Duration = Duration::from_secs(5);
 
 /// Where stream items go: the caller over CPP/1, or stdout (the `call` command).
@@ -437,7 +437,7 @@ impl Engine {
             tags: vec![tags::OFFICE.into()],
             quant: spec.quant.into(),
             file_bytes: spec.weights.bytes,
-            ctx_total: self.config.ctx * self.config.parallel,
+            ctx_total: self.config.ctx,
             ctx_native: server.map(|s| s.ctx_native).filter(|n| *n > 0).unwrap_or(131_072),
             slots: self.config.parallel,
             kv_type: server.map(|s| s.kv_type.clone()).unwrap_or_else(|| self.config.kv_type.clone()),
