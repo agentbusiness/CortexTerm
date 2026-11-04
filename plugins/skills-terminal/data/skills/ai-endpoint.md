@@ -2,7 +2,7 @@ Connect an application to an existing local or remote model endpoint without loa
 
 ## Inspect
 
-Use CortexTerm's supplied model-holder and service facts first. One model per machine: borrow the existing compatible holder through the supported sharing path. Do not start Ollama, llama.cpp or another runtime merely to answer a terminal question.
+Use CortexTerm's supplied model-holder and service facts first. Borrow an existing compatible model holder through the supported sharing path. Do not start Ollama, llama.cpp or another runtime merely to answer a terminal question.
 
 For the application being configured, establish API type, base URL, model name, authentication and target network. A container's localhost is itself. Query the endpoint's documented model or health route with a deadline if allowed; an OpenAI-compatible `/v1/models` route should be used only after compatibility is known. Never print API keys.
 
