@@ -18,6 +18,8 @@ pub struct Lender {
     /// The app (`cortexcode`), as the window shows it.
     pub software: String,
     pub model_id: String,
+    /// The model on the member's computer (its card's `plugin`), named on every call to it.
+    pub plugin: String,
 }
 
 /// A reachable member's model to serve here, for a machine without a usable GPU: a `coding` one
@@ -32,16 +34,19 @@ pub async fn look(ctx: &Ctx) -> Option<Lender> {
         .filter_map(|peer| {
             let card = peer.card?;
             let software = card.software;
-            let model = card.model?;
-            let rank = if model.tags.iter().any(|tag| tag == tags::CODING) {
-                0
-            } else if model.tags.iter().any(|tag| tag == tags::OFFICE) {
-                1
-            } else {
-                return None;
+            // The member's best model for this app: a `coding` one before an `office` one.
+            let ranked = |model: &cc_protocol::contracts::mesh::ModelCard| {
+                if model.tags.iter().any(|tag| tag == tags::CODING) {
+                    Some(0)
+                } else if model.tags.iter().any(|tag| tag == tags::OFFICE) {
+                    Some(1)
+                } else {
+                    None
+                }
             };
+            let (rank, model) = card.models.into_iter().filter_map(|model| ranked(&model).map(|rank| (rank, model))).min_by_key(|(rank, _)| *rank)?;
             let rank = if peer.member.local { rank } else { rank + 2 };
-            Some((rank, Lender { node: peer.member.node, name: peer.member.name, software, model_id: model.model_id }))
+            Some((rank, Lender { node: peer.member.node, name: peer.member.name, software, model_id: model.model_id, plugin: model.plugin }))
         })
         .collect();
     found.sort_by_key(|(rank, _)| *rank);
@@ -60,7 +65,10 @@ pub fn prefix_cache_key(params: &mut Value) {
 
 /// One call on the lender's model. Stream items go to `on_item` as they arrive; `cancel` cancels
 /// the call there.
-pub async fn call(ctx: &Ctx, lender: &Lender, method: &str, params: Value, on_item: &mut (dyn FnMut(Value) + Send), cancel: Option<CancellationToken>) -> Result<Value, RpcError> {
+pub async fn call(ctx: &Ctx, lender: &Lender, method: &str, mut params: Value, on_item: &mut (dyn FnMut(Value) + Send), cancel: Option<CancellationToken>) -> Result<Value, RpcError> {
+    if let Some(params) = params.as_object_mut() {
+        params.insert(cc_protocol::contracts::model::PLUGIN_PARAM.to_owned(), Value::String(lender.plugin.clone()));
+    }
     let mut stream = ctx.call_stream("mesh.call", json!({"node": lender.node, "method": method, "params": params}))?;
     let cancel = cancel.unwrap_or_default();
     loop {
