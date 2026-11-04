@@ -416,20 +416,33 @@ async function runner(args) {
 // checkout's ./cortexterm. Every start writes it again, only where it changed.
 const sh = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
 
+// The app starts detached (nohup ... &), so the starter ends at once: a starter that became the app's
+// process would only be activated by the next open, never run again. When the app already runs, the
+// starter brings its window forward (macOS: opening the frame's running Electron bundle activates it).
 function starterScript() {
   const lines = ['#!/bin/sh', `export PATH=${sh(process.env.PATH || '/usr/local/bin:/usr/bin:/bin')}`, `export CORTEX_HOME=${sh(HOME)}`];
   const log = sh(START_LOG);
-  lines.push(`mkdir -p ${sh(dirname(START_LOG))}`);
+  lines.push(
+    `pid="$(sed -n 's/.*"pid": *\\([0-9][0-9]*\\).*/\\1/p' ${sh(join(HOME, 'run', 'frame.json'))} 2>/dev/null)"`,
+    'if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then',
+  );
+  if (process.platform === 'darwin') {
+    lines.push(
+      `  shell="$(ps -axo ppid=,comm= | awk -v p="$pid" '$1 == p && /\\.app\\/Contents\\/MacOS\\// { sub(/^ *[0-9]+ +/, ""); sub(/\\/Contents\\/MacOS\\/.*/, ""); print; exit }')"`,
+      '  [ -n "$shell" ] && open "$shell"',
+    );
+  }
+  lines.push('  exit 0', 'fi', `mkdir -p ${sh(dirname(START_LOG))}`);
   if (DEV_ROOT) {
-    lines.push(`exec ${sh(join(DEV_ROOT, 'cortexterm'))} >>${log} 2>&1`);
+    lines.push(`nohup ${sh(join(DEV_ROOT, 'cortexterm'))} >>${log} 2>&1 </dev/null &`);
   } else {
     const app = process.platform === 'darwin' ? 'CortexTerm.app/Contents/MacOS/CortexTerm' : 'cortexterm/CortexTerm';
     lines.push(
       `apps=${sh(APPS)}`,
       'for v in $(ls "$apps" 2>/dev/null | grep -E \'^[0-9]+\\.[0-9]+\\.[0-9]+$\' | sort -t. -k1,1nr -k2,2nr -k3,3nr); do',
-      `  [ -f "$apps/$v/${READY}" ] && exec "$apps/$v/${app}" >>${log} 2>&1`,
+      `  if [ -f "$apps/$v/${READY}" ]; then nohup "$apps/$v/${app}" >>${log} 2>&1 </dev/null & exit 0; fi`,
       'done',
-      `exec npx --yes cortexterm >>${log} 2>&1`,
+      `nohup npx --yes cortexterm >>${log} 2>&1 </dev/null &`,
     );
   }
   return `${lines.join('\n')}\n`;
@@ -463,8 +476,15 @@ function writable(dir) {
 function installStarter() {
   try {
     if (process.platform === 'darwin') {
-      const folder = writable('/Applications') ? '/Applications' : join(homedir(), 'Applications');
-      const contents = join(folder, 'CortexTerm.app', 'Contents');
+      const bundles = ['/Applications', join(homedir(), 'Applications')].map((folder) => join(folder, 'CortexTerm.app'));
+      const starter = (bundle) => {
+        try { return readFileSync(join(bundle, 'Contents', 'Info.plist'), 'utf8').includes('ai.cortexterm.starter'); } catch { return false; }
+      };
+      // A CortexTerm.app that is not a starter (the disk image's app) is the user's own: leave it.
+      if (bundles.some((bundle) => existsSync(join(bundle, 'Contents', 'Info.plist')) && !starter(bundle))) return;
+      const bundle = bundles.find(starter) || (writable('/Applications') ? bundles[0] : bundles[1]);
+      const folder = dirname(bundle);
+      const contents = join(bundle, 'Contents');
       const icon = starterIcon('CortexTerm.icns');
       const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
