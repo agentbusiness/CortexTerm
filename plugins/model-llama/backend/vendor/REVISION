@@ -5,3 +5,5 @@ ggml tree 5053576b728b87a1d9f7e846ad7920e863882ba5
 Copied: CMakeLists.txt, LICENSE, cmake/, common/, ggml/, include/, src/, tools/, vendor/, licenses/,
 scripts/ui-assets.cmake, UNSLOTH_PREBUILT_INFO.json (provenance). Left out: prebuilt binaries, models,
 tests, examples, docs, Python tooling, the test folders under tools/.
+Patched as PATCHES.md (beside this file) says; tools/server/server-context.cpp is the same file in
+the other Cortex engines' vendored llama.cpp.

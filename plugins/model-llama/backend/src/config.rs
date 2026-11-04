@@ -7,9 +7,11 @@ use serde::Deserialize;
 pub struct Config {
     /// "" = by memory (`catalog::for_memory`).
     pub variant: String,
-    /// Context tokens per slot.
+    /// Context tokens of the one KV pool every slot shares (`--kv-unified`): any request may use
+    /// all of it.
     pub ctx: u32,
     pub parallel: u32,
+    /// Prompt tokens read per step (`-ub`; the logical batch `-b` is at least 2048).
     pub ubatch: u32,
     /// f16 | q8_0 (q8_0 needs flash attention; checked once, f16 otherwise).
     pub kv_type: String,
@@ -24,9 +26,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             variant: String::new(),
-            ctx: 8192,
+            ctx: 32768,
             parallel: 2,
-            ubatch: 256,
+            ubatch: 2048,
             kv_type: "f16".into(),
             idle_unload_s: 600,
             server_bin: None,

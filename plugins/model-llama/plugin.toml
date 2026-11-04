@@ -31,8 +31,10 @@ publishes = ["model.progress", "model.install"]
 # Defaults for the frame config's [plugin.config] table (the frame config's values win).
 [backend.config]
 variant = ""            # "" = by memory: gemma-4-e4b-qat above 8 GiB, gemma-4-e2b-qat otherwise
-ctx = 8192              # context tokens per slot
-parallel = 2            # llama-server slots (the pool is ctx * parallel)
-ubatch = 256
+# ctx, parallel and ubatch are the shared office-model settings (see vendor/PATCHES.md): an office model
+# answers the same whichever app lends it.
+ctx = 32768             # context tokens of the one KV pool the slots share (any request may use all of it)
+parallel = 2            # llama-server slots
+ubatch = 2048           # prompt tokens read per step
 kv_type = "f16"         # "q8_0" only where flash attention works (checked once, falls back to f16)
 idle_unload_s = 600     # unload Gemma after this long without a request

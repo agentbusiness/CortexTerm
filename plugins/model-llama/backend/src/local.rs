@@ -379,7 +379,8 @@ pub async fn slots(server: &Server) -> Result<SlotsResult, RpcError> {
         })
         .unwrap_or_default();
     let busy = slots.iter().filter(|slot| slot.busy).count() as u32;
-    let pool: u64 = list.as_array().map(|l| l.iter().map(|s| s["n_ctx"].as_u64().unwrap_or(0)).sum()).unwrap_or(0);
+    // One KV pool every slot shares (`--kv-unified`): each slot reports the whole pool.
+    let pool: u64 = list.as_array().and_then(|l| l.iter().filter_map(|s| s["n_ctx"].as_u64()).max()).unwrap_or(0);
     Ok(SlotsResult {
         slots,
         queued: 0,
