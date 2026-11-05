@@ -1256,6 +1256,7 @@ async fn dispatch(shared: Arc<Shared>, method: &str, params: Value) -> Result<Va
             let s = shared.clone();
             to_value(&tokio::task::spawn_blocking(move || s.ssh.hosts()).await.map_err(|e| RpcError::internal(e.to_string()))?)
         }
+        methods::ADDRESSES => to_value(&ssh::addresses()),
         methods::SSH_KEYS => {
             let s = shared.clone();
             to_value(&tokio::task::spawn_blocking(move || s.ssh.keys()).await.map_err(|e| RpcError::internal(e.to_string()))?)
@@ -1717,6 +1718,7 @@ fn main() {
             methods::MEMORY_CHANGES,
             methods::SSH_HOSTS,
             methods::SSH_KEYS,
+            methods::ADDRESSES,
             methods::SHARES,
             methods::SCHEDULE_LIST,
             methods::SCHEDULE_GET,
@@ -1748,6 +1750,7 @@ fn main() {
             methods::MEMORY_CHANGES,
             methods::SSH_HOSTS,
             methods::SSH_KEYS,
+            methods::ADDRESSES,
             methods::SCHEDULE_LIST,
             methods::SCHEDULE_GET,
             methods::SCHEDULE_RUNS_LIST,
