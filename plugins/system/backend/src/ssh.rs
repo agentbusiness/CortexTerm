@@ -4,7 +4,7 @@
 //! material is never read into the output.
 
 use crate::util::{home, run, run_env, which};
-use cc_protocol::contracts::system::{SshHost, SshHosts, SshKey, SshKeys};
+use cc_protocol::contracts::system::{Addresses, SshHost, SshHosts, SshKey, SshKeys};
 use std::collections::HashMap;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt;
@@ -537,4 +537,18 @@ fn grade(key: &mut SshKey, open: bool) {
         key.notes.push("other users can read it (chmod 600)".into());
     }
     key.health = if bad { "bad" } else if weak { "weak" } else { "good" }.into();
+}
+
+/// This machine's host name and interface addresses: what an `ssh` to it would name.
+pub fn addresses() -> Addresses {
+    let mut name = [0u8; 256];
+    // gethostname writes at most `len` bytes into the buffer it is given.
+    let hostname = if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) } == 0 {
+        let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+        String::from_utf8_lossy(&name[..end]).into_owned()
+    } else {
+        String::new()
+    };
+    let addresses = crate::protection_sensors::local_addresses().iter().map(|ip| ip.to_string()).collect();
+    Addresses { hostname, addresses }
 }

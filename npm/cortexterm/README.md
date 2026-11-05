@@ -23,7 +23,10 @@ Arguments go to the app: `npx cortexterm --headless`, `npx cortexterm --safe`.
 ```sh
 npx cortexterm runner
 npx cortexterm runner join <invitation>
+npx cortexterm runner allow <computer>
 ```
+
+After joining, `runner allow <computer>` lets that computer of your network work here (shells, metrics, alerts); a runner has no Settings window for that switch.
 
 The runner keeps terminal execution, metrics, monitoring, memory, mesh and updates running in the background. It never downloads or loads a local chat model; AI uses an available model in the mesh. Shell commands execute on this machine and work without AI.
 

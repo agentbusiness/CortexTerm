@@ -10,6 +10,7 @@ mod time;
 use crate::procs::Snapshot;
 use cc_protocol::contracts::system::{ProtectionConfig, ProtectionSensor, SecurityObservation};
 pub use endpoint::{deep_install_command, open_installer, service_installed};
+pub(crate) use packet::local_addresses;
 use endpoint::service_capture;
 use std::collections::HashMap;
 

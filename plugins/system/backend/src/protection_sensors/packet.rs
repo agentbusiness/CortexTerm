@@ -495,7 +495,7 @@ fn endpoint(text: &str) -> Option<(IpAddr, u16)> {
     Some((address.parse().ok()?, port.parse().ok()?))
 }
 
-fn local_addresses() -> BTreeSet<IpAddr> {
+pub(crate) fn local_addresses() -> BTreeSet<IpAddr> {
     let mut addresses = BTreeSet::new();
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
     // getifaddrs allocates the list; all pointers are read only while it is live, and family

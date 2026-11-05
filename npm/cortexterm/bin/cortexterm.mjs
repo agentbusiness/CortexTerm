@@ -6,7 +6,8 @@
 // on its own: closing the terminal does not quit it (its start output goes to ~/.cortexterm/logs/start.log).
 // Arguments go to the app (`--headless`, `--safe`). `npx cortexterm runner` keeps it running without
 // a local chat model: launchd on macOS, systemd on Linux (boot and SSH logout). `runner join <invitation>`
-// joins the mesh, `runner off` stops it. Development uses the same installer via ./cortexterm runner.
+// joins the mesh, `runner allow <computer>` lets a member work here (shells, metrics), `runner off`
+// stops it. Development uses the same installer via ./cortexterm runner.
 // Every desktop start also puts a CortexTerm starter in /Applications (Linux: the app menu).
 
 import { spawn } from 'node:child_process';
@@ -343,6 +344,22 @@ async function runner(args) {
     if (!code) throw new Error('runner join <invitation>: use the invitation from Settings > Mesh on another computer');
     const member = await frameCall('mesh.pair.join', { code });
     say(`joined the network as ${member.name}`);
+    say('to work on this computer from another one: npx cortexterm runner allow <its name>');
+    return 0;
+  }
+  if (what === 'allow') {
+    // A runner has no Settings window: this is Settings > Mesh's "may work here" switch.
+    const wanted = rest.join(' ').trim();
+    if (!wanted) throw new Error('runner allow <computer>: the name of a computer in your network');
+    const { members } = await frameCall('mesh.members', {});
+    const status = await frameCall('mesh.status', {});
+    const others = members.filter((member) => member.node !== status.node);
+    // Mac names carry a curly apostrophe (Sam’s Mac); a typed straight one names the same computer.
+    const plain = (text) => text.replace(/[\u2018\u2019]/g, "'").toLowerCase();
+    const named = others.filter((member) => plain(member.name) === plain(wanted) || member.node.startsWith(wanted));
+    if (!named.length) throw new Error(`no computer named ${wanted} in the network; members: ${others.map((member) => member.name).join(', ') || 'none'}`);
+    for (const member of named) await frameCall('mesh.allow', { node: member.node, allowed: true });
+    say(`${named[0].name} may now work on this computer`);
     return 0;
   }
   if (!['darwin', 'linux'].includes(process.platform)) throw new Error('the runner supports macOS and Linux');
@@ -366,7 +383,7 @@ async function runner(args) {
     say('the runner is off; existing terminal shells are preserved');
     return 0;
   }
-  if (what) throw new Error(`unknown runner command ${what}; use runner, runner join <invitation>, or runner off`);
+  if (what) throw new Error(`unknown runner command ${what}; use runner, runner join <invitation>, runner allow <computer>, or runner off`);
   if (running()) {
     // Do not take over a desktop or another checkout sharing this home.
     throw new Error('CortexTerm already runs for this home; stop it before installing the runner');
@@ -561,6 +578,7 @@ async function main() {
       'npx cortexterm [--headless] [--safe]   start CortexTerm; the first run downloads it into ~/.cortexterm/app',
       'npx cortexterm runner                  model-free background service (macOS login / Linux boot)',
       'npx cortexterm runner join <invitation>  join this computer to your network (the invitation from Settings > Mesh)',
+      'npx cortexterm runner allow <computer>  let that computer work here: shells, metrics, alerts',
       'npx cortexterm runner off              stop the runner',
       '',
     ].join('\n'));

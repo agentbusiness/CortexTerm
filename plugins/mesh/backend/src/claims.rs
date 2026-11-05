@@ -43,6 +43,14 @@ use tokio_util::sync::CancellationToken;
 /// not claim (a project description, a prewarm).
 const LOOK_AGAIN: Duration = Duration::from_millis(500);
 
+/// How long a member has to answer a claim that does not wait: it answers at once, granted or
+/// not, and loads nothing to answer. A member that lets this pass is not answering on its
+/// connection (seen: an ingest stood still for good at the first claim, asking a member that never
+/// answered while a free model waited on this computer): the claim goes on to the next model, and
+/// the connection is closed so the dial loop connects to the member again. A claim waiting in a
+/// member's line is not bounded; its answer comes when it is that call's turn.
+const MEMBER_ANSWER: Duration = Duration::from_secs(10);
+
 /// Who uses this computer's models now, and who waits for them; each use and wait names its
 /// model (`plugin`), and each model has its own slots and its own line.
 #[derive(Default)]
@@ -356,7 +364,21 @@ impl Mesh {
             return self.lend("", session, plugin, since, foreground, wait, cancel).await;
         }
         let params = json!({"session_id": session, "plugin": plugin, "tag": tag, "since_ms": since, "wait": wait});
-        let answer = self.call_member(node, "mesh.model.claim", params, None, cancel).await;
+        let call = self.call_member(node, "mesh.model.claim", params, None, cancel);
+        let answer = if wait {
+            call.await
+        } else {
+            match tokio::time::timeout(MEMBER_ANSWER, call).await {
+                Ok(answer) => answer,
+                Err(_) => {
+                    tracing::info!(node = %&node[..node.len().min(10)], "a member did not answer a claim; its connection is closed and dialled again");
+                    if let Some(connection) = self.connection(node) {
+                        connection.close(6u32.into(), b"no answer");
+                    }
+                    return false;
+                }
+            }
+        };
         answer.ok().and_then(|value| value.get("granted").and_then(Value::as_bool)).unwrap_or(false)
     }
 

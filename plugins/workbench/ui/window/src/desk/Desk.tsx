@@ -38,6 +38,26 @@ type Client = ReturnType<typeof runtime>['client'];
 
 const clientOf = (node?: string | null) => runtimeFor(node).client;
 
+/** ssh options that take a value. */
+const SSH_VALUED = 'BbcDEeFIiJLlmOoPpQRSWw';
+
+/** The host of a plain `ssh [options] [user@]host` login (no remote command), else null. */
+function sshLogin(command: string): string | null {
+  const [program, ...rest] = command.trim().split(/\s+/);
+  if (program !== 'ssh') return null;
+  const left: string[] = [];
+  for (let skip = false, i = 0; i < rest.length; i++) {
+    const word = rest[i] ?? '';
+    if (skip) skip = false;
+    else if (word.startsWith('-')) skip = word.length === 2 && SSH_VALUED.includes(word[1] ?? '');
+    else left.push(word);
+  }
+  // A word after the host is a remote command: that is not a login.
+  if (left.length !== 1) return null;
+  const target = (left[0] ?? '').replace(/^ssh:\/\//, '').replace(/^[^@]*@/, '').replace(/:\d+$/, '').replace(/^\[(.*)\]$/, '$1');
+  return target || null;
+}
+
 /** The home place's project on a computer's frame: its first project, else one opened at `~`. */
 async function homeProject(client: Client): Promise<{ id: string; root: string }> {
   const projects = await client.call<{ projects: { id: string; root: string }[] }>('frame.project.list', {});
@@ -141,6 +161,27 @@ export function Desk() {
     const timer = setInterval(readComputers, 10_000);
     return () => { off(); clearInterval(timer); };
   }, [readComputers, client]);
+  /** The joined computer an ssh target names: by its name, or by its host name or an address it reports. */
+  const addressBook = useRef(new Map<string, { hostname: string; addresses: string[] }>());
+  const computerFor = useCallback(async (target: string): Promise<Computer | undefined> => {
+    const reachable = computers.filter((computer) => computer.reachable);
+    if (!reachable.length) return undefined;
+    const names = new Set([target.toLowerCase()]);
+    const hosts = await client.call<{ hosts: { alias: string; hostname: string }[] }>('system.ssh.hosts', {}).catch(() => null);
+    const alias = hosts?.hosts.find((entry) => entry.alias === target);
+    if (alias?.hostname) names.add(alias.hostname.toLowerCase());
+    const named = (name: string) => [...names].some((wanted) => wanted === name.toLowerCase() || wanted.split('.')[0] === name.toLowerCase().split('.')[0]);
+    for (const computer of reachable) {
+      if (named(computer.name)) return computer;
+      let known = addressBook.current.get(computer.node);
+      if (!known) {
+        known = await clientOf(computer.node).call<{ hostname: string; addresses: string[] }>('system.addresses', {}, { signal: AbortSignal.timeout(4000) }).catch(() => undefined);
+        if (known) addressBook.current.set(computer.node, known);
+      }
+      if (known && ((known.hostname && named(known.hostname)) || known.addresses.some((address) => names.has(address.toLowerCase())))) return computer;
+    }
+    return undefined;
+  }, [computers, client]);
   const nameOf = (node?: string) => (node ? computers.find((computer) => computer.node === node)?.name ?? 'another computer' : undefined);
 
   // --- boot: the home place, a Desk, live shells for every terminal pane ------------------------
@@ -305,7 +346,18 @@ export function Desk() {
     void clientOf(node).call('terminal.write', { term_id: termId, data }).catch((cause) => host.notify(`Not sent: ${errorMessage(cause)}`));
   }, [host, nodeOfTerm]);
 
+  /** `ssh` to a joined computer opens a shell on it (blocks and the AI) instead of a raw login. */
+  const sshToComputer = useCallback(async (command: string) => {
+    const target = sshLogin(command);
+    const computer = target ? await computerFor(target) : undefined;
+    if (!computer) return false;
+    await openTerm(undefined, 'stage', 'shell', computer.node);
+    host.notify(`${computer.name} is a joined computer: its shell opened here, with blocks and the AI.`);
+    return true;
+  }, [computerFor, openTerm, host]);
+
   const onShell = useCallback(async (command: string, how: 'here' | 'pane' | 'background' | 'watch') => {
+    if ((how === 'here' || how === 'pane') && await sshToComputer(command).catch(() => false)) return;
     if (how === 'here' && focusedTerm?.termId && desk) {
       // Nothing waits: a busy shell hands the command to a helper shell in the same folder, whose
       // card joins this stream; the helper closes once its command is done.
@@ -329,7 +381,7 @@ export function Desk() {
     // The new shell needs a moment to show its prompt.
     setTimeout(() => runIn(pane.termId!, command, node), 700);
     if (how === 'background' || how === 'watch') host.notify(how === 'watch' ? `Watching \`${command}\`: you'll be told when it ends.` : `\`${command}\` runs on the Shelf.`);
-  }, [focusedTerm, openTerm, runIn, host, desk, client, home, update]);
+  }, [focusedTerm, openTerm, runIn, host, desk, client, home, update, sshToComputer]);
 
   useEffect(() => live.onFinished((run, node) => {
     if (helpers.current.has(run.term_id)) {
@@ -417,10 +469,12 @@ export function Desk() {
     void onAsk(text, intent, runId, { node: sideNode }).catch((cause) => host.notify(errorMessage(cause)));
   }, [onAsk, sideNode, host]);
   const onSideShell = useCallback((command: string) => {
-    void openTerm(undefined, 'stage', command.split(/\s+/)[0] || 'shell', sideNode).then((pane) => {
+    void (async () => {
+      if (await sshToComputer(command).catch(() => false)) return;
+      const pane = await openTerm(undefined, 'stage', command.split(/\s+/)[0] || 'shell', sideNode);
       if (pane.termId) setTimeout(() => runIn(pane.termId!, command, sideNode), 700);
-    }).catch((cause) => host.notify(`No shell on ${selectedComputer.name}: ${errorMessage(cause)}`));
-  }, [openTerm, runIn, sideNode, selectedComputer.name, host]);
+    })().catch((cause) => host.notify(`No shell on ${selectedComputer.name}: ${errorMessage(cause)}`));
+  }, [openTerm, runIn, sideNode, selectedComputer.name, host, sshToComputer]);
 
   /** A command offered for a computer: on that computer's Line, never run until the person does. */
   const commandOn = useCallback((node: string | undefined, command: string) => {

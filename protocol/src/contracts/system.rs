@@ -237,6 +237,9 @@ pub mod methods {
     pub const SSH_HOSTS: &str = "system.ssh.hosts";
     /// `{}` -> [`super::SshKeys`]: the keys in `~/.ssh` and in the running agent, with hygiene notes.
     pub const SSH_KEYS: &str = "system.ssh.keys";
+    /// `{}` -> [`super::Addresses`]: this machine's host name and interface addresses, so an
+    /// `ssh` target can be recognised as a joined computer.
+    pub const ADDRESSES: &str = "system.addresses";
     /// `{}` -> [`crate::contracts::service::ShareList`]: the services this plugin shares with the
     /// other apps on this machine and the mesh (`system.trace`, `system.schedule`).
     pub const SHARES: &str = "system.shares";
@@ -1074,6 +1077,13 @@ pub struct SshHosts {
     pub agent: String,
     #[serde(default)]
     pub agent_socket: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Addresses {
+    pub hostname: String,
+    /// The up, non-loopback interface addresses.
+    pub addresses: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
