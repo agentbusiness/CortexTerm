@@ -198,8 +198,8 @@ pub mod methods {
     pub const SWEEP: &str = "system.sweep";
     /// `{}` -> [`super::SweepReport`]: run the sweep now.
     pub const SWEEP_RUN: &str = "system.sweep.run";
-    /// `{}` -> [`super::SweepReport`]: close every open alert and incident, then run the sweep:
-    /// what is still true comes back. Decisions are kept.
+    /// `{}` -> `{ok}`: remove every alert, incident and finding (the last sweep with them), so the
+    /// next sweep starts from nothing and only what is still true comes back. Decisions are kept.
     pub const SWEEP_CLEAN: &str = "system.sweep.clean";
     /// [`super::DecideParams`] -> [`super::SweepReport`]: decide about a group of findings, or
     /// take the decision back. Kept in the graph across sweeps and restarts.

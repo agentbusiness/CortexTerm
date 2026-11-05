@@ -4,7 +4,7 @@
 [plugin]
 id = "cleanup"
 name = "Cleanup"
-version = "0.1.3"
+version = "0.1.4"
 description = "Disk space you can get back: build output, caches, AI agents' leftovers, temporary files, forgotten folders and large duplicates, with what is in use left alone. Clean, keep or postpone each find, or let the local model plan it; every find and decision is kept in the graph."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

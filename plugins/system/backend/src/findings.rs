@@ -60,7 +60,7 @@ impl Store {
         if last.is_none() {
             last = Self::move_sweeps().await?;
         }
-        let rows = graph::query_all("MATCH (f:SweepFinding) RETURN f.key, f.state, f.kind, f.text, f.tried, f.raised, f.severity, f.fix, f.source, f.group ORDER BY f.key", json!({})).await?;
+        let rows = graph::query_all("MATCH (f:SweepFinding) WHERE f.ended_ms IS NULL RETURN f.key, f.state, f.kind, f.text, f.tried, f.raised, f.severity, f.fix, f.source, f.group ORDER BY f.key", json!({})).await?;
         let found: Vec<String> = last.as_ref().map(|sweep| graph::texts(&sweep["findings"])).unwrap_or_default();
         if let Some(sweep) = &last {
             store.last = SweepReport {
@@ -252,6 +252,18 @@ impl Store {
         graph::put(batch);
         self.states.insert(key, ("ignored".into(), wire.to_owned()));
         Ok(())
+    }
+
+    /// Forget every finding (the last sweep, first-seen states, tried fixes, raises); the
+    /// person's decisions stay.
+    pub fn clear(&mut self) {
+        let gone: Vec<_> = self.states.drain().map(|(key, _)| r("SweepFinding", key)).collect();
+        if !gone.is_empty() {
+            graph::retire(gone, "cleared");
+        }
+        self.tried.clear();
+        self.raised.clear();
+        self.last = SweepReport::default();
     }
 
     /// The model's second look raised these findings (report key, what it looks like).
