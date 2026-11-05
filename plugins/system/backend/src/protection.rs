@@ -675,11 +675,20 @@ impl Store {
             })
             .unwrap_or_else(|| event.subject.clone());
         // At most one incident per exact entity in a 30-minute episode. An IP identifies the
-        // observed source/destination only, never the person controlling it.
+        // observed source/destination only, never the person controlling it. A step of a chain
+        // can come later: within a day, the file one observation touched is the program another
+        // ran (downloaded, then started; started, then made to start at login).
         let index = self
             .incidents
             .iter()
-            .rposition(|i| i.key == key && i.last_at.abs_diff(event.at) < 1_800_000);
+            .rposition(|i| i.key == key && i.last_at.abs_diff(event.at) < 1_800_000)
+            .or_else(|| {
+                self.incidents.iter().rposition(|i| {
+                    !i.key.starts_with("group:")
+                        && i.last_at.abs_diff(event.at) < DAY
+                        && i.observations.iter().any(|e| same_file(e, &event))
+                })
+            });
         if index.is_none() && rank(&event.severity) == 0 {
             if self.context.len() >= MAX_QUEUE {
                 self.context.pop_front();
@@ -756,23 +765,10 @@ impl Store {
             incident.severity = normal_severity(&event.severity).into();
             incident.title = event.summary.chars().take(220).collect();
         }
-        // A credential observation plus actual outbound network evidence from the same exact
-        // process/observed lineage is suspicious. It proves neither secret contents nor theft.
-        let credential = incident
-            .observations
-            .iter()
-            .any(|e| matches!(e.kind.as_str(), "credential_access" | "credential"));
-        let network = incident
-            .observations
-            .iter()
-            .any(|e| e.kind == "outbound" && e.remote.is_some());
-        let persistence = incident
-            .observations
-            .iter()
-            .any(|e| matches!(e.kind.as_str(), "persistence" | "persistence_write"));
-        if credential && (network || persistence) {
-            incident.severity = "high".into();
-            incident.title = "Credential access and related network or startup activity; review the recorded evidence.".into();
+        // Live activity is rated as an attack chain: one step alone is watched, two steps of one
+        // process tree or one file are an attack. A sweep group keeps its findings' rating.
+        if !incident.key.starts_with("group:") {
+            rate_chain(incident);
         }
         if new_evidence
             && (rank(&incident.severity) > previous_rank
@@ -869,13 +865,14 @@ impl Store {
         }
     }
 
-    /// Every open incident is dismissed (a clean plate before a sweep).
-    pub fn dismiss_all(&mut self) {
-        for incident in self.incidents.iter_mut().filter(|i| i.state == "open") {
-            incident.state = "dismissed".into();
-            incident.revision = incident.revision.saturating_add(1);
-            Self::save(incident, &self.about);
+    /// Every incident is removed, open or dismissed (a clean plate before a sweep).
+    pub fn clear(&mut self) {
+        let gone: Vec<GraphRef> = self.incidents.drain(..).map(|incident| graph::r("ProtectionIncident", &incident.id)).collect();
+        if !gone.is_empty() {
+            graph::retire(gone, "cleared");
         }
+        self.notified.clear();
+        self.lineage.clear();
     }
 
     pub fn action(&mut self, action: &ProtectionAction) -> Result<(), String> {
@@ -1073,6 +1070,75 @@ pub fn validate_config(config: &ProtectionConfig) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The steps of an attack, in the order one goes.
+const STEPS: [&str; 5] = ["got in", "ran", "set itself to start", "reached passwords or files", "sent data out"];
+
+/// The step an observation is evidence of, if any. A plain process start is a step only when the
+/// program it ran is a file the incident already flagged.
+fn step(e: &SecurityObservation, all: &[SecurityObservation]) -> Option<usize> {
+    let rule = e.rule.as_str();
+    match e.kind.as_str() {
+        "malware" | "intrusion" | "network_alert" | "port_scan" | "network_sweep" => Some(0),
+        "process_exec" | "execution" | "exec" => e
+            .executable
+            .as_ref()
+            .filter(|exe| all.iter().any(|o| o.path.as_ref() == Some(*exe) && o.kind != e.kind))
+            .map(|_| 1),
+        "persistence" | "persistence_write" => Some(2),
+        "credential_access" | "credential" | "archive_created" | "bulk_file_change" => Some(3),
+        "outbound" if e.remote.is_some() => Some(4),
+        "network" if matches!(rule, "network:upload" | "network:drop" | "network:telegram" | "network:threat" | "network:beacon") => Some(4),
+        _ => None,
+    }
+}
+
+/// One observation that is an attack on its own: a malware match rated high; a connection to a
+/// known command server, a stealer's drop or Telegram from a program that is not Telegram; an
+/// unsigned or unapproved program online from a temporary or download folder.
+fn certain(e: &SecurityObservation) -> bool {
+    (e.kind == "malware" || matches!(e.rule.as_str(), "network:threat" | "network:drop" | "network:telegram" | "network:unsigned")) && rank(&e.severity) == 3
+}
+
+/// The file one observation touched is the program the other ran.
+fn same_file(a: &SecurityObservation, b: &SecurityObservation) -> bool {
+    let crossed = |x: &SecurityObservation, y: &SecurityObservation| x.path.is_some() && x.path == y.executable;
+    crossed(a, b) || crossed(b, a)
+}
+
+/// Every program the observations name is signed by Apple or a named developer: an app updating
+/// itself writes its start item and goes online, which is two steps but no attack.
+fn vouched(all: &[SecurityObservation]) -> bool {
+    let programs: std::collections::BTreeSet<&str> = all.iter().filter_map(|e| e.executable.as_deref()).collect();
+    !programs.is_empty()
+        && programs.iter().all(|exe| {
+            let sig = crate::codesign::check(std::path::Path::new(exe));
+            sig.status == "signed" && (sig.apple || !sig.team_id.is_empty())
+        })
+}
+
+/// Two or more steps of one process tree or one file, by a program nothing vouches for, are an
+/// attack (high, titled as the chain); one step alone, however it was rated, is watched (low),
+/// unless it is [`certain`].
+fn rate_chain(incident: &mut SecurityIncident) {
+    let all = &incident.observations;
+    let steps: std::collections::BTreeSet<usize> = all.iter().filter_map(|e| step(e, all)).collect();
+    let worst = all.iter().map(|e| rank(&e.severity)).max().unwrap_or(0);
+    if steps.len() >= 2 && !vouched(all) {
+        let who = all
+            .iter()
+            .find_map(|e| e.executable.as_deref().or(e.path.as_deref()))
+            .and_then(|p| p.rsplit('/').next())
+            .unwrap_or("A program");
+        let chain: Vec<&str> = steps.iter().map(|i| STEPS[*i]).collect();
+        incident.severity = "high".into();
+        incident.title = format!("{who}: {}. Each step is linked by its process or file; review the evidence.", chain.join(" → "));
+    } else if all.iter().any(certain) {
+        incident.severity = "high".into();
+    } else {
+        incident.severity = normal_severity(if worst >= 1 { "low" } else { "info" }).into();
+    }
 }
 
 pub fn rank(value: &str) -> u8 {

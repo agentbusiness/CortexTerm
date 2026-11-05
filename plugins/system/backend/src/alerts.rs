@@ -52,7 +52,7 @@ impl AlertStore {
     pub async fn load() -> Result<AlertStore, String> {
         let mut store = AlertStore { loaded: true, ..Default::default() };
         let rows = graph::query_all(
-            "MATCH (a:Alert) WHERE a.at >= $since RETURN a.key, a.kind, a.severity, a.text, a.at, a.subject, a.pid, a.port, a.path, a.actions, a.dismissed, a.quiet_until ORDER BY a.at",
+            "MATCH (a:Alert) WHERE a.at >= $since AND a.ended_ms IS NULL RETURN a.key, a.kind, a.severity, a.text, a.at, a.subject, a.pid, a.port, a.path, a.actions, a.dismissed, a.quiet_until ORDER BY a.at",
             json!({"since": now_ms().saturating_sub(WEEK)}),
         )
         .await?;
@@ -147,13 +147,11 @@ impl AlertStore {
         }
     }
 
-    /// Close every open alert and forget when each fired, so what is still true fires again.
+    /// Remove every alert and forget when each fired, so what is still true fires again.
     pub fn clear(&mut self) {
-        for stored in self.alerts.iter_mut().filter(|s| !s.alert.dismissed) {
-            stored.alert.dismissed = true;
-            let mut batch = Batch::new();
-            batch.unit().node("Alert", stored.alert.id.clone()).p("dismissed", true);
-            graph::put(batch);
+        let gone: Vec<GraphRef> = self.alerts.drain(..).map(|stored| graph::r("Alert", stored.alert.id)).collect();
+        if !gone.is_empty() {
+            graph::retire(gone, "cleared");
         }
         self.last.clear();
     }

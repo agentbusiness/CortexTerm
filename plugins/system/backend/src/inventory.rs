@@ -1528,7 +1528,7 @@ pub async fn checks(scope: Scope, discovery: crate::filesystem::Shared) -> Part 
         when(scope.updates, apps_section(&client, &feeds, &local)),
         when(scope.updates, limited("macOS and Safari patch level", 30, os_section(&client, &feeds, &local))),
         when(scope.updates, eol_section(&client, &local)),
-        when(scope.deps, deps_section(&client, &feeds, &local)),
+        when(scope.deps, deps_section(&client, &local)),
         when(scope.apps, async { tokio::task::spawn_blocking(docker_checks).await.unwrap_or_default() }),
     );
     for each in [apps, os, eol, deps, docker] {
@@ -1945,9 +1945,9 @@ async fn eol_section(client: &reqwest::Client, local: &Local) -> Part {
     part
 }
 
-/// Project lockfiles and venvs in OSV, one finding per project. Severity from the advisories;
-/// a CVE on CISA's exploited list, or a malicious-package record, makes it high.
-async fn deps_section(client: &reqwest::Client, feeds: &Feeds, local: &Local) -> Part {
+/// Project lockfiles and venvs in OSV: a malicious-package record alerts per project; every other
+/// known vulnerability is one noted line for all projects.
+async fn deps_section(client: &reqwest::Client, local: &Local) -> Part {
     let mut part = Part::default();
     let all: Vec<&(&str, String, String)> = local.projects.iter().flat_map(|p| &p.packages).collect::<BTreeSet<_>>().into_iter().collect();
     if all.is_empty() {
@@ -1977,9 +1977,8 @@ async fn deps_section(client: &reqwest::Client, feeds: &Feeds, local: &Local) ->
         }
     }
     part.checked.push(format!("project dependencies in OSV ({} packages)", all.len()));
-    // Details of up to 200 advisories, 20 at a time: severity, CVE aliases, and whether it is
-    // only a notice (an unmaintained crate) or withdrawn, which is left out.
-    let mut details: HashMap<String, (String, bool)> = HashMap::new();
+    // Up to 200 advisories, 20 at a time: one that is only a notice (an unmaintained crate) or
+    // withdrawn is left out.
     let mut notices: HashSet<String> = HashSet::new();
     let wanted: Vec<String> = vulns.values().flatten().cloned().collect::<BTreeSet<_>>().into_iter().take(200).collect();
     for chunk in wanted.chunks(20) {
@@ -1995,61 +1994,51 @@ async fn deps_section(client: &reqwest::Client, feeds: &Feeds, local: &Local) ->
             let Ok(Some((id, vuln))) = done else { continue };
             if vuln["withdrawn"].is_string() || matches!(vuln["affected"][0]["database_specific"]["informational"].as_str(), Some("unmaintained" | "notice")) {
                 notices.insert(id);
-                continue;
             }
-            let label = vuln["database_specific"]["severity"].as_str().or_else(|| vuln["affected"][0]["ecosystem_specific"]["severity"].as_str());
-            let kev = vuln["aliases"].as_array().into_iter().flatten().filter_map(Value::as_str).any(|a| feeds.kev.contains(a)) || feeds.kev.contains(&id);
-            details.insert(id, (label.map(severity_of).unwrap_or("medium").to_owned(), kev));
         }
     }
     for ids in vulns.values_mut() {
         ids.retain(|id| !notices.contains(id));
     }
     vulns.retain(|_, ids| !ids.is_empty());
-    let rank = |s: &str| match s {
-        "high" => 0,
-        "medium" => 1,
-        "low" => 2,
-        _ => 3,
-    };
+    // A project's dependencies are the person's work, not this Mac: an outdated library in a repo
+    // or a cache is noted once for all of them. A known malicious package is different: installing
+    // it ran its code here, so each project that has one alerts.
+    let mut outdated: Vec<(String, usize)> = Vec::new();
     for project in &local.projects {
         let hits: Vec<(&(&str, String, String), &Vec<String>)> = project.packages.iter().filter_map(|p| vulns.get_key_value(p).map(|(k, v)| (*k, v))).collect();
         if hits.is_empty() {
             continue;
         }
-        let ids: BTreeSet<&String> = hits.iter().flat_map(|(_, ids)| ids.iter()).collect();
-        let malicious = ids.iter().any(|id| id.starts_with("MAL-"));
-        let exploited = ids.iter().any(|id| details.get(*id).is_some_and(|d| d.1));
-        let worst = ids.iter().filter_map(|id| details.get(*id).map(|d| d.0.as_str())).min_by_key(|s| rank(s)).unwrap_or("medium");
-        let severity = if malicious || exploited { "high" } else { worst };
-        let packages: Vec<String> = hits.iter().map(|((eco, name, version), _)| format!("{name} {version} ({eco})")).collect();
-        let id_list: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
-        let ecosystems: BTreeSet<&str> = hits.iter().map(|((eco, _, _), _)| *eco).collect();
         let shown = tilde(&project.root);
-        let fix = match ecosystems.iter().next() {
-            Some(&"npm") if ecosystems.len() == 1 => Some(format!("cd {shown} && npm audit fix")),
-            Some(&"crates.io") if ecosystems.len() == 1 => Some(format!("cd {shown} && cargo update")),
-            _ => None,
-        };
+        let bad: Vec<String> = hits.iter().filter(|(_, ids)| ids.iter().any(|id| id.starts_with("MAL-"))).map(|((eco, name, version), _)| format!("{name} {version} ({eco})")).collect();
+        if bad.is_empty() {
+            outdated.push((shown, hits.len()));
+            continue;
+        }
         part.add(
-            severity,
+            "high",
             "vuln",
-            format!(
-                "{shown}: {} with {}{}{}: {} ({}).",
-                plural(packages.len(), "dependency", "dependencies"),
-                plural(id_list.len(), "known vulnerability", "known vulnerabilities"),
-                if malicious { ", including a known malicious package" } else { "" },
-                if exploited { ", one is being exploited (CISA KEV)" } else { "" },
-                names(&packages, 5),
-                names(&id_list, 3)
-            ),
-            fix,
+            format!("{shown} has {} known to be malicious: {}. Installing it ran its code on this Mac.", plural(bad.len(), "package", "packages"), names(&bad, 5)),
+            None,
             "osv",
         );
-        match hits.as_slice() {
-            [((eco, name, _), _)] => part.about("Package", format!("{eco}:{name}")),
-            _ => part.about("Repo", project.root.display().to_string()),
-        }
+        part.about("Repo", project.root.display().to_string());
+    }
+    if !outdated.is_empty() {
+        outdated.sort_by(|a, b| b.1.cmp(&a.1));
+        let shown: Vec<String> = outdated.iter().map(|(root, n)| format!("{root} ({n})")).collect();
+        part.add(
+            "info",
+            "vuln",
+            format!(
+                "{} use dependencies with known vulnerabilities: {}. They belong to your work, not to this Mac; update them in each project when you work on it.",
+                plural(outdated.len(), "project or package cache", "projects and package caches"),
+                names(&shown, 3)
+            ),
+            None,
+            "osv",
+        );
     }
     part
 }

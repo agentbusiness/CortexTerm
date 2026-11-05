@@ -361,11 +361,17 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
   };
 
   // `clean` closes every open alert and incident first, so only what is still true comes back.
+  // `clean` first removes every alert, incident and finding: the list empties at once, and only
+  // what the sweep still finds comes back.
   const runSweep = async (clean = false) => {
     setSweeping(true); setActionProblem(null);
     try {
-      const next = await client.call<SweepReport>(clean ? 'system.sweep.clean' : 'system.sweep.run', {});
-      if (mounted.current) { setReport(next); void loadSlow(); void refresh(); if (clean) void machineAlerts.reload(); }
+      if (clean) {
+        await client.call('system.sweep.clean', {});
+        if (mounted.current) { setReport(null); setSelected(''); void refresh(); void machineAlerts.reload(); }
+      }
+      const next = await client.call<SweepReport>('system.sweep.run', {});
+      if (mounted.current) { setReport(next); void loadSlow(); void refresh(); void machineAlerts.reload(); }
     }
     catch (cause) { if (mounted.current) setActionProblem(errorMessage(cause)); }
     finally { if (mounted.current) setSweeping(false); }
@@ -405,7 +411,7 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
       {urgent > 0 && <span className="ct-label ct-warn">{urgent} NEED{urgent === 1 ? 'S' : ''} YOU</span>}
       <span className="ct-label ct-faint">{loading && !status ? 'LOADING…' : `${openCount} OPEN`}</span>
       <span className="grow" />
-      <button type="button" className="detent sm" disabled={sweeping} title="Closes every open alert and incident, then sweeps: what is still true comes back. Your decisions are kept." onClick={() => void runSweep(true)}>CLEAN &amp; SWEEP</button>
+      <button type="button" className="detent sm" disabled={sweeping} title="Removes every alert, incident and finding, then sweeps: only what is still true comes back. Your decisions are kept." onClick={() => void runSweep(true)}>CLEAN &amp; SWEEP</button>
       <button type="button" className="detent sm" disabled={sweeping} title={report?.at ? `Last sweep ${ago(report.at)}` : 'The daily sweep has not run yet'} onClick={() => void runSweep()}>{sweeping ? 'SWEEPING…' : 'SWEEP NOW'}</button>
     </header>
     {questions.length > 0 && <nav className="ct-sec-ask" aria-label="Ask the assistant">
