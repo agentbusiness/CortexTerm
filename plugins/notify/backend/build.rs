@@ -24,7 +24,9 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=SDKROOT");
     match build() {
-        Ok(path) => println!("cargo:rustc-env=CC_NOTIFY_HELPER_BUILD=built:{}", path.display()),
+        // The app's name only, not its folder: a released binary names no folder of the build
+        // computer (the app is found beside the executable first; see native::locate_helper).
+        Ok(path) => println!("cargo:rustc-env=CC_NOTIFY_HELPER_BUILD=built:{}", path.file_name().map_or(path.display().to_string(), |name| name.to_string_lossy().into_owned())),
         Err(reason) => {
             // Elsewhere there is no app to build: only a macOS build without it is worth a warning.
             if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
