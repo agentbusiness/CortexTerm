@@ -20,6 +20,8 @@
 #                                    their data folders make ~/.cortexterm/live
 # Contents/Resources/ui/             the Electron shell and Electron (as CortexTerm.app)
 set -euo pipefail
+# Built files name no folder of this computer (scripts/build-env.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/build-env.sh"
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 live=0
