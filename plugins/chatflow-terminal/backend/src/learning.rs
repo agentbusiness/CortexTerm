@@ -5,7 +5,7 @@
 use crate::{context, flow::Flow, replay, security};
 use cc_protocol::contracts::frame::{JournalEntry, JournalReadResult, SessionListResult, kinds};
 use cc_protocol::contracts::memory::{KnowledgeItem, KnowledgeListResult, KnowledgeSearchResult, StreamReadResult, methods as memory};
-use cc_protocol::contracts::model::{ChatMessage, ChatParams, ChatResult, Priority, Sampling, Thinking, tags};
+use cc_protocol::contracts::model::{ChatMessage, ChatParams, ChatResult, CountResult, Priority, Sampling, Thinking, methods as model_methods, tags};
 use cc_protocol::contracts::{mesh::methods as mesh, now_ms};
 use cc_protocol::{RpcError, codes, parse_params};
 use serde::{Deserialize, Serialize};
@@ -991,8 +991,14 @@ pub async fn background(flow: &Flow, purpose: &str, messages: Vec<ChatMessage>, 
     check_cancel(cancel)?;
     let key = format!("ct-learning-{purpose}-{}", uuid::Uuid::new_v4());
     let ctx = flow.ctx()?;
+    // The prompt's size in tokens (the messages this call sends, no tools), so the claim books the
+    // shares of the model's context pool it needs; 0 when the count fails (unknown).
+    let tokens = match ctx.call(model_methods::COUNT, json!({"messages": messages, "tools": []})).await.and_then(parse_params::<CountResult>) {
+        Ok(counted) => counted.tokens,
+        Err(_) => 0,
+    };
     let claimed = async {
-        let mut claim = ctx.call_stream(mesh::CLAIM, json!({"kind": "model", "tags": [tags::CODING, tags::OFFICE, tags::SMALL_OFFICE], "session_id": key, "foreground": false, "wait": true}))?;
+        let mut claim = ctx.call_stream(mesh::CLAIM, json!({"kind": "model", "tags": [tags::CODING, tags::OFFICE, tags::SMALL_OFFICE], "session_id": key, "foreground": false, "wait": true, "tokens": tokens}))?;
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => { claim.cancel(); return Err(RpcError::cancelled()); },

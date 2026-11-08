@@ -9,7 +9,7 @@ use cc_protocol::contracts::chatflow::{FlowState, RunningResult, TurnResult};
 use cc_protocol::contracts::frame::kinds;
 use cc_protocol::contracts::terminal::{Run, topics};
 use cc_protocol::contracts::mesh::methods as mesh_methods;
-use cc_protocol::contracts::model::{ChatDelta, ChatMessage, ChatParams, ChatResult, Priority, Sampling, Thinking, ToolCall, ToolSpec, tags};
+use cc_protocol::contracts::model::{ChatDelta, ChatMessage, ChatParams, ChatResult, CountResult, Priority, Sampling, Thinking, ToolCall, ToolSpec, methods as model_methods, tags};
 use cc_protocol::contracts::service::{self as svc, Access, Share};
 use cc_protocol::contracts::skills::{self, Description, SkillInfo, SkillResult};
 use cc_protocol::{Ctx, PluginEnv, RpcError, codes, parse_params};
@@ -429,10 +429,16 @@ impl Flow {
     /// One use of the best model on the mesh for the turn's call (`mesh.claim`, as CortexCode's
     /// chat flow does): Qwen (`coding`) before Gemma (`office`), on this Mac first; the frame then
     /// routes the session's model calls there. It waits while that model is busy. Without the mesh
-    /// plugin the call runs on this app's model plugin.
-    async fn claim(&self, session: &str, cancel: &CancellationToken) -> Result<(), RpcError> {
+    /// plugin the call runs on this app's model plugin. The claim states the prompt's size in
+    /// tokens (`messages` and `tools` as the call sends them), so it books the shares of the
+    /// model's context pool the call needs; 0 when the count fails (unknown).
+    async fn claim(&self, session: &str, messages: &[ChatMessage], tools: &[ToolSpec], cancel: &CancellationToken) -> Result<(), RpcError> {
         let ctx = self.ctx()?;
-        let params = json!({"kind": "model", "tags": [tags::CODING, tags::OFFICE, tags::SMALL_OFFICE], "session_id": session, "foreground": true, "wait": true});
+        let tokens = match ctx.call(model_methods::COUNT, json!({"messages": messages, "tools": tools})).await.and_then(parse_params::<CountResult>) {
+            Ok(counted) => counted.tokens,
+            Err(_) => 0,
+        };
+        let params = json!({"kind": "model", "tags": [tags::CODING, tags::OFFICE, tags::SMALL_OFFICE], "session_id": session, "foreground": true, "wait": true, "tokens": tokens});
         let Ok(mut call) = ctx.call_stream(mesh_methods::CLAIM, params) else { return Ok(()) };
         loop {
             tokio::select! {
@@ -521,18 +527,9 @@ impl Flow {
             "shown": recalled.shown, "facts": facts, "project_context": recalled.project_context, "host_message": false, "text": ""
         })).await?;
 
-        self.phase(session, seq, "waiting for a free model").await;
-        self.claim(session, cancel).await?;
         // The model looks things up with `run` (read-only checks, run here) and answers; a command in
-        // its answer is the person's to run, whatever it does.
-        let mut step = 0;
-        let mut lookups = 0;
-        let mut config_calls = 0;
-        let mut recalls = 0;
-        let mut output_reads = 0;
-        let mut rounds = 0;
-        let mut seen: HashMap<String, String> = HashMap::new();
-        let wants_command = intent == "fix" || (input.continuing.is_none() && asks_for_command(&input.text));
+        // its answer is the person's to run, whatever it does. The tools are built before the claim,
+        // which states the size of the prompt they are part of.
         let services = self.services(&selection_query).await;
         let mut tools = vec![run_tool(), recall::tool()];
         if input.term_id.is_some() { tools.push(crate::evidence::tool()); }
@@ -546,6 +543,16 @@ impl Flow {
             let (name, description, parameters) = svc::tool_of(share);
             ToolSpec { name, description, parameters }
         }));
+        self.phase(session, seq, "waiting for a free model").await;
+        self.claim(session, &messages, &tools, cancel).await?;
+        let mut step = 0;
+        let mut lookups = 0;
+        let mut config_calls = 0;
+        let mut recalls = 0;
+        let mut output_reads = 0;
+        let mut rounds = 0;
+        let mut seen: HashMap<String, String> = HashMap::new();
+        let wants_command = intent == "fix" || (input.continuing.is_none() && asks_for_command(&input.text));
         let mut last_request;
         loop {
             let available: Vec<ToolSpec> = tools.iter().filter(|tool| {
@@ -860,7 +867,7 @@ impl Flow {
         self.journal(session, kinds::NOTE, json!({"purpose": learning::CONTEXT, "run_id": run_id,
             "cwd": cwd, "failure": recalled.failure, "shown": recalled.shown, "facts": evidence.text(),
             "host_message": false, "text": ""})).await?;
-        self.claim(session, cancel).await?;
+        self.claim(session, &messages, &[], cancel).await?;
         let seq = self.journal(session, kinds::ASSISTANT_MESSAGE, json!({"text": "", "streaming": true, "run_id": run_id})).await?;
         let params = ChatParams {
             messages,

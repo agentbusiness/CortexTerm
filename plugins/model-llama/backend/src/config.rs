@@ -7,8 +7,9 @@ use serde::Deserialize;
 pub struct Config {
     /// "" = by memory (`catalog::for_memory`).
     pub variant: String,
-    /// Context tokens of the one KV pool every slot shares (`--kv-unified`): any request may use
-    /// all of it.
+    /// Context tokens of the one KV pool every slot shares (`--kv-unified`): one 32k share per
+    /// slot (`parallel` × 32768); a call books the shares it needs through the mesh claim and may
+    /// use several of them.
     pub ctx: u32,
     pub parallel: u32,
     /// Prompt tokens read per step (`-ub`; the logical batch `-b` is at least 2048).
@@ -26,7 +27,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             variant: String::new(),
-            ctx: 32768,
+            ctx: 65536,
             parallel: 2,
             ubatch: 2048,
             kv_type: "f16".into(),
