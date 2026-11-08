@@ -3,7 +3,7 @@
 [plugin]
 id = "chatflow-terminal"
 name = "Terminal flow"
-version = "0.1.28"
+version = "0.1.29"
 description = "Terminal assistance with compact task-skill selection, bounded read-only checks, configuration previews and user-run proposals, with graph-backed learning and recall."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

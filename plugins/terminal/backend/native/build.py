@@ -75,6 +75,13 @@ with (source / "src" / "lib_vt.zig").open("a") as output:
     output.write('\ncomptime { if (@import("terminal_options").c_abi) {\n'
                  '    @export(&@import("cortex_terminal.zig").read, .{ .name = "cortex_terminal_read" });\n'
                  '} }\n')
+# Ghostty's own file host does not answer on every network, so the packages this library needs come
+# from where they are published. Zig checks each against the manifest's hash, whichever server answers.
+for manifest in source.rglob("build.zig.zon"):
+    text = manifest.read_text()
+    for origin, published in PIN["packages"].items():
+        text = text.replace(origin, published)
+    manifest.write_text(text)
 prefix = work / "install"
 cache = work / "global-cache"
 native_environment = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=str(cache), ZIG_LOCAL_CACHE_DIR=str(work / "local-cache"))

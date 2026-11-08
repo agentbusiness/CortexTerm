@@ -7,7 +7,7 @@
 [plugin]
 id = "skills-terminal"
 name = "Terminal skills"
-version = "0.1.10"
+version = "0.1.11"
 description = "Compact task skills for files, shells, services, networking, databases, deployments, cloud tools, business apps, AI and configuration formats."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
