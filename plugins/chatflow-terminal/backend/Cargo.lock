@@ -28,6 +28,7 @@ name = "cc-chatflow-terminal"
 version = "0.1.0"
 dependencies = [
  "cc-protocol",
+ "libc",
  "serde",
  "serde_json",
  "tokio",

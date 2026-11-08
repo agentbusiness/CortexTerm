@@ -7,6 +7,12 @@
 # encryption on (the agent browser's cookies are encrypted with a key Electron keeps in the
 # Keychain, "CortexTerm Safe Storage"); `fuses` records it. Needs $repo/ui/node_modules/@electron/fuses.
 
+# This branding's number in the release catalog, which names an Electron "<version>-<number>". An
+# installed updater keeps one folder per name and never replaces it, and a release reuses the archive
+# of a name already published, so raise this whenever what electron_mac_branded makes changes.
+# 2: the first archives published kept "Electron Helper".
+ELECTRON_BRANDING=2
+
 electron_mac_branded() {
   local src="$1" dst="$2" icns="$3"
   rm -rf "$dst"

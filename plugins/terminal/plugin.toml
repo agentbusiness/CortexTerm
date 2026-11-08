@@ -17,7 +17,7 @@ platforms = ["macos", "linux"]
 category = "terminal"
 contract = "terminal@1"
 dir = "backend"
-build = ["cargo", "build", "--release"]
+build = ["python3", "native/build.py"]
 exec = "backend/target/release/cc-terminal"
 # The PTY daemon that owns the shells; the plugin starts it from beside its own executable.
 assets = ["backend/target/release/cortexd"]

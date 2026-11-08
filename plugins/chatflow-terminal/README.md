@@ -1,3 +1,31 @@
+# Evidence and remembered fixes — source revision, 2026-11-07
+
+The assistant now receives numbered excerpts from recorded command output, including sampled
+earlier errors and nearby lines. Its `recorded_output` tool can read another section from a Run
+verified as belonging to the selected terminal. Initial reads have a three-second deadline,
+twelve-page limit and 3,600-byte context cap; each turn permits four follow-up reads of at most
+60 lines. Large logs and long lines are sampled or shortened, with omissions stated explicitly.
+The existing backend response is line-bounded, not byte-bounded. These reads never rerun commands
+or earn successful-repair credit.
+
+For a failed command, the flow also looks for the latest earlier completed success of the exact
+command, in the exact folder, on the same machine. It compares recorded branches, durations and
+available historical OS/exact-name Homebrew version observations. Missing history stays unknown;
+observed differences do not establish the cause of a failure or which executable was installed.
+
+Learned fixes retain one-way identities of allowlisted project files, not their contents. Recall
+explains whether observed files match a saved example, changed or could not be checked. This is
+historical applicability evidence, not proof of matching tool versions or a working fix. Capture
+is limited to eight folders, 1 MiB per file, 2 MiB of attempted contents and a 300-millisecond wait,
+with one filesystem reader at a time. Old lessons remain historical, explicit preferences retain
+their existing treatment, and replay uses the context recorded with its episode. Memory stays
+private to CortexTerm; the command-risk engine retains execution authority.
+
+Implementation: `backend/src/{evidence,comparison,context}.rs`, integrated in `flow.rs`,
+`learning.rs` and `replay.rs`. The assistant backend passed offline Cargo compilation checks.
+No app, live database query, Gemma/Qwen behavior or 8 GB Mac verification was performed.
+See the [plain-English implementation record](../../docs/weekly-ideas-implementation/README.md).
+
 # Terminal flow 0.1.15: task skills and configuration previews
 
 The foreground flow now shortlists compact task cards, attaches a clear match, separates skill lookups from read-only checks and counts the templated context before generation. A configuration tool inspects files and prepares user-run, hash-bound changes. It never applies a change. The 0.1.15 work is source-only: no build, package install, app launch or live model validation. See [the complete loading/configuration description](../../docs/terminal-skills/README.md) and [100-workflow coverage](../../docs/terminal-skills/COVERAGE.md). Existing learning and recall behavior is described below.

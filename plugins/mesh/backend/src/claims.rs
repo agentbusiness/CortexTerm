@@ -18,6 +18,9 @@
 //! this app loads its own (`SlotsResult::loaded`, the card's `loaded`): a model is not loaded twice
 //! on one computer for the same work, and an app that can do its work with either tag uses what is
 //! there.
+//! An app that serves before this one on this computer takes the tags it serves over
+//! ([`crate::handover`]): this app's own model of those tags is no option, and that app's ranks as
+//! this app's own would (tier 0).
 //! Another computer's model ranks before another app's on this computer (tier `machine`): the apps
 //! here share this computer's GPU, so a call sent to one of them adds little while another
 //! computer is free (seen: an ingest's overflow went to a second model on its own computer while
@@ -174,6 +177,12 @@ impl Mesh {
         self.claims.freed.notify_one();
     }
 
+    /// A use of this computer's model `plugin` is held or waited for.
+    pub fn model_in_use(&self, plugin: &str) -> bool {
+        let lending = lock(&self.claims.lending);
+        lending.holders.iter().any(|holder| holder.plugin == plugin) || lending.waiting.iter().any(|waiter| waiter.plugin == plugin)
+    }
+
     /// A member went away: what it held or waited for here is over.
     pub fn requester_gone(&self, node: &str) {
         let mut lending = lock(&self.claims.lending);
@@ -276,6 +285,10 @@ impl Mesh {
             && !lock(&self.borrows).contains_key("model")
         {
             for (plugin, info) in crate::card::local_models(ctx).await {
+                // Another app serves these tags on this computer: its model is used instead.
+                if self.is_handed(&info.tags) {
+                    continue;
+                }
                 let Some((rank, tag)) = ranked(&info.tags) else { continue };
                 let tok_s = ctx.call("model.metrics", crate::card::for_model(&plugin)).await.ok().and_then(|value| serde_json::from_value::<LiveMetrics>(value).ok()).map_or(0.0, |metrics| metrics.decode_tps_per_stream);
                 let loaded = ctx.call("model.slots", crate::card::for_model(&plugin)).await.ok().and_then(|value| serde_json::from_value::<SlotsResult>(value).ok()).is_some_and(|slots| slots.loaded);
@@ -302,7 +315,7 @@ impl Mesh {
             let Some(card) = cards.get(&member.node) else { continue };
             // Another app on this computer shares its GPU: it comes after the other computers.
             let tier = if member.local {
-                3
+                if crate::handover::serves_before_me(card) { 0 } else { 3 }
             } else if Self::path_of(connection).0 == "lan" {
                 1
             } else {

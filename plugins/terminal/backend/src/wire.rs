@@ -16,7 +16,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 /// The daemon build: bump it whenever `daemon.rs` (or what it runs) changes.
-pub const DAEMON_VERSION: u32 = 3;
+pub const DAEMON_VERSION: u32 = 4;
 
 /// `$CORTEX_HOME`, else `~/.cortexterm`.
 pub fn home() -> PathBuf {

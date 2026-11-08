@@ -137,7 +137,7 @@ pub struct Tracker {
     answered: bool,
     /// A full-screen program's screen while it runs in the alternate screen: its last screen is
     /// recorded as the Run's output when it leaves, so a full-screen Run has output too.
-    screen: Option<vt100::Parser>,
+    screen: Option<crate::screen::ScreenState>,
     /// The Keychain key looked up for the current prompt (once per prompt).
     tried: Option<String>,
     /// The Keychain key filled in during this Run, and [`Tracker::lines`] then.
@@ -601,7 +601,11 @@ impl Tracker {
     /// The full-screen program's last screen, as the Run's output lines.
     fn last_screen(&mut self) {
         let Some(screen) = self.screen.take() else { return };
-        let rows: Vec<String> = screen.screen().contents().lines().map(|row| row.trim_end().to_owned()).collect();
+        let view = match screen.screen() {
+            Ok(view) => view,
+            Err(error) => { tracing::warn!(%error, "could not capture full-screen Run output"); return; }
+        };
+        let rows: Vec<String> = view.contents().lines().map(|row| row.trim_end().to_owned()).collect();
         let rows: Vec<&String> = rows.iter().skip_while(|row| row.is_empty()).collect();
         let end = rows.iter().rposition(|row| !row.is_empty()).map_or(0, |i| i + 1);
         if end == 0 || !self.recording() {
@@ -649,7 +653,10 @@ impl Tracker {
                 self.take_keyboard();
                 if self.recorder.is_some() && self.screen.is_none() {
                     // Larger than any real window: the program lays out for the real one.
-                    self.screen = Some(vt100::Parser::new(100, 300, 0));
+                    self.screen = match crate::screen::ScreenState::new(100, 300) {
+                        Ok(screen) => Some(screen),
+                        Err(error) => { tracing::warn!(%error, "could not allocate full-screen Run capture"); None }
+                    };
                 }
             }
             // Stay in the terminal until the shell returns: an app can leave the alternate
