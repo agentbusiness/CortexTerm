@@ -3,7 +3,7 @@
 [plugin]
 id = "model-llama"
 name = "Model (Gemma on llama.cpp)"
-version = "0.1.12"
+version = "0.1.13"
 description = "Gemma 4 (tag office, E2B smalloffice) on upstream llama.cpp's llama-server with MTP drafts, on Metal on macOS and on the CPU on Linux: E4B above 8 GB, E2B on 8 GB machines. Gemma stays this app's own while other apps on the machine run theirs (each lends its own); only a machine without a usable GPU borrows a member's model."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
@@ -33,7 +33,9 @@ publishes = ["model.progress", "model.install"]
 variant = ""            # "" = by memory: gemma-4-e4b-qat above 8 GiB, gemma-4-e2b-qat otherwise
 # ctx, parallel and ubatch are the shared office-model settings (see vendor/PATCHES.md): an office model
 # answers the same whichever app lends it.
-ctx = 32768             # context tokens of the one KV pool the slots share (any request may use all of it)
+# ctx is the one KV pool the slots share (--kv-unified): one 32k share per slot (parallel × 32768);
+# a call books the shares it needs through the mesh claim and may use several of them.
+ctx = 65536
 parallel = 2            # llama-server slots
 ubatch = 2048           # prompt tokens read per step
 kv_type = "f16"         # "q8_0" only where flash attention works (checked once, falls back to f16)
