@@ -1,7 +1,7 @@
 [plugin]
 id = "filebrowser"
 name = "File Browser"
-version = "0.1.1"
+version = "0.1.2"
 description = "Home-rooted file browsing and native file transfers for mesh computers."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

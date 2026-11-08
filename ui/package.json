@@ -1,7 +1,7 @@
 {
   "name": "cortexterm-ui",
   "private": true,
-  "version": "0.1.15",
+  "version": "0.1.16",
   "description": "CortexTerm window shell: the Electron shell the frame starts, the UI SDK and the build of every UI package",
   "type": "module",
   "main": "shell/main.js",
