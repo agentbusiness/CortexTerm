@@ -434,7 +434,7 @@ impl Engine {
             variant: spec.id.into(),
             path: dir.join(spec.weights.name).display().to_string(),
             family: "gemma4".into(),
-            tags: vec![tags::OFFICE.into()],
+            tags: vec![if spec.tier == "e2b" { tags::SMALL_OFFICE } else { tags::OFFICE }.into()],
             quant: spec.quant.into(),
             file_bytes: spec.weights.bytes,
             ctx_total: self.config.ctx,

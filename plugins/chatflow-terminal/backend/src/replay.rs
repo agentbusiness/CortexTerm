@@ -40,7 +40,7 @@ pub async fn one(flow: &Flow, cancel: &CancellationToken) -> Result<(), RpcError
             let snapshots = rows(
                 flow,
                 "MATCH (e:TerminalEpisode)-[:OBSERVED]->(r:CommandRun) WHERE e.failure = $failure AND e.verified_fix = true AND e.proposal <> '' \
-                 OPTIONAL MATCH (e)-[:ABOUT]->(f:Folder) RETURN e.key, e.at_ms, EXISTS { (e)-[:SHOWN]->(:Knowledge {id: $id}) }, r.command, f.key ORDER BY e.created_ms LIMIT 50",
+                 OPTIONAL MATCH (e)-[:ABOUT]->(f:Folder) RETURN e.key, e.at_ms, EXISTS { (e)-[:SHOWN]->(:Knowledge {id: $id}) }, r.command, f.key, e.project_context ORDER BY e.created_ms LIMIT 50",
                 json!({"failure": failure, "id": lesson.id}),
                 50,
             )
@@ -55,7 +55,11 @@ pub async fn one(flow: &Flow, cancel: &CancellationToken) -> Result<(), RpcError
                 }
                 let Some(at_ms) = row.get(1).and_then(Value::as_u64) else { continue };
                 let Some((messages, shown)) = learning::episode_record(flow, episode, at_ms).await? else { continue };
-                let key = format!("{}/{episode}", lesson.id);
+                let project_context: Vec<String> = row.get(5).cloned().and_then(|value| serde_json::from_value(value).ok()).unwrap_or_default();
+                // New treatment and alias/context identity: never reuse raw-lesson replay arms
+                // when the foreground now includes a project-applicability notice.
+                let treatment = cc_protocol::sha256::hex(&serde_json::to_vec(&(&lesson.aliases, &project_context))?);
+                let key = format!("context-v1/{}/{episode}/{treatment}", lesson.id);
                 let prior = rows(
                     flow,
                     "MATCH (r:TerminalReplay {key: $key}) RETURN r.state, r.with_answer, r.without_answer, r.with_model, r.without_model, r.expected_command, r.attempts",
@@ -67,7 +71,7 @@ pub async fn one(flow: &Flow, cancel: &CancellationToken) -> Result<(), RpcError
                 if prior.first().and_then(|r| r.first()).and_then(Value::as_str) == Some("done") || attempts >= MAX_ATTEMPTS {
                     continue;
                 }
-                match compare(flow, &key, episode, &lesson, &messages, &shown, text(3), prior.first(), cancel).await {
+                match compare(flow, &key, episode, &lesson, &messages, &shown, &project_context, text(3), prior.first(), cancel).await {
                     Err(error) if error.code == codes::CANCELLED || cancel.is_cancelled() => return Err(error),
                     Err(error) => {
                         tracing::warn!(replay = %key, %error, attempt = attempts + 1, "terminal replay failed");
@@ -92,6 +96,7 @@ async fn compare(
     lesson: &KnowledgeItem,
     messages: &[ChatMessage],
     shown: &[Shown],
+    project_context: &[String],
     expected: &str,
     prior: Option<&Vec<Value>>,
     cancel: &CancellationToken,
@@ -114,7 +119,7 @@ async fn compare(
         if (arm == "with" && with.is_some()) || (arm == "without" && without.is_some()) {
             continue;
         }
-        let request = arm_messages(messages, shown, lesson, arm == "with");
+        let request = arm_messages(messages, shown, lesson, project_context, arm == "with");
         let result = background(flow, &format!("replay-{arm}"), request, None, cancel).await?;
         // Empty or truncated generations are inconclusive and retried, never graded.
         if result.result.content.trim().is_empty() || result.result.finish_reason != "stop" || result.model_id.is_empty() {
@@ -145,15 +150,15 @@ async fn compare(
     // Persist both actual answers before scoring; repeat puts use one key. If the worker stops
     // between feedback and the done marker, the same event is merged on recovery.
     persist(flow, key, episode, lesson, "compared", Some(with), Some(without), &with_model, &without_model, expected, verdict).await?;
-    learning::record_feedback(flow, &format!("replay/{key}"), episode, &lesson.id, verdict, "held_out_replay", &format!("terminal-replay://{key}")).await?;
+    learning::record_feedback(flow, &format!("replay/{}/{episode}", lesson.id), episode, &lesson.id, verdict, "held_out_replay_context_v1", &format!("terminal-replay://{key}")).await?;
     persist(flow, key, episode, lesson, "done", Some(with), Some(without), &with_model, &without_model, expected, verdict).await
 }
 
-fn arm_messages(messages: &[ChatMessage], shown: &[Shown], lesson: &KnowledgeItem, with: bool) -> Vec<ChatMessage> {
+fn arm_messages(messages: &[ChatMessage], shown: &[Shown], lesson: &KnowledgeItem, project_context: &[String], with: bool) -> Vec<ChatMessage> {
     let target: Vec<_> = shown.iter().filter(|item| item.id == lesson.id).map(|item| item.index).collect();
     let mut out: Vec<_> = messages.iter().enumerate().filter(|(index, _)| !target.contains(index)).map(|(_, message)| message.clone()).collect();
     if with {
-        let note = Shown { id: lesson.id.clone(), name: lesson.name.clone(), text: lesson.text.clone(), kind: "lesson".into(), failure: String::new(), index: 0 };
+        let note = learning::shown(lesson, "", Some(project_context));
         // The insertion point is identical in both arms; only this note is the treatment.
         let at = target.first().copied().unwrap_or_else(|| out.iter().position(|m| m.role != "system").unwrap_or(out.len())).min(out.len());
         out.insert(at, note.message());

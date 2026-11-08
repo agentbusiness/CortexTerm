@@ -4,6 +4,15 @@ PTY terminals running the user's login shell: `terminal.open`, `terminal.write`,
 
 ## Terminal application compatibility (source only)
 
+The backend now uses one pinned Ghostty terminal parser. Its optional vector fast paths and image processing
+are disabled; speed and transitive license completeness remain unverified. An authorized build must
+collect the pinned Unicode dependency notices into `data/licenses/GHOSTTY-THIRD-PARTY.txt` before
+packaging can proceed. The generated notice stays visible to the packer and release digest.
+Future authorized builds need Python 3,
+Zig 0.17.0 and the existing Rust toolchain. The manifest runs `backend/native/build.py`, which
+checks the source digest, builds a static library and then builds Rust. Direct Cargo commands
+do not download or compile Ghostty. See [terminal-core implementation and validation limits](../../docs/TERMINAL-CORE.md).
+
 The shared `terminal@1` additions provide binary input and formatted screen restoration with byte
 offsets. Both apps' terminal panes use one SDK transport for ordered input, mouse bytes, resize and
 reconnect. See [shared contract and release targets](../../docs/SHARED-TERMINAL.md).
@@ -61,7 +70,7 @@ The shells belong to `cortexd`, a small daemon shipped beside `cc-terminal` (`ba
 - **What survives.** Each terminal keeps an opaque `meta` in the daemon: the integration nonce, the folder, the last exit, the Run in progress (as it started), PATH, aliases, functions and the owning session (`marks::Saved`, sent when they change). The next instance resumes the tracker from it and continues the Run's output stream. Output produced while no instance is attached (the last 1 MiB) is replayed to it for the marks and Runs, not published: the snapshot already shows it. A swap can still lose the few lines in flight at the moment of the hand-over; output beyond 1 MiB while nobody is attached is missing from that Run.
 - **Flow control.** While attached, the daemon stops reading a shell above 1 MiB unsent and resumes below 256 KiB; output is coalesced to about 16 ms per message. With no client the shell keeps running (the screen stays current; only the last MiB is kept for replay).
 - **Close.** `terminal.close` hangs up the shell's process group and the foreground job in the daemon, waits 1.5 s and kills whatever ignored it.
-- **Versions.** `wire::DAEMON_VERSION` is bumped whenever the daemon changes. A plugin that meets a daemon of another version with no living shell asks it to quit and starts its own; with living shells it keeps using it (the protocol only grows) and replaces it once its last shell is closed. Shells are never killed for an upgrade.
+- **Versions.** The Ghostty source change uses daemon build 4 (not started or installed here). `wire::DAEMON_VERSION` is bumped whenever the daemon changes. A plugin that meets a daemon of another version with no living shell asks it to quit and starts its own; with living shells it keeps using it (the protocol only grows) and replaces it once its last shell is closed. Shells are never killed for an upgrade.
 - If the daemon itself dies, its shells die with it; the plugin reports their exit and the window starts new ones in their folders.
 
 ## When a command asks
@@ -98,7 +107,7 @@ One self-contained plugin folder, separable into its own repository (only `cc-pr
 ## Build and run
 
 ```sh
-cd backend && cargo build --release && cargo clippy --all-targets -- -D warnings
+cd backend && python3 native/build.py
 cd ui && npm ci && npm run build && npm test     # after the SDK is built (cd ../../ui/sdk && npm run build)
 cortex-pack build plugins/terminal                  # -> plugins/terminal/target/terminal-<version>-<target>.ccplugin
 ```

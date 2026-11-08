@@ -14,6 +14,9 @@ mod learning;
 mod recall;
 mod replay;
 mod security;
+mod context;
+mod evidence;
+mod comparison;
 
 use cc_protocol::contracts::lifecycle::{Hello, ProbeCheck, ProbeReport};
 use cc_protocol::{BoxFuture, Call, Ctx, Plugin, PluginEnv, RpcError, run_plugin};

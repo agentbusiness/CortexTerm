@@ -2,7 +2,7 @@
 //! live in CT's graph. Stable event keys make retrying a pass safe, including after a hot swap.
 //! Scores are derived from feedback nodes, rather than non-idempotent counter increments.
 
-use crate::{flow::Flow, replay, security};
+use crate::{context, flow::Flow, replay, security};
 use cc_protocol::contracts::frame::{JournalEntry, JournalReadResult, SessionListResult, kinds};
 use cc_protocol::contracts::memory::{KnowledgeItem, KnowledgeListResult, KnowledgeSearchResult, StreamReadResult, methods as memory};
 use cc_protocol::contracts::model::{ChatMessage, ChatParams, ChatResult, Priority, Sampling, Thinking, tags};
@@ -113,6 +113,7 @@ impl Shown {
 
 #[derive(Default)]
 pub struct Recall {
+    pub project_context: Vec<String>,
     pub shown: Vec<Shown>,
     pub failure: String,
 }
@@ -193,8 +194,8 @@ pub fn failure_key(command: &str, output: &str) -> String {
     if shape.is_empty() { String::new() } else { format!("failed {program} {}", cut(&shape, 160)) }
 }
 
-pub async fn recall(flow: &Flow, question: &str, cwd: &str, failed_id: Option<&str>) -> Result<Recall, RpcError> {
-    let mut recalled = Recall::default();
+pub async fn recall(flow: &Flow, question: &str, cwd: &str, failed_id: Option<&str>, project_context: &[String]) -> Result<Recall, RpcError> {
+    let mut recalled = Recall { project_context: project_context.to_vec(), ..Recall::default() };
     if let Some(id) = failed_id {
         let mut run: Option<(String, i64)> = rows(flow, "MATCH (r:CommandRun {key: $id}) RETURN r.command, r.exit_code", json!({"id": id}), 1)
             .await?
@@ -225,7 +226,7 @@ pub async fn recall(flow: &Flow, question: &str, cwd: &str, failed_id: Option<&s
         .collect();
     places.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.updated_ms.cmp(&a.1.updated_ms)));
     for (_, item) in places.into_iter().take(MAX_FACTS) {
-        recalled.shown.push(shown(item, ""));
+        recalled.shown.push(shown(item, "", None));
     }
     let scores = match scores(flow).await {
         Ok(scores) => scores,
@@ -244,7 +245,7 @@ pub async fn recall(flow: &Flow, question: &str, cwd: &str, failed_id: Option<&s
         .filter_map(|row| row.first()?.as_str().map(str::to_owned))
         .collect();
     for item in lessons.items.iter().filter(|item| preferences.contains(&item.id) && usable(item)).take(MAX_PREFERENCES) {
-        recalled.shown.push(shown(item, ""));
+        recalled.shown.push(shown(item, "", None));
     }
     let mut candidates: HashMap<String, KnowledgeItem> = HashMap::new();
     // The question, with what failed: an automatic fix turn's question says little by itself.
@@ -271,13 +272,13 @@ pub async fn recall(flow: &Flow, question: &str, cwd: &str, failed_id: Option<&s
     });
     for item in candidates.into_iter().take(MAX_LESSONS) {
         let key = if item.aliases.contains(&recalled.failure) { &recalled.failure } else { "" };
-        recalled.shown.push(shown(&item, key));
+        recalled.shown.push(shown(&item, key, Some(project_context)));
     }
     Ok(recalled)
 }
 
 /// Failure-key recall happens immediately after a failed check, once per item per turn.
-pub async fn at_failure(flow: &Flow, key: &str, cwd: &str, already: &[Shown]) -> Result<Vec<Shown>, RpcError> {
+pub async fn at_failure(flow: &Flow, key: &str, cwd: &str, already: &[Shown], project_context: &[String]) -> Result<Vec<Shown>, RpcError> {
     let listed: KnowledgeListResult = parse_params(flow.ctx()?.call(memory::KNOWLEDGE_LIST, json!({"kind": "lesson"})).await?)?;
     let scores = scores(flow).await?;
     Ok(listed
@@ -291,15 +292,19 @@ pub async fn at_failure(flow: &Flow, key: &str, cwd: &str, already: &[Shown]) ->
                 && !harmful(scores.get(&item.id))
         })
         .take(2)
-        .map(|item| shown(item, key))
+        .map(|item| shown(item, key, Some(project_context)))
         .collect())
 }
 
 /// A memory item as the model sees it, with how old it is (old memory may no longer hold).
-fn shown(item: &KnowledgeItem, failure: &str) -> Shown {
+pub(crate) fn shown(item: &KnowledgeItem, failure: &str, project_context: Option<&[String]>) -> Shown {
     let text = match age(item.updated_ms) {
         Some(age) => format!("{} (saved {age})", cut(&item.text, 580)),
         None => cut(&item.text, 600),
+    };
+    let text = match project_context {
+        Some(observed) if item.kind == "lesson" => format!("{}\n{text}", context::notice(&item.aliases, observed)),
+        _ => text,
     };
     Shown { id: item.id.clone(), name: item.name.clone(), text, kind: item.kind.clone(), failure: failure.into(), index: 0 }
 }
@@ -336,6 +341,8 @@ pub struct Episode {
     pub proposal: String,
     pub proposal_ms: u64,
     pub facts: String,
+    #[serde(default)]
+    pub project_context: Vec<String>,
     pub status: String,
     pub messages: Vec<ChatMessage>,
     pub shown: Vec<Shown>,
@@ -495,6 +502,7 @@ fn episode(session: &str, run: &str, entries: &[JournalEntry]) -> Option<Episode
         status: status.into(),
         proposal_ms: mine.iter().rev().find(|e| e.kind == "command_proposal").map_or(0, |e| e.ts_ms),
         facts: value("facts").as_str().unwrap_or("").to_owned(),
+        project_context: serde_json::from_value(value("project_context")).unwrap_or_default(),
         messages: snapshot.and_then(|d| d.get("messages")).and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default(),
         shown: context.and_then(|d| d.get("shown")).and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default(),
         checks: cut(
@@ -610,7 +618,7 @@ pub async fn persist_episode(flow: &Flow, e: &Episode) -> Result<(), RpcError> {
         "source_seq": e.seq, "created_ms": e.ts_ms, "at_ms": at_ms,
         "question": e.question, "intent": e.intent, "failure": e.failure,
         "answer": e.answer, "proposal": e.proposal, "proposal_ms": e.proposal_ms, "facts": e.facts, "status": e.status,
-        "checks": e.checks, "outcome_exit": e.outcome_exit, "outcome_failure": e.outcome_failure, "rerun_ok": e.rerun_ok,
+        "project_context": e.project_context, "checks": e.checks, "outcome_exit": e.outcome_exit, "outcome_failure": e.outcome_failure, "rerun_ok": e.rerun_ok,
         "verified_fix": e.verified_fix(), "check_repair": e.check_repair, "correction": e.correction, "correction_seq": e.correction_seq
     }})];
     let mut edges = vec![edge("TerminalEpisode", &key, "OF", "Session", &e.session)];
@@ -830,6 +838,11 @@ async fn keep(flow: &Flow, e: &Episode, learned: &Distilled, text: &str, why: &s
     }
     let name = existing.as_ref().map(|item| item.name.as_str()).unwrap_or(name);
     let mut aliases = vec![scope];
+    // Bind only the episode's most specific observed folder. Parent inputs must not
+    // override changed child inputs; user preferences are not software-compatibility claims.
+    if why != "preference" && let Some(binding) = e.project_context.first().filter(|binding| context::is_binding(binding)) {
+        aliases.push(binding.clone());
+    }
     if !e.failure.is_empty() {
         aliases.push(e.failure.clone());
     }
@@ -979,7 +992,7 @@ pub async fn background(flow: &Flow, purpose: &str, messages: Vec<ChatMessage>, 
     let key = format!("ct-learning-{purpose}-{}", uuid::Uuid::new_v4());
     let ctx = flow.ctx()?;
     let claimed = async {
-        let mut claim = ctx.call_stream(mesh::CLAIM, json!({"kind": "model", "tags": [tags::CODING, tags::OFFICE], "session_id": key, "foreground": false, "wait": true}))?;
+        let mut claim = ctx.call_stream(mesh::CLAIM, json!({"kind": "model", "tags": [tags::CODING, tags::OFFICE, tags::SMALL_OFFICE], "session_id": key, "foreground": false, "wait": true}))?;
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => { claim.cancel(); return Err(RpcError::cancelled()); },

@@ -344,7 +344,7 @@ async function runner(args) {
     if (!code) throw new Error('runner join <invitation>: use the invitation from Settings > Mesh on another computer');
     const member = await frameCall('mesh.pair.join', { code });
     say(`joined the network as ${member.name}`);
-    say('to work on this computer from another one: npx cortexterm runner allow <its name>');
+    say('every computer of the network may now work on this one');
     return 0;
   }
   if (what === 'allow') {

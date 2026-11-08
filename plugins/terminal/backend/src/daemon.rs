@@ -2,7 +2,7 @@
 //! swaps. The terminal plugin is its client (see `client` and `wire`).
 //!
 //! Each terminal is a shell on its own pseudo-terminal with three threads: a reader that feeds the
-//! VT emulator (`vt100`, for snapshots) and queues the bytes for the owner, a writer that writes
+//! VT emulator (Ghostty, for snapshots) and queues the bytes for the owner, a writer that writes
 //! queued input in order, and a waiter that records the exit. A sender task per terminal ships the
 //! queue to the owning connection, coalescing what arrives within about 16 ms into one message.
 //!
@@ -415,6 +415,7 @@ impl Daemon {
 
     fn open(&self, client: &Arc<Client>, spawn: Spawn) -> Result<Record, String> {
         check_size(spawn.cols, spawn.rows)?;
+        let screen = ScreenState::new(spawn.rows, spawn.cols)?;
         let pair = native_pty_system()
             .openpty(PtySize { rows: spawn.rows, cols: spawn.cols, pixel_width: 0, pixel_height: 0 })
             .map_err(|e| format!("cannot open a pseudo-terminal: {e}"))?;
@@ -449,7 +450,7 @@ impl Daemon {
             meta: Mutex::new(spawn.meta),
             master: Mutex::new(Some(pair.master)),
             input: Mutex::new(Some(input_tx)),
-            parser: Mutex::new(ScreenState::new(spawn.rows, spawn.cols)),
+            parser: Mutex::new(screen),
             killer: Mutex::new(killer),
             flow: Mutex::new(Flow { owner, ..Flow::default() }),
             room: Condvar::new(),
@@ -553,7 +554,7 @@ impl Daemon {
             // TIOCSWINSZ on the master; the kernel delivers SIGWINCH to the foreground group.
             master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).map_err(|e| format!("resize failed: {e}"))?;
         }
-        parser.set_size(rows, cols);
+        parser.set_size(rows, cols)?;
         *lock(&term.size) = (cols, rows);
         drop(parser);
         Ok(term.record())
@@ -562,7 +563,7 @@ impl Daemon {
     fn snapshot(&self, term_id: &str, restore: bool) -> Result<Snapshot, String> {
         let term = self.get(term_id)?;
         let parser = lock(&term.parser);
-        let screen = parser.screen();
+        let screen = parser.screen()?;
         let (cursor_row, cursor_col) = screen.cursor_position();
         let (rows, cols) = screen.size();
         Ok(Snapshot {
@@ -574,7 +575,7 @@ impl Daemon {
             rows,
             alive: term.alive(),
             alternate_screen: screen.alternate_screen(),
-            restore: if restore { parser.restore() } else { None },
+            restore: if restore { Some(parser.restore()?) } else { None },
             input_base64: true,
         })
     }

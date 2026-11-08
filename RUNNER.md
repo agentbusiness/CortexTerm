@@ -14,7 +14,7 @@ npx cortexterm runner join <invitation>
 npx cortexterm runner allow <computer>
 ```
 
-Joining puts the runner in the network; it does not yet let anyone work on it. `runner allow <computer>` (the name another computer shows in Settings > Mesh) is the "may work here" switch a runner has no window for: that computer then opens shells here and reads this machine's metrics and alerts. Until then its cluster card says metrics are unavailable and a shell is refused.
+Joining puts the runner in the network, and every member may work on it at once: it opens shells here and reads this machine's metrics and alerts. A member switched off in Settings > Mesh gets neither; `runner allow <computer>` (the name another computer shows in Settings > Mesh) switches it on again, the switch a runner has no window for.
 
 The installer starts the installed frame directly through the operating system's service manager. The service does not depend on npx's temporary cache or on a shell window remaining open. There is one managed runner per OS account. A second CortexTerm sharing the same `CORTEX_HOME` is refused; stop it before installing the runner.
 

@@ -34,18 +34,20 @@ pub async fn look(ctx: &Ctx) -> Option<Lender> {
         .filter_map(|peer| {
             let card = peer.card?;
             let software = card.software;
-            // The member's best model for this app: a `coding` one before an `office` one.
+            // The member's best model for this app: `coding`, then `office`, then `smalloffice`.
             let ranked = |model: &cc_protocol::contracts::mesh::ModelCard| {
                 if model.tags.iter().any(|tag| tag == tags::CODING) {
                     Some(0)
                 } else if model.tags.iter().any(|tag| tag == tags::OFFICE) {
                     Some(1)
+                } else if model.tags.iter().any(|tag| tag == tags::SMALL_OFFICE) {
+                    Some(2)
                 } else {
                     None
                 }
             };
             let (rank, model) = card.models.into_iter().filter_map(|model| ranked(&model).map(|rank| (rank, model))).min_by_key(|(rank, _)| *rank)?;
-            let rank = if peer.member.local { rank } else { rank + 2 };
+            let rank = if peer.member.local { rank } else { rank + 3 };
             Some((rank, Lender { node: peer.member.node, name: peer.member.name, software, model_id: model.model_id, plugin: model.plugin }))
         })
         .collect();
