@@ -1,15 +1,15 @@
 # Local llama.cpp patches
 
 The Cortex engines and CortexTerm's model-llama run the same llama.cpp: the source in `REVISION`
-(unslothai/llama.cpp `b11876-mix-ec42614`, commit `468ad58`, a 0.7.0 development build), with the
+(unslothai/llama.cpp `b12347-mix-241a0f3`, commit `c2cf5f9`), with the
 same patched `tools/server/server-context.cpp` and the same server settings for an office model
 (cortex-network: a model lent under a tag answers the same whichever app serves it). This file is
 the same in both apps; a change to it, or to `server-context.cpp`, is made in both.
 
 Moved from v0.6.0 (`d8123504`) on 2026-11-04. Five patches applied at v0.6.0; upstream now does the
 first itself (`get_available_slot` returns a pinned slot that is still processing untouched, so the
-caller defers the task), so four remain. The surrounding upstream code at each site is unchanged in
-substance at `468ad58`; every site is marked `GlobalCortex patch`.
+caller defers the task), so four remain. The patches were rebased onto the new shared_ptr checkpoint API on 2026-11-18;
+every site is marked `GlobalCortex patch`.
 
 - `create_checkpoint`: the spacing eviction (`--checkpoint-min-step`) never erases the newest
   checkpoint left by an earlier task. A caller that primes a shared history and then sends the call
@@ -43,3 +43,10 @@ b11623, archived in CortexCode commit `82562e6`). They matter where requests are
   no sliding window) keeps upstream's rule. (CortexCode patch 5.)
 
 CortexCode's patch 6 (`--spec-max-parallel`) was not ported.
+
+## 2026-11-18 upstream rebase
+
+Published source c2cf5f983a01bc2ea7a5d68a7ce4fb171e6fe335, release b12347-mix-241a0f3.
+All four prompt-cache patches retained. Checkpoint storage now uses shared_ptr;
+local checkpoint scans dereference these pointers and the newest-other exclusion
+uses `cur.n_tokens`. No builds or runtime checks performed.
