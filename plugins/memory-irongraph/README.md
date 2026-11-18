@@ -1,7 +1,7 @@
 # cc-memory — memory@1 on IronGraph
 
 `cc-memory` is the CortexTerm memory plugin (CPP/1, category `memory`, contract `memory@1`), built on
-`irongraph-sdk =0.1.8`. It keeps one embedded IronGraph instance per process, the exclusive owner of
+`irongraph-sdk =0.1.14`. It keeps one embedded IronGraph instance per process, the exclusive owner of
 `<CORTEX_HOME>/irongraph` (`CORTEX_HOME`, else derived from `CORTEX_PLUGIN_DATA`). IronGraph's
 embedding model lives in `~/.cortex-models`, the models folder every Cortex app shares
 (`<org>-<repo>/<revision>/<file>`, `docs/SHARED-MODELS.md`), and its rebuildable vector cache in
