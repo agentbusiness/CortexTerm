@@ -181,10 +181,12 @@ fn check_size(cols: u16, rows: u16) -> Result<(), RpcError> {
     Ok(())
 }
 
-/// The environment a new shell gets: this process's, without the plugin plumbing (CORTEX_HOME
-/// stays, so `cx` finds the frame), with the terminal's own variables.
+/// The environment a new shell gets: this process's, without the plugin plumbing, with the
+/// terminal's own variables. CORTEX_HOME goes too: every Cortex app reads it as its own home, so
+/// `npx cortexcode` in a CortexTerm shell would take ~/.cortexterm for its home and CortexTerm's
+/// frame for a running CortexCode.
 fn shell_env(cwd: &Path, extra: &[(String, String)]) -> Vec<(String, String)> {
-    const PLUMBING: &[&str] = &["CORTEX_FRAME_SOCKET", "CORTEX_PLUGIN_INSTANCE", "CORTEX_PLUGIN_DATA", "CORTEX_LOG"];
+    const PLUMBING: &[&str] = &["CORTEX_HOME", "CORTEX_FRAME_SOCKET", "CORTEX_PLUGIN_INSTANCE", "CORTEX_PLUGIN_DATA", "CORTEX_LOG"];
     let own = [
         ("TERM", "xterm-256color".to_owned()),
         ("COLORTERM", "truecolor".to_owned()),
