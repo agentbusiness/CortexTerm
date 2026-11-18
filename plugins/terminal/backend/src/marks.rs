@@ -629,6 +629,23 @@ impl Tracker {
             self.ansi.push(b'm');
             return;
         }
+        // Spinners and progress bars redraw with codes as well as `\r` (Node's cursorTo(0) and
+        // clearLine, npm's spinner): back to column 1 is a carriage return; erasing the whole
+        // line, or the rest of it from column 1, redraws it as nothing.
+        match (last, self.buf.as_slice()) {
+            (b'G', b"" | b"0" | b"1") => {
+                self.cr = true;
+                return;
+            }
+            (b'K', b"2") | (b'K', b"" | b"0") if self.buf == b"2" || self.cr => {
+                if self.recording() {
+                    self.cr = true;
+                    self.redraw();
+                }
+                return;
+            }
+            _ => {}
+        }
         if !(last == b'h' || last == b'l') || self.buf.first() != Some(&b'?') {
             return;
         }
