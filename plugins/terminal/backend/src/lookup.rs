@@ -49,8 +49,14 @@ pub async fn fetch_script(url: &str) -> Result<Script, String> {
         }
     }
     let text = String::from_utf8_lossy(&kept).into_owned();
-    let threats = threat::scan(&text, false);
-    Ok(Script { url: final_url, truncated: bytes > kept.len() as u64, text, bytes, threats })
+    let truncated = bytes > kept.len() as u64;
+    // CPU-only code, never a shell/model call. Keep parsing and scanning off the async executor.
+    let (text, threats, analysis) = tokio::task::spawn_blocking(move || {
+        let threats = threat::scan(&text, false);
+        let analysis = crate::script_effects::inspect(&text, truncated);
+        (text, threats, analysis)
+    }).await.map_err(|e| format!("script inspection did not finish: {e}"))?;
+    Ok(Script { url: final_url, truncated, text, bytes, threats, analysis: Some(analysis) })
 }
 
 /// The packages `text` installs by name, then what OSV knows about them.

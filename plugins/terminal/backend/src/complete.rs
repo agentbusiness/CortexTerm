@@ -96,6 +96,9 @@ pub fn complete(line: &str, cursor: usize, shell: &Shell, suggestion: Option<Str
     while !line.is_char_boundary(cursor) {
         cursor -= 1;
     }
+    if let Some(result) = crate::completion_options::complete(line, cursor, shell, suggestion.clone()) {
+        return result;
+    }
     let from = word_start(line, cursor);
     let word = &line[from..cursor];
     // The words of this command before the one being completed.
@@ -112,7 +115,7 @@ pub fn complete(line: &str, cursor: usize, shell: &Shell, suggestion: Option<Str
     } else {
         context(&words, word, from, shell)
     };
-    Completions { from: start as u32, items, suggestion }
+    Completions { from: start as u32, to: None, items, suggestion }
 }
 
 fn context(words: &[&str], word: &str, from: usize, shell: &Shell) -> (Vec<Completion>, usize) {
@@ -179,7 +182,7 @@ fn commands(prefix: &str, shell: &Shell) -> Vec<Completion> {
     items
 }
 
-fn files(word: &str, cwd: &Path, dirs_only: bool) -> Vec<Completion> {
+pub(crate) fn files(word: &str, cwd: &Path, dirs_only: bool) -> Vec<Completion> {
     let typed = unescape(word);
     let (dir_part, prefix) = match typed.rfind('/') {
         Some(i) => (&typed[..=i], &typed[i + 1..]),

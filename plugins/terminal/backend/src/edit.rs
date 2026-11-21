@@ -83,5 +83,5 @@ pub fn complete(line: &str, cwd: &Path) -> Result<Completions, RpcError> {
     if create {
         items.push(Completion { value: escaped(&typed), kind: "new".into(), description: format!("Create {typed}") });
     }
-    Ok(Completions { from: (line.len() - query.len()) as u32, items, suggestion: None })
+    Ok(Completions { from: (line.len() - query.len()) as u32, to: None, items, suggestion: None })
 }

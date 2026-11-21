@@ -79,6 +79,12 @@ export interface Script {
   bytes: number;
   truncated?: boolean;
   threats: Threat[];
+  analysis?: {
+    statements: number;
+    stopped_at?: number | null;
+    limits: string[];
+    findings: { rule: string; line: number; related_lines: number[]; explanation: string; assumptions: string[] }[];
+  } | null;
 }
 
 /** `terminal.packages.check`: what OSV knows about the packages an install names. */
@@ -95,6 +101,7 @@ export interface Completion {
 
 export interface Completions {
   from: number;
+  to?: number | null;
   items: Completion[];
   suggestion?: string | null;
 }
