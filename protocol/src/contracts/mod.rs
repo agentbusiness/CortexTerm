@@ -35,6 +35,8 @@ pub mod mesh;
 pub mod model;
 #[cfg(feature = "notify")]
 pub mod notify;
+#[cfg(feature = "reports")]
+pub mod reports;
 #[cfg(feature = "research")]
 pub mod research;
 #[cfg(feature = "service")]
@@ -71,6 +73,7 @@ pub const CATEGORIES: &[(&str, &str)] = &[
     ("research", "research@1"),
     ("update", "update@1"),
     ("mesh", "mesh@1"),
+    ("stats", "stats@1"),
     ("system", "system@1"),
     ("cleanup", "cleanup@1"),
 ];

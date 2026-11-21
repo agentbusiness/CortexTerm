@@ -384,7 +384,7 @@ impl Plugin for FileBrowser {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+    cc_stats_kit::start("CORTEX_LOG", "info", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
     let root = match Root::new() {
         Ok(root) => root,
         Err(error) => {

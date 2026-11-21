@@ -33,6 +33,10 @@ Its code was copied from CortexCode (`../CortexCode`) and reshaped. Both apps fo
   in both repositories, byte for byte;
 - the caller's side of shared services and their text for a model, `service-kit/`: the same code in
   both repositories, byte for byte.
+- what an app records about itself and its delivery to CortexManage, `stats-kit/` (errors and
+  calls as Parquet day files, `contracts::reports`): the same code in every repository, byte for
+  byte; every process calls `cc_stats_kit::start` in place of its own log setup, and the
+  `stats` plugin (`plugins/stats`, the same in every repository) alone writes and delivers.
 
 **Any change to the plugin architecture, the mesh, or model and resource sharing is made in both
 CortexTerm and CortexCode**, in the same piece of work, and listed in both repositories' docs with the

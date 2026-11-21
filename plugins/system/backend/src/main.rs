@@ -1675,10 +1675,7 @@ impl Plugin for SystemPlugin {
 }
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("CORTEX_LOG").unwrap_or_else(|_| "warn".into()))
-        .with_writer(std::io::stderr)
-        .init();
+    cc_stats_kit::start("CORTEX_LOG", "warn", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
     keys::import_files();
     protection::keys_changed(&keys::status());
     std::thread::spawn(malware::check_keys);

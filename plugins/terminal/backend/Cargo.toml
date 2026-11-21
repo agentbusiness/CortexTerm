@@ -25,6 +25,7 @@ path = "src/cortexd.rs"
 
 [dependencies]
 cc-protocol = { path = "../../../protocol", features = ["terminal", "memory", "service"] }
+cc-stats-kit = { path = "../../../stats-kit" }
 # The write sandbox both apps share (identical in CortexCode and CortexTerm).
 tokio-util = "0.7"
 cc-sandbox-kit = { path = "../../../sandbox-kit" }

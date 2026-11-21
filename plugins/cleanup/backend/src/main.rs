@@ -362,7 +362,7 @@ impl Plugin for Server {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+    cc_stats_kit::start("CORTEX_LOG", "info", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         eprintln!("cc-cleanup: the serving user has no home folder");
         std::process::exit(1);
