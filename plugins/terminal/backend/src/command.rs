@@ -9,13 +9,11 @@
 //!   folders the caller names in `writable`.
 //! - `monitor`: the system plugin traces it (`system.trace.run`); the answer names the trace and
 //!   its one line.
-//! - The risk engine ([`crate::assess`]) decides, not the caller: a command that deletes, needs
-//!   admin or reads a secret, or that writes or talks to the network outside the sandbox, does not
-//!   run until the person approved it in the asking app's window (`approved`).
-//! - An approval is bound to the command: another app's `approved` counts only for the very
-//!   command (with its folder, risk and sandbox) this service refused to that app within the last
-//!   hour, and only once; an app on another computer never approves. Without a caller (this app's
-//!   own plugins, a schedule run by the system plugin) `approved` is taken as given.
+//! - Another app on this computer runs what it sends: it decides about its own commands (its
+//!   modes, its own asks). From an app on another computer, a command that deletes, needs admin
+//!   or reads a secret, or that writes or talks to the network outside the sandbox, is refused.
+//!   Without a caller (this app's own plugins, a schedule run by the system plugin) the risk
+//!   engine ([`crate::assess`]) refuses those unless `approved`.
 //! - Each asking session has a Shell of its own here, `service.<app>.<session>`. The job is the
 //!   Run's `(:CommandRun)` node, with `job_state`, `job_text`, `tail`, `trace`, `trace_line`,
 //!   `caller_*`, `purpose` and `pgid` on it, so `jobs.get` answers for as long as the Run is kept
@@ -63,28 +61,11 @@ struct Entry {
     pgid: Option<i32>,
 }
 
-/// An approval counts for a refusal this recent.
-const APPROVAL_WINDOW: Duration = Duration::from_secs(3600);
-/// Refusals remembered for approvals.
-const REFUSALS: usize = 100;
-
-/// A command refused to another app: what its `approved` may answer.
-#[derive(PartialEq)]
-struct Refusal {
-    app: String,
-    node: String,
-    command: String,
-    cwd: PathBuf,
-    risk: String,
-    sandboxed: bool,
-}
-
 pub struct Commands {
     store: Option<Arc<Store>>,
     emit: Emit,
     home: PathBuf,
     jobs: Mutex<VecDeque<Entry>>,
-    refusals: Mutex<VecDeque<(Refusal, Instant)>>,
     policy: OnceLock<Policy>,
     login_path: OnceLock<Option<String>>,
 }
@@ -108,34 +89,9 @@ impl Commands {
             emit,
             home,
             jobs: Mutex::new(VecDeque::new()),
-            refusals: Mutex::new(VecDeque::new()),
             policy: OnceLock::new(),
             login_path: OnceLock::new(),
         })
-    }
-
-    /// Remember a command refused to another app, so the person's yes in that app's window can
-    /// approve that command (and only that one).
-    fn refused_to(&self, refusal: Refusal) {
-        let mut refusals = lock(&self.refusals);
-        refusals.retain(|(_, at)| at.elapsed() < APPROVAL_WINDOW);
-        refusals.push_back((refusal, Instant::now()));
-        while refusals.len() > REFUSALS {
-            refusals.pop_front();
-        }
-    }
-
-    /// Whether another app's `approved` answers a refusal of this very command (used once).
-    fn take_approval(&self, refusal: &Refusal) -> bool {
-        let mut refusals = lock(&self.refusals);
-        refusals.retain(|(_, at)| at.elapsed() < APPROVAL_WINDOW);
-        match refusals.iter().position(|(held, _)| held == refusal) {
-            Some(index) => {
-                refusals.remove(index);
-                true
-            }
-            None => false,
-        }
     }
 
     /// The person's PATH as their login shell sets it (read once), for the risk engine to find
@@ -374,23 +330,13 @@ impl Commands {
         let high: Vec<&str> = assessment.threats.iter().filter(|t| t.severity == "high").map(|t| t.text.as_str()).collect();
         let grave = matches!(assessment.risk.as_str(), "delete" | "admin" | "secret") || !high.is_empty();
         let outside = !p.options.sandboxed && assessment.risk != "read";
-        let refusal = other_app.as_ref().map(|other| Refusal {
-            app: other.app.clone(),
-            node: other.node.clone(),
-            command: p.command.clone(),
-            cwd: cwd.clone(),
-            risk: assessment.risk.clone(),
-            sandboxed: p.options.sandboxed,
-        });
-        let approved = match (&other_app, &refusal) {
-            // Another app's yes answers only the refusal of this very command, once.
-            (Some(other), Some(refusal)) if grave || outside => p.options.approved && other.local && self.take_approval(refusal),
-            _ => p.options.approved,
+        // An app on this computer decides about its own commands (its modes, its asks): its call
+        // runs. An app on another computer never runs a risky command here.
+        let approved = match &other_app {
+            Some(other) => other.local,
+            None => p.options.approved,
         };
         if (grave || outside) && !approved {
-            if let Some(refusal) = refusal {
-                self.refused_to(refusal);
-            }
             let why = if !high.is_empty() {
                 high.join(" ")
             } else if assessment.reasons.is_empty() {

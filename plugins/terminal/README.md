@@ -104,7 +104,7 @@ One self-contained plugin folder, separable into its own repository (only `cc-pr
 | `backend/` | Cargo workspace (depends on `cc-protocol` by path), binaries `cc-terminal` (category `terminal`, contract `terminal@1`) and `cortexd` (the PTY daemon, packed as an asset beside it) |
 | `ui/` | one npm workspace (own `package-lock.json`, `@cortex/sdk` as a local dependency): `ui/pane` (pane.terminal@1); each package builds `dist/` with `manifest.json` |
 
-## Secrets and approvals (unreleased)
+## Secrets, and who decides (unreleased)
 
 - **`secret`** is a risk class of its own, between `network` and `delete`: reading out a private
   key, a credentials file (`~/.aws/credentials`, `.netrc`, `.npmrc`, `.pypirc`, `.git-credentials`,
@@ -114,10 +114,12 @@ One self-contained plugin folder, separable into its own repository (only `cc-pr
   not reading it out. It is never safe, so the chat model never runs it on its own; the Line labels
   it READS SECRETS and asks first, and `terminal.command` treats it like delete and admin (the
   person approves it, in the sandbox too).
-- **Approvals are bound to the command** (`command.rs`): another app's `approved` counts only for
-  the very command (folder, risk, sandbox) this service refused to that app within the hour, and
-  once; an app on another computer never approves. A schedule another app owns is run by the
-  system plugin `on_behalf_of` that app, with the schedule's own approval.
+- **Who decides** (`command.rs`): another app on this computer runs what it sends; it decides
+  about its own commands (its modes, its asks). From an app on another computer, a command that
+  deletes, needs admin or reads a secret, or that writes or talks to the network outside the
+  sandbox, is refused. Without a caller the risk engine refuses those unless `approved`. A
+  schedule another app owns is run by the system plugin `on_behalf_of` that app, with the
+  schedule's own approval.
 
 Not built and not run.
 
