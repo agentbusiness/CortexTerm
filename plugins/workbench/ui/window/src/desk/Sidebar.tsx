@@ -5,7 +5,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { errorMessage, useRuntime } from '@cortex/sdk';
-import type { Metrics, ModelInfo, Proc, ProcessGroup } from './api';
+import type { Metrics, Proc, ProcessGroup } from './api';
 import { GB, rate, size } from './api';
 
 const HISTORY = 60;
@@ -97,33 +97,35 @@ export function useMetrics(enabled = true) {
   return { metrics, history, problem };
 }
 
-export function useModel() {
-  const client = useRuntime().client;
-  const [info, setInfo] = useState<ModelInfo | null>(null);
-  const [problem, setProblem] = useState<string | null>(null);
-  useEffect(() => {
-    let stopped = false;
-    const read = () => client.call<ModelInfo>('model.info', {}, { signal: AbortSignal.timeout(4000) })
-      .then((value) => { if (!stopped) { setInfo(value); setProblem(null); } })
-      .catch((cause) => { if (!stopped) setProblem(errorMessage(cause)); });
-    void read();
-    const timer = setInterval(read, 10_000);
-    return () => {
-      stopped = true;
-      clearInterval(timer);
-    };
-  }, [client]);
-  return { info, problem };
+/** The model the last turn's calls went to, as the terminal flow says it (`chatflow-terminal.model`). */
+export interface UsedModel {
+  tag: string;
+  model: string;
+  /** `local`: this app's own model; `app`: another app on this Mac; `computer`: another computer. */
+  place: 'local' | 'app' | 'computer';
+  /** The app or computer that runs it. */
+  via: string;
 }
 
-/** `OFFICE · GEMMA 4 E4B · LOCAL`, `CODING · QWEN3.8 27B · VIA CORTEXCODE`. */
-export function modelLabel(info: ModelInfo | null, problem: string | null): string {
-  if (!info) return problem ? 'NO MODEL YET' : 'MODEL …';
-  const tag = (info.tags?.[0] ?? 'office').toUpperCase();
-  const name = (info.variant || info.model_id || info.family).replace(/[-_]/g, ' ').toUpperCase();
-  const source = info.extra?.source;
-  const where = source === 'borrowed' ? `VIA ${(info.extra?.holder ?? 'MESH').toString().toUpperCase()}` : source === 'none' ? 'NOT LOADED' : 'LOCAL';
-  return `${tag} · ${name} · ${where}`;
+export function useUsedModel() {
+  const client = useRuntime().client;
+  const [used, setUsed] = useState<UsedModel | null>(null);
+  useEffect(() => {
+    let stopped = false;
+    const accept = (value: unknown) => { if (!stopped && value) setUsed(value as UsedModel); };
+    const off = client.on('chatflow-terminal.model', (_topic, data) => accept(data));
+    void client.call<UsedModel | null>('chatflow-terminal.model', {}, { signal: AbortSignal.timeout(4000) }).then(accept).catch(() => undefined);
+    return () => { stopped = true; off(); };
+  }, [client]);
+  return used;
+}
+
+/** `CODING · QWEN3.8 27B · VIA CORTEXCODE`, `OFFICE · GEMMA 4 E4B · LOCAL`, `CODING · … · ON STUDIO`. */
+export function modelLabel(used: UsedModel | null): string {
+  if (!used) return 'NO MODEL USED YET';
+  const name = used.model.replace(/[-_]/g, ' ').toUpperCase();
+  const where = used.place === 'local' ? 'LOCAL' : `${used.place === 'app' ? 'VIA' : 'ON'} ${(used.via || 'MESH').toUpperCase()}`;
+  return [used.tag.toUpperCase(), name, where].filter(Boolean).join(' · ');
 }
 
 /** The picker names the computer; this header only shows its hardware and thermal status. */

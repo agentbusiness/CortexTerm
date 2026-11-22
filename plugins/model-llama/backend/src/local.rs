@@ -78,8 +78,9 @@ fn sampling_into(body: &mut Map<String, Value>, sampling: &Sampling) {
 }
 
 /// Gemma 4's template turns thinking on with `<|think|>` at the start of the system turn; its
-/// `enable_thinking` switch does exactly that, and the template's default is on, so it is always
-/// passed: on only when the call asks for thinking.
+/// `enable_thinking` switch does exactly that, so it is always passed: on only when the call asks
+/// for thinking. Gemma has no effort levels (its template knows only on and off), so a call's
+/// effort is carried by its thinking budget alone.
 fn thinking_into(body: &mut Map<String, Value>, thinking: &Thinking) {
     body.insert("chat_template_kwargs".into(), json!({"enable_thinking": thinking.enabled}));
     if thinking.enabled

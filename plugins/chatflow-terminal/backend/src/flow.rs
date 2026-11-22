@@ -8,8 +8,8 @@
 use cc_protocol::contracts::chatflow::{FlowState, RunningResult, TurnResult};
 use cc_protocol::contracts::frame::kinds;
 use cc_protocol::contracts::terminal::{Run, topics};
-use cc_protocol::contracts::mesh::methods as mesh_methods;
-use cc_protocol::contracts::model::{ChatDelta, ChatMessage, ChatParams, ChatResult, CountResult, Priority, Sampling, Thinking, ToolCall, ToolSpec, methods as model_methods, tags};
+use cc_protocol::contracts::mesh::{Placement, PeersResult, methods as mesh_methods};
+use cc_protocol::contracts::model::{ChatDelta, ChatMessage, ChatParams, ChatResult, CountResult, ModelInfo, Priority, Sampling, Thinking, ToolCall, ToolSpec, methods as model_methods, tags};
 use cc_protocol::contracts::service::{self as svc, Access, Share};
 use cc_protocol::contracts::skills::{self, Description, SkillInfo, SkillResult};
 use cc_protocol::{Ctx, PluginEnv, RpcError, codes, parse_params};
@@ -24,7 +24,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-pub const VERBS: &[&str] = &["turn", "cancel", "state", "running", "prewarm"];
+pub const VERBS: &[&str] = &["turn", "cancel", "state", "running", "prewarm", "model"];
+
+/// Topic: the model the last turn's calls went to changed (`{tag, model, place, via}`).
+pub const MODEL_TOPIC: &str = "chatflow-terminal.model";
 
 /// Journal kind of a proposed command: `{command, assessment, run_id}`. The window shows it with
 /// Run / Edit; nothing runs from the flow itself.
@@ -141,11 +144,13 @@ pub struct Flow {
     ctx: OnceLock<Ctx>,
     turns: Mutex<Turns>,
     learner: OnceLock<Arc<Learner>>,
+    /// The model the last turn's calls went to, as the window's header shows it.
+    used: Mutex<Option<Value>>,
 }
 
 impl Flow {
     pub fn new(env: PluginEnv) -> Self {
-        Self { env, ctx: OnceLock::new(), turns: Mutex::new(Turns::default()), learner: OnceLock::new() }
+        Self { env, ctx: OnceLock::new(), turns: Mutex::new(Turns::default()), learner: OnceLock::new(), used: Mutex::new(None) }
     }
 
     pub fn connect(&self, ctx: Ctx) {
@@ -307,6 +312,7 @@ impl Flow {
                 Ok(serde_json::to_value(RunningResult { sessions }).unwrap_or(Value::Null))
             }
             "prewarm" => Ok(json!({"state": "skipped", "messages": 0})),
+            "model" => Ok(self.used.lock().ok().and_then(|used| used.clone()).unwrap_or(Value::Null)),
             other => Err(RpcError::new(codes::UNKNOWN_METHOD, format!("chatflow-terminal has no method `{other}`"))),
         }
     }
@@ -449,10 +455,56 @@ impl Flow {
                 }
             }
         }
-        if let Err(error) = call.finish().await {
-            tracing::debug!(%error, "no model claimed through the mesh; the call runs on this app's model plugin");
-        }
+        let placement = match call.finish().await {
+            Ok(value) => parse_params::<Placement>(value).ok(),
+            Err(error) => {
+                tracing::debug!(%error, "no model claimed through the mesh; the call runs on this app's model plugin");
+                None
+            }
+        };
+        self.note_used(placement).await;
         Ok(())
+    }
+
+    /// Keep and publish the model the turn's calls go to: its tag, its name, and where it runs
+    /// (`local`: this app's own; `app`: another app on this computer, `via` names it; `computer`:
+    /// another computer, `via` names it). All of it is what the claim and the cards declare.
+    async fn note_used(&self, placement: Option<Placement>) {
+        let Ok(ctx) = self.ctx() else { return };
+        let ranked = |model_tags: &[String]| [tags::CODING, tags::OFFICE, tags::SMALL_OFFICE].iter().find(|tag| model_tags.iter().any(|have| have == *tag)).map(|tag| (*tag).to_owned()).unwrap_or_default();
+        let used = match placement.as_ref().and_then(|placement| placement.node.clone().map(|node| (node, placement))) {
+            Some((node, placement)) => {
+                let peers = ctx.call(mesh_methods::PEERS, json!({})).await.and_then(parse_params::<PeersResult>).map(|result| result.peers).unwrap_or_default();
+                let peer = peers.into_iter().find(|peer| peer.member.node == node);
+                let card = peer.as_ref().and_then(|peer| peer.card.clone());
+                let model = card.as_ref().and_then(|card| card.models.iter().find(|model| model.plugin == placement.plugin && model.model_id == placement.model_id).cloned());
+                let local = peer.as_ref().is_some_and(|peer| peer.member.local);
+                let via = match (&card, local) {
+                    (Some(card), true) => card.software.clone(),
+                    (Some(card), false) if !card.name.is_empty() => card.name.clone(),
+                    _ => placement.name.clone(),
+                };
+                let name = model.as_ref().map(|model| if model.variant.is_empty() { model.model_id.clone() } else { model.variant.clone() }).unwrap_or_else(|| placement.model_id.clone());
+                json!({"tag": model.as_ref().map(|model| ranked(&model.tags)).unwrap_or_default(), "model": name, "place": if local { "app" } else { "computer" }, "via": via})
+            }
+            None => {
+                let Ok(info) = ctx.call(model_methods::INFO, json!({})).await.and_then(parse_params::<ModelInfo>) else { return };
+                let name = if info.variant.is_empty() { info.model_id.clone() } else { info.variant.clone() };
+                let borrowed = info.extra.get("source").and_then(Value::as_str) == Some("borrowed");
+                let via = info.extra.get("holder").and_then(Value::as_str).unwrap_or_default().to_owned();
+                json!({"tag": ranked(&info.tags), "model": name, "place": if borrowed { "computer" } else { "local" }, "via": via})
+            }
+        };
+        let changed = match self.used.lock() {
+            Ok(mut kept) if kept.as_ref() != Some(&used) => {
+                *kept = Some(used.clone());
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            ctx.publish(MODEL_TOPIC, used);
+        }
     }
 
     async fn turn(&self, input: &TurnInput, run_id: &str, cancel: &CancellationToken) -> Result<(), RpcError> {

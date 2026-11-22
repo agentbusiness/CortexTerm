@@ -21,7 +21,7 @@ import './sidebar.css';
 import type { Proc, TermState } from './api';
 import { shortPath } from './api';
 import { Line, type LineHandle } from './Line';
-import { Sidebar, modelLabel, useModel } from './Sidebar';
+import { Sidebar, modelLabel, useUsedModel } from './Sidebar';
 import { TermPane, type TermActions } from './TermPane';
 import { AlertsPane, EditorPane, ProcessPane, RunPane } from './Views';
 import { Investigate } from './Investigate';
@@ -136,7 +136,7 @@ export function Desk() {
   const helpers = useRef(new Set<string>());
   const booted = useRef(false);
   const columns = useColumns();
-  const { info: model, problem: modelProblem } = useModel();
+  const usedModel = useUsedModel();
 
   const desk = doc.desks.find((entry) => entry.id === doc.current) ?? doc.desks[0];
   const update = useCallback((id: string, change: (desk: DeskRec) => DeskRec) => {
@@ -647,7 +647,7 @@ export function Desk() {
       <span className="grow" />
       {needsYou.length > 0 && <button type="button" className="detent warn ct-band-action" onClick={jumpNext} title="Next that needs you (⌘J)">{needsYou.length} NEED YOU</button>}
       {openAlerts > 0 && <button type="button" className="detent warn ct-band-action" onClick={openAlertsPane}>{openAlerts} ALERT{openAlerts > 1 ? 'S' : ''}</button>}
-      <span className={`ct-band-note ct-band-model${model?.extra?.source === 'borrowed' ? ' blue' : ''}`} title={modelProblem ?? modelLabel(model, modelProblem)}>{modelLabel(model, modelProblem)}</span>
+      <span className={`ct-band-note ct-band-model${usedModel && usedModel.place !== 'local' ? ' blue' : ''}`} title={`The model the last answer used: ${modelLabel(usedModel)}`}>{modelLabel(usedModel)}</span>
       <button type="button" className="detent ct-band-gear" onClick={() => setSettings((open) => (open === null ? '' : null))} title="Settings (⌘,)" aria-label="Settings">
         <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <circle cx="12" cy="12" r="3" />
