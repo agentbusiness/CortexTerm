@@ -140,3 +140,12 @@ When a command proposed for a sweep finding ends with exit 0, the flow asks the 
 check the finding again (`system.finding.verify`) and tells the model in one sentence whether it is
 gone. A finding's evidence now names what it is about, the person's decision and a fix already
 tried, which is not proposed again. Prompts are unchanged. Not built or run with Gemma or Qwen.
+
+## Secrets masked (unreleased)
+
+Before every `model.chat` call the flow makes, secret-shaped text in the messages (private keys,
+GitHub, GitLab, AWS, Slack, Stripe, npm and API tokens, web tokens, bearer tokens, passwords in
+URLs, `NAME_PASSWORD=…` style assignments) becomes `[secret masked: <label>]` (`secrets.rs`). The
+learner's episodes are masked the same way before the graph keeps them. The person's own view and
+the session journal keep the text as it came. Prompts are unchanged. Not built or run with Gemma
+or Qwen.

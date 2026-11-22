@@ -359,6 +359,22 @@ pub struct Episode {
 }
 
 impl Episode {
+    /// The episode with its secrets masked ([`crate::secrets`]), as the graph keeps it.
+    fn masked(&self) -> Episode {
+        let mask = crate::secrets::mask;
+        let mut e = self.clone();
+        for text in [&mut e.question, &mut e.answer, &mut e.proposal, &mut e.facts, &mut e.checks, &mut e.correction, &mut e.outcome_failure, &mut e.outcome_command] {
+            *text = mask(text);
+        }
+        for line in &mut e.project_context {
+            *line = mask(line);
+        }
+        crate::secrets::mask_messages(&mut e.messages);
+        e
+    }
+}
+
+impl Episode {
     pub fn key(&self) -> String {
         format!("{}/{}", self.session, self.run)
     }
@@ -604,6 +620,8 @@ async fn resolve_outcome(flow: &Flow, episode: &mut Episode, entries: &[JournalE
 /// The episode's facts and edges. Its request snapshot is a record of that moment: appended once
 /// to the episodes stream, found again from the episode's `at_ms`.
 pub async fn persist_episode(flow: &Flow, e: &Episode) -> Result<(), RpcError> {
+    // The graph keeps no secret: what the person typed or a command printed is masked first.
+    let e = &e.masked();
     let key = e.key();
     let written = rows(flow, "MATCH (e:TerminalEpisode {key: $key}) RETURN e.at_ms", json!({"key": key}), 1).await?;
     let at_ms = match written.first().and_then(|r| r.first()).and_then(Value::as_u64) {
@@ -1036,6 +1054,8 @@ pub async fn background(flow: &Flow, purpose: &str, messages: Vec<ChatMessage>, 
             max_tokens: Some(800),
             idle_only: true,
         };
+        let mut params = params;
+        crate::secrets::mask_messages(&mut params.messages);
         let mut stream = ctx.call_stream("model.chat", serde_json::to_value(params)?)?;
         loop {
             tokio::select! {

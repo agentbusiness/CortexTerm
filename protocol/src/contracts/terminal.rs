@@ -732,4 +732,9 @@ pub struct CommandRunParams {
     /// Stamped by the mesh for a call from another app.
     #[serde(default)]
     pub caller: Option<crate::contracts::service::Caller>,
+    /// Set by CortexTerm's own system plugin for a schedule another app owns: the Run is that
+    /// app's (its shell, events and sandbox), and `approved` is the schedule's. Ignored when the
+    /// call has a `caller`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<crate::contracts::service::Caller>,
 }

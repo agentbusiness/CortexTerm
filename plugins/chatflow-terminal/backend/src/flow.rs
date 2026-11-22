@@ -883,6 +883,8 @@ impl Flow {
             max_tokens: Some(THINKING_TOKENS + THINKING_CLOSE_TOKENS + 900),
             idle_only: false,
         };
+        let mut params = params;
+        crate::secrets::mask_messages(&mut params.messages);
         let ctx = self.ctx()?;
         let mut stream = ctx.call_stream("model.chat", serde_json::to_value(&params).map_err(|e| RpcError::internal(e.to_string()))?)?;
         let mut content = String::new();
@@ -1268,6 +1270,7 @@ impl Flow {
             idle_only: false,
         };
         self.fit_context(&mut params, cancel).await?;
+        crate::secrets::mask_messages(&mut params.messages);
         // Keep the journal's learning/replay snapshot equal to what this call actually received.
         // Compaction changes contents in place, so recalled lesson indices remain valid.
         *messages = params.messages.clone();

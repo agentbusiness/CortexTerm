@@ -707,7 +707,7 @@ function CheckStep({ step }: { step: Step }) {
 
 export function riskLabel(risk: Assessment): string {
   if (risk.safe) return 'READ ONLY';
-  const words: Record<string, string> = { write: 'CHANGES FILES', network: 'USES THE NETWORK', delete: 'DELETES', admin: 'NEEDS ADMIN', unknown: "CAN'T PROVE SAFE", read: 'READ ONLY' };
+  const words: Record<string, string> = { write: 'CHANGES FILES', network: 'USES THE NETWORK', secret: 'READS SECRETS', delete: 'DELETES', admin: 'NEEDS ADMIN', unknown: "CAN'T PROVE SAFE", read: 'READ ONLY' };
   return words[risk.risk] ?? risk.risk.toUpperCase();
 }
 

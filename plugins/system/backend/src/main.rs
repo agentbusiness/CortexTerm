@@ -626,8 +626,9 @@ async fn markers(since: u64, bucket_ms: u64) -> Vec<Marker> {
                 "approved": job.approved,
                 "purpose": "shell",
             });
+            // As the app that owns it; its approval is the schedule's, not a fresh refusal's.
             if let Some(owner) = &job.owner {
-                params["caller"] = to_value(owner)?;
+                params["on_behalf_of"] = to_value(owner)?;
             }
             let answer = match self.ctx.get() {
                 Some(ctx) => ctx.call(terminal_contract::methods::COMMAND_RUN, params).await,

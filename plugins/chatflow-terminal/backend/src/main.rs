@@ -17,6 +17,7 @@ mod security;
 mod context;
 mod evidence;
 mod comparison;
+mod secrets;
 
 use cc_protocol::contracts::lifecycle::{Hello, ProbeCheck, ProbeReport};
 use cc_protocol::{BoxFuture, Call, Ctx, Plugin, PluginEnv, RpcError, run_plugin};

@@ -449,6 +449,9 @@ pub enum Risk {
     Read,
     Write,
     Network,
+    /// Reads a secret out: a private key, a credentials file, a `.env`, a keychain, browser
+    /// logins, a wallet, or the environment. Never safe, so the model never runs it on its own.
+    Secret,
     Delete,
     Admin,
     Unknown,
@@ -460,6 +463,7 @@ impl Risk {
             Risk::Read => "read",
             Risk::Write => "write",
             Risk::Network => "network",
+            Risk::Secret => "secret",
             Risk::Delete => "delete",
             Risk::Admin => "admin",
             Risk::Unknown => "unknown",
@@ -561,6 +565,9 @@ fn analyze_cmd(
         }
         let writes = matches!(op.as_str(), ">" | ">>" | ">|" | "&>" | "&>>" | "<>")
             || (op == ">&" && !target.text.chars().all(|c| c.is_ascii_digit() || c == '-'));
+        if op == "<" && secret_file(&expand(&target.text, shell.cwd)) {
+            out.add(Risk::Secret, format!("reads {}", target.text));
+        }
         if writes && !matches!(target.text.as_str(), "/dev/null" | "/dev/stdout" | "/dev/stderr" | "/dev/tty") {
             if target.dynamic() {
                 out.add(Risk::Unknown, "writes to a variable path");
@@ -658,6 +665,10 @@ fn analyze_cmd(
                     out.add(Risk::Unknown, format!("changes {name}"));
                 }
                 rest = &rest[1..];
+            }
+            if rest.is_empty() {
+                out.add(Risk::Secret, "prints the environment");
+                return;
             }
             return recurse(rest, out, expanded);
         }
@@ -758,11 +769,78 @@ fn analyze_cmd(
         out.add(Risk::Write, format!("runs {text}"));
         return;
     }
+    if let Some(reason) = reads_secret(name, args, shell) {
+        out.add(Risk::Secret, reason);
+        // Reading the keychain is all `security … find-…-password` does.
+        if name == "security" {
+            return;
+        }
+    }
     let (risk, reason, files) = classify(name, args, piped_in, shell, depth, out, expanded);
     out.add(risk, reason);
     if files && matches!(risk, Risk::Write | Risk::Delete) {
         out.targets.extend(args.iter().filter(|w| !w.text.starts_with('-') || w.text == "-").cloned());
     }
+}
+
+/// Programs that put a file's contents where someone reads them (the screen, a pipe, the model,
+/// the clipboard, another host). Listing, hashing or editing a file does not read it out.
+const READS_OUT: &[&str] = &[
+    "cat", "bat", "head", "tail", "less", "more", "most", "grep", "egrep", "fgrep", "rg", "ag", "ack", "strings", "xxd", "od",
+    "hexdump", "base64", "awk", "gawk", "sed", "jq", "yq", "nl", "tac", "rev", "cut", "sort", "uniq", "diff", "cmp", "column",
+    "fold", "plutil", "sqlite3", "pbcopy", "curl", "scp", "rsync", "nc", "ncat", "openssl", "gpg",
+];
+
+/// Variable names a secret usually sits in.
+fn secret_name(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    ["TOKEN", "SECRET", "PASSWORD", "PASSWD", "API_KEY", "APIKEY", "PRIVATE_KEY", "ACCESS_KEY", "CREDENTIAL"].iter().any(|part| name.contains(part))
+}
+
+/// A file that holds a secret: a private key, a credentials file, a `.env`, a keychain, browser
+/// logins and cookies, a wallet.
+fn secret_file(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    let name = basename(&text);
+    let private_key = name.starts_with("id_") && !name.ends_with(".pub") && text.contains("/.ssh/");
+    let env_file = (name == ".env" || name.starts_with(".env.")) && !matches!(name, ".env.example" | ".env.sample" | ".env.template");
+    let named = ["/.aws/credentials", "/.netrc", "/.npmrc", "/.pypirc", "/.git-credentials", "/.docker/config.json", "/.kube/config", "/.config/gh/hosts.yml"]
+        .iter()
+        .any(|end| text.ends_with(end));
+    let folders = ["/Library/Keychains/", "/.gnupg/private-keys", "/.config/gcloud/", "/.azure/", "/Electrum/wallets/", "/Application Support/Exodus/"]
+        .iter()
+        .any(|part| text.contains(part));
+    let files = matches!(name, "Login Data" | "Cookies" | "cookies.sqlite" | "logins.json" | "key4.db" | "wallet.dat")
+        || name.ends_with(".keychain")
+        || name.ends_with(".keychain-db")
+        || name.ends_with(".pem")
+        || name.ends_with(".p12")
+        || name.ends_with(".key");
+    private_key || env_file || named || folders || files
+}
+
+/// Why this command reads a secret out, if it does.
+fn reads_secret(name: &str, args: &[Word], shell: &Shell) -> Option<String> {
+    let positional: Vec<&Word> = args.iter().filter(|w| !w.text.starts_with('-')).collect();
+    match name {
+        "security" if matches!(sub(args), "find-generic-password" | "find-internet-password" | "dump-keychain" | "export" | "find-certificate") => {
+            return Some("reads the keychain".into());
+        }
+        "printenv" if positional.is_empty() || positional.iter().any(|w| secret_name(&w.text)) => return Some("prints the environment".into()),
+        // Bare, or `-p` alone: every variable with its value (`set -e` only sets an option).
+        "export" | "set" | "declare" | "typeset" if args.is_empty() || (args.len() == 1 && args[0].text == "-p") => {
+            return Some("prints the environment".into());
+        }
+        "echo" | "print" | "printf" if args.iter().any(|w| w.var && w.text.split('$').skip(1).any(|part| secret_name(part.trim_start_matches('{')))) => {
+            return Some("prints a secret variable".into());
+        }
+        _ => {}
+    }
+    if !READS_OUT.contains(&name) {
+        return None;
+    }
+    let file = args.iter().map(|w| w.text.trim_start_matches('@')).find(|text| !text.starts_with('-') && secret_file(&expand(text, shell.cwd)))?;
+    Some(format!("reads {file}"))
 }
 
 /// Record the first command's program (once). Standard tool names always run the real tool.

@@ -35,7 +35,7 @@ export interface LineProps {
 type Mode = 'shell' | 'ask' | 'unsure';
 type Client = ReturnType<typeof useRuntime>['client'];
 
-const DANGEROUS = new Set(['delete', 'admin', 'unknown']);
+const DANGEROUS = new Set(['secret', 'delete', 'admin', 'unknown']);
 const NO_RUNS: Run[] = [];
 /** Lines of a fetched script shown before it is explained or run. */
 const SCRIPT_LINES = 40;
