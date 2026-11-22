@@ -20,6 +20,7 @@ mod hub;
 mod journal;
 #[cfg(target_os = "macos")]
 mod keychain;
+mod login;
 mod machine;
 mod package;
 mod power;
@@ -225,6 +226,9 @@ async fn serve(cli: Cli, mut config: Config, home: Home) -> Result<(), String> {
     let port = tcp.local_addr().map_err(|e| e.to_string())?.port();
 
     let want_ui = config.ui && !cli.headless && !cli.runner;
+    if want_ui {
+        login::register(&home.root, &config::expand_tilde("~/.cortexterm"));
+    }
     let live = config.live.clone().unwrap_or_else(|| home.live());
     if cli.safe {
         tracing::warn!("safe mode: plugins read their packaged data only");

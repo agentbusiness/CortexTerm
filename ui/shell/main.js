@@ -91,16 +91,23 @@ p{margin:14px 0 0;font:italic 13px/18px "Iowan Old Style",Georgia,serif;color:#8
 let win = null;
 /** @type {ShellModules | null} */
 let modules = null;
+/** Set once the app quits (Quit, or the frame stopping the shell): the window may close then. */
+let quitting = false;
+
+function showWindow() {
+  if (!win) return;
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+}
 
 const single = app.requestSingleInstanceLock();
 if (!single) {
   app.quit();
 } else {
-  app.on('second-instance', () => {
-    if (!win) return;
-    if (win.isMinimized()) win.restore();
-    win.focus();
-  });
+  app.on('second-instance', () => showWindow());
+  // The Dock icon (and the starter in /Applications) brings a hidden window back.
+  app.on('activate', () => showWindow());
   app.whenReady().then(start).catch((error) => {
     log(`startup failed: ${error instanceof Error ? error.stack : String(error)}`);
     app.exit(1);
@@ -156,7 +163,8 @@ async function start() {
     minHeight: 680,
     title: 'CortexTerm',
     backgroundColor: '#14171A',
-    show: true,
+    // Started at login (frame/src/login.rs): running, with no window until the Dock icon is clicked.
+    show: process.env.CORTEX_BACKGROUND !== '1',
     webPreferences: {
       preload: path.join(here, 'preload.cjs'),
       contextIsolation: true,
@@ -166,6 +174,13 @@ async function start() {
     },
   });
   const window = win;
+  // On macOS the close button hides the window: the app (its frame, mesh and model) keeps running
+  // until Quit, as a Mac app does.
+  window.on('close', (event) => {
+    if (quitting || process.platform !== 'darwin') return;
+    event.preventDefault();
+    window.hide();
+  });
 
   let address = frameAddress();
   if (!address) {
@@ -387,6 +402,9 @@ app.on('will-quit', (event) => {
     clearTimeout(deadline);
     app.quit();
   }));
+});
+app.on('before-quit', () => {
+  quitting = true;
 });
 app.on('window-all-closed', () => app.quit());
 for (const signal of /** @type {const} */ (['SIGTERM', 'SIGINT'])) {

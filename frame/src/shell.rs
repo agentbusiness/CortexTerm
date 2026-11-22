@@ -1,5 +1,6 @@
 //! The Electron shell: a supervised child process. Restarted when it crashes; when the user quits
-//! it (closes the window or quits, exit code 0) the whole app quits: the frame shuts down. Started
+//! it (Quit, exit code 0; on macOS closing the window only hides it) the whole app quits: the frame
+//! shuts down. Started
 //! headless (`--no-ui`) or closed otherwise, `frame.ui.open` opens it.
 
 use crate::hub::Frame;
