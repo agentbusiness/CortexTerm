@@ -25,6 +25,8 @@ pub mod cleanup;
 pub mod container;
 #[cfg(feature = "filebrowser")]
 pub mod filebrowser;
+#[cfg(feature = "frontier")]
+pub mod frontier;
 #[cfg(feature = "lang")]
 pub mod lang;
 #[cfg(feature = "memory")]

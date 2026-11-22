@@ -24,6 +24,11 @@ Its code was copied from CortexCode (`../CortexCode`) and reshaped. Both apps fo
   model (no second copy of one model on a computer; another app on this computer ranks after the
   other computers), the serving order on one computer (each app says its own `sharing_priority` on its card, the highest first; no app knows another by name): an app hands a tag over to an app of a higher priority that serves the tag on the same computer, stops its own model for it, uses the other app's and does not lend it (a model an app does not run is not its to share), one models folder for every Cortex app (`~/.cortex-models`,
   `docs/SHARED-MODELS.md`; `shared-models/`);
+- lent frontier CLIs (`protocol/src/contracts/frontier.rs`, `agents.frontier.*`): a computer with
+  Claude Code or Codex signed in runs it for a member under the same switch as its model
+  (`mesh.lend`); the CLI only thinks there, with no tools of its own in an empty folder, and its
+  MCP messages go back to the asking computer, whose own tools do the work where the project is.
+  Optional as every service: an app with no plugin serving these methods lends none;
 - shared services (`protocol/src/contracts/service.rs`): the verbs and what each may do, the
   `<category>.shares` declaration, who a service is for (its `audience`: models, apps or peers),
   where a call may come from, the caller, run options, jobs and read sizes, and the
