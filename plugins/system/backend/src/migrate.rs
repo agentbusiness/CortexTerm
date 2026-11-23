@@ -60,7 +60,7 @@ pub async fn run() -> Moved {
             let mut seen = Batch::new();
             at(&mut seen, report.at);
             let n = report.findings.len();
-            store.record(&report, seen);
+            store.record(&report, seen, &Default::default());
             count("sweep findings", n, path, &mut moved);
         } else {
             count("sweep findings", 0, path, &mut moved);

@@ -914,6 +914,9 @@ pub struct SweepReport {
     /// Group -> its triage.
     #[serde(default)]
     pub triage: std::collections::BTreeMap<String, Triage>,
+    /// Sweep area -> when it was last really checked (Unix milliseconds; 0: not in 8 days).
+    #[serde(default)]
+    pub coverage: std::collections::BTreeMap<String, u64>,
 }
 
 /// A finding checked again after a command ran to fix it.

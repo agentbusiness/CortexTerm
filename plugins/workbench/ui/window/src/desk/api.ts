@@ -309,6 +309,8 @@ export interface SweepReport {
   fixes?: { at: number; group: string; text: string; command: string; gone: boolean }[];
   /** Group -> its triage. */
   triage?: Record<string, Triage>;
+  /** Sweep area -> when it was last really checked (0: not in 8 days). */
+  coverage?: Record<string, number>;
 }
 
 /** What triage made of a sweep group or live incident: code first, then the model, then an

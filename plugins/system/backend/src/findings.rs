@@ -321,9 +321,12 @@ impl Store {
 
     /// Keep a full sweep: what it saw of this Mac first, then its findings (each linked to what it
     /// is about), the findings it no longer found and the sweep's record.
-    pub fn record(&mut self, report: &SweepReport, seen: Batch) {
+    /// `also` are nodes written earlier (by the groups of this sweep that finished before a
+    /// restart) that its findings may be ABOUT.
+    pub fn record(&mut self, report: &SweepReport, seen: Batch, also: &std::collections::HashSet<cc_protocol::contracts::memory::GraphRef>) {
         let mut batch = seen;
-        let present = batch.refs();
+        let mut present = batch.refs();
+        present.extend(also.iter().cloned());
         if let Some(machine) = graph::machine() {
             let mut seen_now = std::collections::HashSet::new();
             let mut first: Vec<Value> = Vec::new();

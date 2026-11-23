@@ -187,3 +187,6 @@
   .ct-protection :is(input,select,pre){border-color:CanvasText;}
   .ct-protection :is(button,input,select,summary,pre):focus-visible{outline-color:Highlight;}
 }
+
+/* When each sweep area was last really checked. */
+.ct-sec-areas{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:6px 0;}

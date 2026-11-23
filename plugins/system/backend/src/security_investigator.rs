@@ -132,6 +132,7 @@ pub(crate) async fn model_json(
     schema: Value,
     tokens: u32,
     limit: Duration,
+    idle_only: bool,
 ) -> Result<String, String> {
     let data = serde_json::to_string(&data)
         .map_err(|_| "Cannot encode the selected observations.".to_owned())?;
@@ -160,7 +161,7 @@ pub(crate) async fn model_json(
         cache_key: Some("cortexterm-security-investigation".into()),
         stop: Vec::new(),
         max_tokens: Some(tokens),
-        idle_only: true,
+        idle_only,
     };
     let value = serde_json::to_value(params)
         .map_err(|_| "Cannot encode the investigation request.".to_owned())?;
@@ -774,6 +775,7 @@ pub async fn investigate(
             plan_schema,
             160,
             PLAN_LIMIT,
+            true,
         )
         .await
         {
@@ -864,6 +866,7 @@ pub async fn investigate(
         answer_schema(&ids),
         640,
         ANSWER_LIMIT.min(left),
+        true,
     )
     .await;
     let text = match response {

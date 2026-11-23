@@ -442,11 +442,17 @@ impl Shared {
             let p = lock(&self.protection);
             (p.config.triage.clone(), p.config.investigate)
         };
+        // Once a day, before judging anything: the planted finding.
+        if mode != "off" && lock(&self.triage).check_due() {
+            let result = triage::self_check(&ctx).await;
+            lock(&self.triage).checked(result);
+        }
+        let paused = lock(&self.triage).paused;
         let precedents = self.precedents();
         let s = self.clone();
         let mine = subject.clone();
         let similar = move |signer: &str| lock(&s.triage).similar(&mine, signer).cloned();
-        match triage::judge(&ctx, subject.clone(), self.snapshot(), precedents, mode == "shadow", investigate, similar).await {
+        match triage::judge(&ctx, subject.clone(), self.snapshot(), precedents, mode == "shadow", investigate, paused, similar).await {
             Ok(outcome) => {
                 if let (Some(investigation), Some(incident)) = (outcome.investigation, subject.incident.as_ref()) {
                     lock(&self.protection).keep_investigation(&incident.id, incident.revision, investigation);
@@ -457,6 +463,7 @@ impl Shared {
                 }
             }
             Err(error) => {
+                tracing::warn!("triage: {} could not be judged: {error}", subject.name);
                 let gate = lock(&self.triage).failed(&subject, &error);
                 if matches!(gate, Some(triage::Gate::Notify)) {
                     self.announce_now(&subject);
@@ -465,8 +472,11 @@ impl Shared {
         }
     }
 
-    /// The report with its triage (by group).
+    /// The report with its triage (by group) and when each area was last checked.
     fn with_triage(&self, mut report: SweepReport) -> SweepReport {
+        // Before the first kept part, an area was last checked by the last full sweep.
+        let full = lock(&self.findings).last.at;
+        report.coverage = sweep::coverage().into_iter().map(|(area, at)| (area, if at == 0 { full } else { at })).collect();
         let store = lock(&self.triage);
         for f in &report.findings {
             if let Some(t) = store.get(&protection::group_subject(&f.group)) {
@@ -481,10 +491,11 @@ impl Shared {
         let _guard = self.sweep_lock.lock().await;
         // Its baselines are in the graph: wait a little for memory when it is still starting.
         graph::wait_ready(Duration::from_secs(60)).await;
-        let (report, seen) = sweep::run_sweep().await;
+        let since = lock(&self.findings).last.at;
+        let (report, seen, also) = sweep::run_sweep(since).await;
         let mut store = lock(&self.findings);
         if graph::ready() {
-            store.record(&report, seen);
+            store.record(&report, seen, &also);
         } else {
             store.last = report.clone();
         }
@@ -648,6 +659,7 @@ impl Shared {
         let ports = sampler::load_ports().await?;
         let protection = protection::Store::load().await?;
         let triage = triage::Store::load().await?;
+        sweep::load_coverage().await?;
         let summary = format!(
             "last sweep {} ({} findings), {} alerts, {} schedules, {} live traces, {feeds} feeds, {items} start items, {networks} networks, {servers} MCP servers, {notes} network notes, {ports} ports",
             findings.last.at,
@@ -1028,6 +1040,8 @@ fn start(shared: &Arc<Shared>) {
             if let (Some(text), Some(ctx)) = (digest, s.ctx.get()) {
                 Shared::notify(ctx, notify::kinds::INFO, "Security this week", text, "system:security-digest".into(), json!({"open": "system.alert"}));
             }
+            let (state, words) = lock(&s.triage).health();
+            protection::health("triage", "Triage with local AI", state, &words);
             let next = lock(&s.triage).next();
             if let Some(subject) = next {
                 s.triage_one(subject).await;

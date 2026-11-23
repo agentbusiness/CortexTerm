@@ -449,6 +449,7 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
       <button type="button" className="detent sm" aria-expanded={coverage} onClick={() => setCoverage((value) => !value)}>COVERAGE {coverage ? '▾' : '▸'}</button>
     </div>}
     {status && coverage && coverageView()}
+    {areasLine()}
 
     <div className="ct-sec-chart-box">
       <div className="ct-sec-legend">
@@ -518,6 +519,18 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
         {entry.incident && <button type="button" className="detent sm" disabled={configurationDisabled || !status?.config.investigate || ['running', 'queued'].includes(investigation?.state ?? '')} onClick={() => void act(entry.incident!.id, 'investigate')}>I · INVESTIGATE</button>}
       </div>
     </>;
+  }
+
+  /** When each sweep area was last really checked: the ones not checked in two days are named. */
+  function areasLine() {
+    const areas = Object.entries(report?.coverage ?? {});
+    if (areas.length === 0) return null;
+    const now = Date.now();
+    const late = areas.filter(([, at]) => !at || now - at > 2 * 86_400_000);
+    return <div className={`ct-sec-areas${late.length ? ' late' : ''}`} title={areas.map(([area, at]) => `${area}: ${at ? `checked ${ago(at)}` : 'not checked in 8 days'}`).join('\n')}>
+      <span className="ct-label ct-blue">{areas.length - late.length} OF {areas.length} SWEEP AREAS CHECKED IN 2 DAYS</span>
+      {late.length > 0 && <span className="ct-label ct-warn">{late.map(([area, at]) => `${area.toUpperCase()} ${at ? ago(at).toUpperCase() : 'NOT IN 8 DAYS'}`).join(' · ')}</span>}
+    </div>;
   }
 
   /** What triage made of an item: why it is grey or in colour, the facts it looked at, and a way

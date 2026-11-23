@@ -635,7 +635,7 @@ fn xprotect(part: &mut Part) {
             fix,
             "xprotect",
         ),
-        Some(_) => {}
+        Some(_) => remediator(part, sofa.as_ref()),
         None => match installed {
             Some(day) if today() - day > 30 => part.add(
                 "low",
@@ -647,6 +647,33 @@ fn xprotect(part: &mut Part) {
             Some(_) => {}
             None => part.skipped.push("XProtect freshness: unknown install date and no SOFA feed cached yet".into()),
         },
+    }
+}
+
+/// XProtect Remediator, the part that removes known malware on a schedule, against SOFA's version.
+fn remediator(part: &mut Part, sofa: Option<&Value>) {
+    const APP: &str = "/Library/Apple/System/Library/CoreServices/XProtect.app/Contents/Info.plist";
+    let Some(info) = plist_dict(APP) else {
+        part.skipped.push("XProtect Remediator: its app's version could not be read".into());
+        return;
+    };
+    let Some(version) = info.get("CFBundleShortVersionString").and_then(|v| v.as_string()).and_then(|v| v.parse::<u64>().ok()) else { return };
+    part.checked.push(format!("XProtect Remediator ({version})"));
+    let current = sofa.and_then(|s| {
+        let data = &s["XProtectPayloads"];
+        Some((data["com.apple.XProtectFramework.XProtect"].as_str()?.parse::<u64>().ok()?, days(data["ReleaseDate"].as_str()?)?))
+    });
+    if let Some((latest, released)) = current
+        && version < latest
+        && today() - released > 3
+    {
+        part.add(
+            "medium",
+            "posture",
+            format!("XProtect Remediator, which removes known malware on a schedule, is version {version}; {latest} has been out for {} days, so its updates may be broken.", today() - released),
+            Some("sudo softwareupdate --background-critical".to_owned()),
+            "xprotect",
+        );
     }
 }
 

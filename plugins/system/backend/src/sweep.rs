@@ -1,6 +1,10 @@
 //! The workstation security sweep. Every check has a time limit; a missing tool is reported in
 //! `skipped` with why. Fixes are only ever offered as commands, never run. Secret scans report
 //! counts, never the text.
+//!
+//! Each group of checks is kept as it finishes (stream `security.sweep.parts`, 8 days: `{key,
+//! full, checked, skipped, findings: [{finding, about}]}`): a full sweep cut off by a restart goes
+//! on from what already finished, and the coverage line says when each area was really checked.
 
 use crate::{agents, graph, intrusion, inventory, launch, malware, netsec, persist, posture, privacy, ssh};
 use crate::util::{home, local_time, now_ms, plural, run, tilde, which};
@@ -8,7 +12,8 @@ use cc_protocol::BoxFuture;
 use cc_protocol::contracts::system::{Finding, SweepReport};
 use regex::Regex;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Mutex;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -222,15 +227,107 @@ impl Area {
 }
 
 /// Run the whole sweep: its report, and what it saw of this Mac for the graph.
-pub async fn run_sweep() -> (SweepReport, graph::Batch) {
-    run_areas(&Area::ALL, None, &SweepReport::default()).await
+/// A full sweep. `since` is when the last full sweep finished: groups of checks that finished
+/// after it (a sweep a restart cut off) are taken as they were, not run again. The refs are the
+/// nodes those groups wrote, which the findings may be ABOUT.
+pub async fn run_sweep(since: u64) -> (SweepReport, graph::Batch, HashSet<cc_protocol::contracts::memory::GraphRef>) {
+    run_groups(&Area::ALL, None, &SweepReport::default(), Some(since)).await
+}
+
+const PARTS: &str = "security.sweep.parts";
+const PART_DAYS: u32 = 8;
+
+/// When each area was last really checked (Unix milliseconds), from the kept parts.
+static COVERAGE: Mutex<BTreeMap<&'static str, u64>> = Mutex::new(BTreeMap::new());
+
+fn key_of(areas: &[Area]) -> String {
+    areas.iter().map(|a| a.name()).collect::<Vec<_>>().join(",")
+}
+
+fn covered(key: &str, at: u64) {
+    let mut coverage = COVERAGE.lock().unwrap_or_else(|p| p.into_inner());
+    for name in key.split(',') {
+        if let Some(area) = Area::ALL.iter().find(|a| a.name() == name) {
+            let slot = coverage.entry(area.name()).or_insert(0);
+            *slot = (*slot).max(at);
+        }
+    }
+}
+
+/// Read the kept parts once at start: the coverage.
+pub async fn load_coverage() -> Result<(), String> {
+    let since = now_ms().saturating_sub(u64::from(PART_DAYS) * 86_400_000);
+    for entry in graph::stream_read(PARTS, since).await? {
+        covered(&graph::text(&entry.value["key"]), entry.at_ms);
+    }
+    Ok(())
+}
+
+/// Area name -> when it was last really checked (0: not in the last 8 days).
+pub fn coverage() -> BTreeMap<String, u64> {
+    let coverage = COVERAGE.lock().unwrap_or_else(|p| p.into_inner());
+    Area::ALL.iter().map(|a| (a.name().to_owned(), coverage.get(a.name()).copied().unwrap_or(0))).collect()
+}
+
+/// A group finished: what it saw goes to the graph now (so a later finding can be ABOUT it even
+/// after a restart) and, for a full sweep, its findings are kept.
+fn keep_part(key: &str, part: &Part, full: bool) {
+    let at = now_ms();
+    covered(key, at);
+    if !graph::ready() {
+        return;
+    }
+    let mut record = json!({"key": key, "full": full});
+    if full {
+        graph::put(part.graph.clone());
+        let findings: Vec<Value> = part.findings.iter().map(|f| json!({"finding": f, "about": f.about})).collect();
+        record = json!({"key": key, "full": true, "checked": part.checked, "skipped": part.skipped, "findings": findings});
+    }
+    graph::append(PARTS, vec![record], PART_DAYS);
+}
+
+/// The groups of a full sweep that finished since `since` (at most 36 hours ago), by key.
+async fn kept_parts(since: u64) -> HashMap<String, (Part, HashSet<cc_protocol::contracts::memory::GraphRef>)> {
+    let mut out = HashMap::new();
+    let floor = since.max(now_ms().saturating_sub(36 * 3_600_000)).saturating_add(1);
+    for entry in graph::stream_read(PARTS, floor).await.unwrap_or_default() {
+        let value = &entry.value;
+        if value["full"].as_bool() != Some(true) {
+            continue;
+        }
+        let mut part = Part { checked: graph::texts(&value["checked"]), skipped: graph::texts(&value["skipped"]), ..Default::default() };
+        let mut refs = HashSet::new();
+        for item in value["findings"].as_array().into_iter().flatten() {
+            let Ok(mut finding) = serde_json::from_value::<Finding>(item["finding"].clone()) else { continue };
+            finding.about = serde_json::from_value::<Option<(String, String)>>(item["about"].clone()).ok().flatten();
+            if let Some((label, key)) = &finding.about {
+                refs.insert(graph::r(label, key.clone()));
+            }
+            part.at_check.push(part.checked.len());
+            part.findings.push(finding);
+        }
+        part.checked = part.checked.into_iter().map(|c| format!("{c} (finished {}, before a restart)", local_time(entry.at_ms))).collect();
+        // The newest record of a group wins.
+        out.insert(graph::text(&value["key"]), (part, refs));
+    }
+    out
 }
 
 /// Run the checks of some areas, each group of checks side by side. With `within`, a group that
 /// has not finished by then contributes `last`'s findings for its areas instead (when there is a
 /// `last`), and `checked` says so. Also what the checks saw of this Mac, as graph units.
 pub async fn run_areas(areas: &[Area], within: Option<Duration>, last: &SweepReport) -> (SweepReport, graph::Batch) {
+    let (report, batch, _) = run_groups(areas, within, last, None).await;
+    (report, batch)
+}
+
+async fn run_groups(areas: &[Area], within: Option<Duration>, last: &SweepReport, resume: Option<u64>) -> (SweepReport, graph::Batch, HashSet<cc_protocol::contracts::memory::GraphRef>) {
     let started = Instant::now();
+    let mut kept = match resume {
+        Some(since) => kept_parts(since).await,
+        None => HashMap::new(),
+    };
+    let mut present: HashSet<cc_protocol::contracts::memory::GraphRef> = HashSet::new();
     let has = |area: Area| areas.contains(&area);
     let scope = inventory::Scope { updates: has(Updates) || has(Apps), apps: has(Apps), deps: has(Packages), secrets: has(Secrets) };
     let discovery = std::sync::Arc::new(crate::filesystem::Scan::default());
@@ -262,19 +359,31 @@ pub async fn run_areas(areas: &[Area], within: Option<Duration>, last: &SweepRep
     }
 
     let deadline = within.map(|d| tokio::time::Instant::now() + d);
+    let full = resume.is_some();
     let mut tasks = tokio::task::JoinSet::new();
     let mut served: Vec<Vec<Area>> = Vec::new();
+    let mut parts: Vec<Option<Part>> = Vec::new();
     for (i, (group_areas, work)) in groups.into_iter().enumerate() {
+        let key = key_of(&group_areas);
         served.push(group_areas);
+        // Finished before a restart: taken as it was.
+        if let Some((part, refs)) = kept.remove(&key) {
+            present.extend(refs);
+            parts.push(Some(part));
+            continue;
+        }
+        parts.push(None);
         tasks.spawn(async move {
             let part = match deadline {
                 Some(deadline) => tokio::time::timeout_at(deadline, work).await.ok(),
                 None => Some(work.await),
             };
+            if let Some(part) = &part {
+                keep_part(&key, part, full);
+            }
             (i, part)
         });
     }
-    let mut parts: Vec<Option<Part>> = served.iter().map(|_| None).collect();
     while let Some(done) = tasks.join_next().await {
         if let Ok((i, part)) = done {
             parts[i] = part;
@@ -326,7 +435,7 @@ pub async fn run_areas(areas: &[Area], within: Option<Duration>, last: &SweepRep
         skipped: all.skipped,
         ..Default::default()
     };
-    (report, all.graph)
+    (report, all.graph, present)
 }
 
 fn merged((a, b): (Part, Part)) -> Part {
