@@ -7,9 +7,13 @@
 //! - malicious-package records (OSV `MAL-`) for the project and global packages installed;
 //! - every advisory the graph already says affects this Mac, to see whether it still does.
 //!
-//! What affects this Mac is kept in the graph as `(:Advisory)-[:AFFECTS {verdict*}]->` the app,
-//! formula, package or macOS it affects (`cve::record`); only an advisory that affected nothing
-//! here before raises an alert. The facts earlier versions wrote (`<id> affects this Mac`,
+//! What is installed is what the last sweep recorded in the graph (no walk of the disk unless the
+//! graph has nothing yet). What affects this Mac is kept in the graph as
+//! `(:Advisory)-[:AFFECTS {verdict*}]->` the app, formula, package or macOS it affects
+//! (`cve::record`); only an advisory that affected nothing here before raises an alert, and only
+//! when it matters (`cve::priority`): high when CISA KEV lists it or the vendor marks it exploited,
+//! a warning when EPSS is at least 0.1 or CISA's SSVC says it is exploited and automatable. The
+//! rest is recorded and counted, never alerted one by one. The facts earlier versions wrote (`<id> affects this Mac`,
 //! global knowledge) are looked at once more and withdrawn: the AFFECTS edges replace them.
 //! Nothing is kept outside the graph.
 
@@ -98,11 +102,12 @@ async fn round(ctx: &Ctx) -> Result<Vec<Candidate>, String> {
 
     let mut found = Vec::new();
     let mut affected = BTreeSet::new();
+    let mut quiet = 0;
     for (looked, id) in ids.iter().take(MOST).enumerate() {
         if looked > 0 {
             tokio::time::sleep(APART).await;
         }
-        let Ok(report) = batch.report(id).await else { continue };
+        let Ok((report, rated)) = batch.report(id).await else { continue };
         // Unknown is not a change of mind: the edges keep their verdict until a look says otherwise.
         if report.verdict != "unknown" {
             batch.record(&report);
@@ -111,7 +116,10 @@ async fn round(ctx: &Ctx) -> Result<Vec<Candidate>, String> {
         if report.verdict == "affected" {
             affected.insert(id.clone());
             if !before.contains(id) && fact.is_none() {
-                found.push(alert(&report));
+                match alert(&report, rated) {
+                    Some(candidate) => found.push(candidate),
+                    None => quiet += 1,
+                }
             }
         }
         // A fact an earlier version wrote: the edges hold it now.
@@ -129,7 +137,7 @@ async fn round(ctx: &Ctx) -> Result<Vec<Candidate>, String> {
             let _ = call(ctx, memory_contract::methods::KNOWLEDGE_WITHDRAW, params).await;
         }
     }
-    tracing::info!("cve watch: {} advisories looked at, {} affect this Mac, {} new", ids.len().min(MOST), affected.len(), found.len());
+    tracing::info!("cve watch: {} advisories looked at, {} affect this Mac, {} new alerts, {quiet} new of low priority (recorded, not alerted)", ids.len().min(MOST), affected.len(), found.len());
     Ok(found)
 }
 
@@ -145,12 +153,17 @@ async fn known(ctx: &Ctx) -> Result<Vec<(String, KnowledgeItem)>, String> {
         .collect())
 }
 
-fn alert(report: &CveReport) -> Candidate {
-    let severity = if report.kev.is_some() || report.id.starts_with("MAL-") || report.cvss.as_ref().is_some_and(|c| c.score >= 9.0) { "high" } else { "warn" };
-    Candidate {
+/// An alert for an advisory newly affecting this Mac, by its priority; none for a low one.
+fn alert(report: &CveReport, priority: &str) -> Option<Candidate> {
+    let severity = match priority {
+        "high" => "high",
+        "medium" => "warn",
+        _ => return None,
+    };
+    Some(Candidate {
         key: format!("cve:{}", report.id),
         alert: Alert { kind: "cve".into(), severity: severity.into(), text: report.verdict_text.clone(), actions: vec!["show".into()], ..Default::default() },
-    }
+    })
 }
 
 /// Whether a CISA row's vendor and product name something installed here: Apple's always (macOS

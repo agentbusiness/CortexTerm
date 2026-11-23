@@ -133,14 +133,20 @@ impl Iterator for Walk {
             } else {
                 self.roots.pop()?
             };
-            // Do not open devices, process pseudo-files, or their aliases.
-            let canonical = match path.canonicalize() {
-                Ok(path) => path,
-                Err(error) => {
-                    self.unread
-                        .add(format!("filesystem: {}: {error}", tilde(&path)));
-                    continue;
+            // Do not open devices, process pseudo-files, or their aliases. Only a symlink can lead
+            // somewhere else, so only a symlink is resolved (resolving every path costs a look-up
+            // per folder above it, and made a whole-disk walk take hours).
+            let link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
+            let canonical = if link {
+                match path.canonicalize() {
+                    Ok(path) => path,
+                    Err(error) => {
+                        self.unread.add(format!("filesystem: {}: {error}", tilde(&path)));
+                        continue;
+                    }
                 }
+            } else {
+                path.clone()
             };
             if ["/dev", "/proc", "/sys"]
                 .iter()
@@ -229,6 +235,7 @@ impl Discovery {
                     ".claude/settings.local.json",
                     "Claude/claude_desktop_config.json",
                     ".cursor/mcp.json",
+                    ".cursor/hooks.json",
                     ".codeium/windsurf/mcp_config.json",
                     "Code/User/mcp.json",
                     "Code/User/settings.json",

@@ -32,6 +32,8 @@ const CHROME: &str = "https://versionhistory.googleapis.com/v1/chrome/platforms/
 const FIREFOX: &str = "https://product-details.mozilla.org/1.0/firefox_versions.json";
 const CASKS: &str = "https://formulae.brew.sh/api/cask.json";
 const MALEXT: &str = "https://raw.githubusercontent.com/toborrm9/malicious_extension_sentry/main/Malicious-Extensions.csv";
+/// Microsoft's list of extensions it removed from the VS Marketplace (id, date, why), daily.
+const VSREMOVED: &str = "https://raw.githubusercontent.com/microsoft/vsmarketplace/main/RemovedPackages.md";
 
 // ---------------------------------------------------------------------------------------------
 // Dates and versions (also used by the posture checks)
@@ -287,6 +289,21 @@ fn keep_casks(bytes: &[u8]) -> Option<Vec<u8>> {
     (!casks.is_empty()).then(|| serde_json::to_vec(&casks).ok()).flatten()
 }
 
+/// Microsoft's RemovedPackages.md, kept as `[lowercase id, date, type]` rows (the Markdown
+/// table `| Extension Identifier | Removal Date | Type |`).
+fn keep_vsremoved(bytes: &[u8]) -> Option<Vec<u8>> {
+    let text = String::from_utf8_lossy(bytes);
+    let rows: Vec<(String, String, String)> = text
+        .lines()
+        .filter_map(|line| {
+            let cells: Vec<&str> = line.trim().trim_matches('|').split('|').map(str::trim).collect();
+            let [id, date, why] = cells.as_slice() else { return None };
+            (id.contains('.') && !id.contains(' ') && !id.starts_with('-')).then(|| (id.to_lowercase(), (*date).to_owned(), (*why).to_owned()))
+        })
+        .collect();
+    (rows.len() > 50).then(|| serde_json::to_vec(&rows).ok()).flatten()
+}
+
 fn keep_text(bytes: &[u8]) -> Option<Vec<u8>> {
     (bytes.len() > 1000).then(|| bytes.to_vec())
 }
@@ -301,11 +318,13 @@ struct Feeds {
     firefox: Option<Value>,
     casks: Vec<Cask>,
     malext: HashSet<String>,
+    /// Lowercase extension id -> (why Microsoft removed it, when).
+    vsremoved: HashMap<String, (String, String)>,
 }
 
 async fn load_feeds(client: &reqwest::Client) -> (Feeds, Part) {
     let mut part = Part::default();
-    let (sofa, safari, kev, electron, chrome, firefox, casks, malext) = tokio::join!(
+    let (sofa, safari, kev, electron, chrome, firefox, casks, malext, vsremoved) = tokio::join!(
         feed(client, "sofa-macos.json", SOFA_MACOS, json_ok),
         feed(client, "sofa-safari.json", SOFA_SAFARI, json_ok),
         feed(client, KEV_FILE, KEV, keep_kev),
@@ -314,6 +333,7 @@ async fn load_feeds(client: &reqwest::Client) -> (Feeds, Part) {
         feed(client, "firefox.json", FIREFOX, json_ok),
         feed(client, "homebrew-casks.json", CASKS, keep_casks),
         feed(client, "malicious-extensions.csv", MALEXT, keep_text),
+        feed(client, "vsmarketplace-removed.json", VSREMOVED, keep_vsremoved),
     );
     let parse = |bytes: Option<Vec<u8>>| bytes.and_then(|b| serde_json::from_slice::<Value>(&b).ok());
     let mut feeds = Feeds {
@@ -333,6 +353,9 @@ async fn load_feeds(client: &reqwest::Client) -> (Feeds, Part) {
         && let Ok(id) = Regex::new(r"\b[a-p]{32}\b")
     {
         feeds.malext = id.find_iter(&String::from_utf8_lossy(&bytes)).map(|m| m.as_str().to_owned()).collect();
+    }
+    if let Some(bytes) = take(&mut part, "VS Marketplace removed extensions", vsremoved) {
+        feeds.vsremoved = serde_json::from_slice::<Vec<(String, String, String)>>(&bytes).unwrap_or_default().into_iter().map(|(id, date, why)| (id, (why, date))).collect();
     }
     (feeds, part)
 }
@@ -454,6 +477,16 @@ pub struct Local {
     toolchains: Vec<Toolchain>,
     pub projects: Vec<Project>,
     extensions: Vec<BrowserExt>,
+    editor_extensions: Vec<EditorExt>,
+}
+
+/// One installed VS Code, Cursor, Windsurf or VSCodium extension.
+struct EditorExt {
+    editor: &'static str,
+    cli: &'static str,
+    /// `publisher.name`, as written in its package.json.
+    id: String,
+    version: String,
 }
 
 fn info(path: &Path) -> Option<plist::Dictionary> {
@@ -485,7 +518,7 @@ impl Local {
         }
         if scope.apps {
             local.extensions();
-            editor_extensions(&mut local.part);
+            editor_extensions(&mut local.part, &mut local.editor_extensions);
         }
         if scope.secrets {
             secret_files(&mut local.part, &local.projects);
@@ -502,6 +535,80 @@ impl Local {
         local.apps(false, &discovery);
         local.projects(&discovery);
         local
+    }
+
+    /// What the last sweep recorded in the graph: macOS and Safari, the apps and the projects'
+    /// packages (with no walk of the disk). None when the graph holds no apps yet.
+    pub async fn recorded() -> Option<Local> {
+        if !graph::ready() {
+            return None;
+        }
+        let rows = graph::query_all(
+            "MATCH (a:App)-[:INSTALLED_ON]->(:Machine) WHERE a.ended_ms IS NULL RETURN a.key, a.name, a.version, a.path, a.origin, a.electron ORDER BY a.key",
+            json!({}),
+        )
+        .await
+        .ok()?;
+        if rows.is_empty() {
+            return None;
+        }
+        let origin = |text: &str| match text {
+            "App Store" => "App Store",
+            "Homebrew" => "Homebrew",
+            "Sparkle" => "Sparkle",
+            "Apple" => "Apple",
+            _ => "direct",
+        };
+        let mut local = Local::default();
+        for row in &rows {
+            let path = PathBuf::from(graph::text(&row[3]));
+            // An app that is gone since the sweep is not compared.
+            if !path.as_os_str().is_empty() && !path.exists() {
+                continue;
+            }
+            let electron = Some(graph::text(&row[5])).filter(|e| !e.is_empty());
+            local.apps.push(App { id: graph::text(&row[0]), name: graph::text(&row[1]), version: graph::text(&row[2]), path, origin: origin(&graph::text(&row[4])), feed: None, electron, signature: None });
+        }
+        local.safari = local.apps.iter().find(|a| a.id == "com.apple.Safari").map(|a| a.version.clone()).unwrap_or_default();
+        local.os = graph::query("MATCH (o:OS {key: 'macOS'}) RETURN o.version", json!({})).await.ok().and_then(|rows| rows.first().map(|row| graph::text(&row[0]))).unwrap_or_default();
+        if local.os.is_empty() {
+            local.os = run("/usr/bin/sw_vers", &["-productVersion"], STEP).map(|o| o.stdout.trim().to_owned()).unwrap_or_default();
+        }
+        if let Ok(rows) = graph::query_all("MATCH (f:Formula)-[:INSTALLED_ON]->(:Machine) WHERE f.ended_ms IS NULL AND f.kind = 'cask' RETURN f.key", json!({})).await {
+            local.casks_installed = rows.iter().map(|row| graph::text(&row[0])).collect();
+        }
+        let ecosystem = |text: &str| -> Option<&'static str> {
+            ["npm", "PyPI", "crates.io", "Go", "RubyGems"].into_iter().find(|e| *e == text)
+        };
+        let packages = graph::query_all(
+            "MATCH (p:Repo)-[d:DEPENDS_ON]->(k:Package) WHERE p.ended_ms IS NULL RETURN p.key, k.ecosystem, k.name, d.version, d.versions ORDER BY p.key, k.key",
+            json!({}),
+        )
+        .await
+        .unwrap_or_default();
+        for row in &packages {
+            let root = PathBuf::from(graph::text(&row[0]));
+            let Some(eco) = ecosystem(&graph::text(&row[1])) else { continue };
+            if local.projects.last().is_none_or(|p| p.root != root) {
+                local.projects.push(Project { root: root.clone(), ..Default::default() });
+            }
+            let project = local.projects.last_mut().expect("pushed above");
+            let name = graph::text(&row[2]);
+            let mut versions = graph::texts(&row[4]);
+            if versions.is_empty() {
+                versions.push(graph::text(&row[3]));
+            }
+            for version in versions.into_iter().filter(|v| !v.is_empty()) {
+                project.packages.insert((eco, name.clone(), version));
+            }
+        }
+        local.part.checked.push(format!(
+            "this Mac as the last sweep recorded it: {}, {} in {}",
+            plural(local.apps.len(), "app", "apps"),
+            plural(local.projects.iter().map(|p| p.packages.len()).sum::<usize>(), "project package", "project packages"),
+            plural(local.projects.len(), "project", "projects")
+        ));
+        Some(local)
     }
 
     /// The apps; `inspect` also checks their signatures and library loading (slower).
@@ -1256,7 +1363,7 @@ fn browser_ext(browser: &'static str, id: String, name: String, perms: &[String]
 }
 
 /// VS Code, Cursor and Windsurf extensions: run on every start, sideloaded, invisible code.
-fn editor_extensions(part: &mut Part) {
+fn editor_extensions(part: &mut Part, found: &mut Vec<EditorExt>) {
     let h = home();
     let editors = [
         ("VS Code", "code", h.join(".vscode/extensions")),
@@ -1288,6 +1395,7 @@ fn editor_extensions(part: &mut Part) {
             count += 1;
             let id = format!("{}.{}", pkg["publisher"].as_str().unwrap_or("?"), pkg["name"].as_str().unwrap_or("?"));
             let version = pkg["version"].as_str().unwrap_or("");
+            found.push(EditorExt { editor, cli, id: id.clone(), version: version.to_owned() });
             if pkg["activationEvents"].as_array().is_some_and(|a| a.iter().any(|e| e == "*")) {
                 always.push(id.clone());
             }
@@ -1337,19 +1445,30 @@ fn editor_extensions(part: &mut Part) {
     }
 }
 
-/// The longest run of invisible characters (zero-width, variation selectors, tags, private use)
-/// in a file of at most 8 MB.
+/// The longest run of characters that hide code, in a file of at most 8 MB: zero-width spaces and
+/// joiners (a joiner between emoji is part of the emoji), the word joiner, a byte-order mark after
+/// the start, tag characters, the variation selectors U+E0100–U+E01EF (GlassWorm's carrier) and
+/// bidirectional controls. Emoji variation selectors (U+FE00–U+FE0F) and private-use characters
+/// (icon fonts) are ordinary text.
 fn invisible_run(path: &Path) -> usize {
     if std::fs::metadata(path).map(|m| m.len()).unwrap_or(u64::MAX) > 8 * 1024 * 1024 {
         return 0;
     }
     let Ok(bytes) = std::fs::read(path) else { return 0 };
-    let (mut best, mut current) = (0, 0);
-    for c in String::from_utf8_lossy(&bytes).chars() {
-        let hidden = matches!(c as u32,
-            0x200B..=0x200F | 0x2060..=0x2064 | 0xFEFF | 0xFE00..=0xFE0F | 0xE000..=0xF8FF | 0xE0000..=0xE007F | 0xE0100..=0xE01EF | 0xF0000..=0x10FFFF);
+    let emoji = |c: char| matches!(c as u32, 0x1F000..=0x1FAFF | 0x2600..=0x27BF | 0xFE0F);
+    let (mut best, mut current, mut previous) = (0, 0, None::<char>);
+    for (i, c) in String::from_utf8_lossy(&bytes).chars().enumerate() {
+        let hidden = match c as u32 {
+            0x200B | 0x200C | 0x2060 => true,
+            0x200D => !previous.is_some_and(emoji),
+            0xFEFF => i > 0,
+            0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069 => true,
+            0xE0000..=0xE007F | 0xE0100..=0xE01EF => true,
+            _ => false,
+        };
         current = if hidden { current + 1 } else { 0 };
         best = best.max(current);
+        previous = Some(c);
     }
     best
 }
@@ -1802,13 +1921,16 @@ async fn os_section(client: &reqwest::Client, feeds: &Feeds, local: &Local) -> P
                             }
                             exploited.extend(release["ActivelyExploitedCVEs"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_owned)));
                         }
-                        let risk = risk_text(client, feeds, &cves, &exploited).await;
+                        exploited.extend(cves.iter().filter(|c| feeds.kev.contains(*c)).cloned());
+                        let risk = risk_text(client, &cves, &exploited).await;
                         let text = format!(
                             "macOS {} is {} behind {latest}; {risk}",
                             local.os,
                             plural(missed.len(), "security update", "security updates")
                         );
-                        part.add(if exploited.is_empty() { "medium" } else { "high" }, "vuln", text, update.clone(), "SOFA");
+                        // Exploited fixes missed on this Mac are hard evidence of exposure.
+                        let (severity, source) = if exploited.is_empty() { ("medium", "SOFA") } else { ("high", "exploited-cve") };
+                        part.add(severity, "vuln", text, update.clone(), source);
                         part.about("OS", "macOS");
                     }
                 }
@@ -1838,9 +1960,11 @@ async fn os_section(client: &reqwest::Client, feeds: &Feeds, local: &Local) -> P
                         }
                     }
                 }
-                let risk = risk_text(client, feeds, &cves, &exploited).await;
+                exploited.extend(cves.iter().filter(|c| feeds.kev.contains(*c)).cloned());
+                let risk = risk_text(client, &cves, &exploited).await;
                 let text = format!("Safari {} is behind {latest}; {risk}", local.safari);
-                part.add(if exploited.is_empty() { "medium" } else { "high" }, "vuln", text, update, "SOFA");
+                let (severity, source) = if exploited.is_empty() { ("medium", "SOFA") } else { ("high", "exploited-cve") };
+                part.add(severity, "vuln", text, update, source);
                 part.about("App", "com.apple.Safari");
             }
         }
@@ -1849,10 +1973,8 @@ async fn os_section(client: &reqwest::Client, feeds: &Feeds, local: &Local) -> P
 }
 
 /// "the newer releases fix 392 vulnerabilities, 2 of them actively exploited (CVE-…); the
-/// highest exploit likelihood (EPSS) is 26%." KEV adds to the exploited set.
-async fn risk_text(client: &reqwest::Client, feeds: &Feeds, cves: &BTreeSet<String>, exploited: &BTreeSet<String>) -> String {
-    let mut exploited = exploited.clone();
-    exploited.extend(cves.iter().filter(|c| feeds.kev.contains(*c)).cloned());
+/// highest exploit likelihood (EPSS) is 26%." `exploited` already holds the KEV-listed ones.
+async fn risk_text(client: &reqwest::Client, cves: &BTreeSet<String>, exploited: &BTreeSet<String>) -> String {
     let mut text = format!("the newer releases fix {}", plural(cves.len(), "vulnerability", "vulnerabilities"));
     if !exploited.is_empty() {
         let list: Vec<String> = exploited.iter().cloned().collect();
@@ -2021,18 +2143,27 @@ async fn deps_section(client: &reqwest::Client, local: &Local) -> Part {
             "vuln",
             format!("{shown} has {} known to be malicious: {}. Installing it ran its code on this Mac.", plural(bad.len(), "package", "packages"), names(&bad, 5)),
             None,
-            "osv",
+            "osv-malicious",
         );
         part.about("Repo", project.root.display().to_string());
     }
     if !outdated.is_empty() {
         outdated.sort_by(|a, b| b.1.cmp(&a.1));
         let shown: Vec<String> = outdated.iter().map(|(root, n)| format!("{root} ({n})")).collect();
+        // One line for all of them, rated by the worst known exploitation (never by CVSS alone):
+        // an exploited one is worth a look, the rest is a quiet count.
+        let ids: Vec<String> = vulns.values().flatten().cloned().collect::<BTreeSet<_>>().into_iter().collect();
+        let (rating, why) = crate::cve::prioritise(client, &ids).await;
+        let severity = match rating {
+            "high" => "medium",
+            "medium" => "low",
+            _ => "info",
+        };
         part.add(
-            "info",
+            severity,
             "vuln",
             format!(
-                "{} use dependencies with known vulnerabilities: {}. They belong to your work, not to this Mac; update them in each project when you work on it.",
+                "{} use dependencies with known vulnerabilities: {}; {why}. They belong to your work, not to this Mac; update them in each project when you work on it.",
                 plural(outdated.len(), "project or package cache", "projects and package caches"),
                 names(&shown, 3)
             ),
@@ -2142,6 +2273,28 @@ fn extension_findings(feeds: &Feeds, local: &Local) -> Part {
             "MalExt Sentry",
         );
         part.about("Extension", extension_key(ext));
+    }
+    // Editor extensions Microsoft removed from its marketplace: malware is hard evidence; one removed
+    // as untrustworthy or as an impersonation is worth a look; spam and the rest are a note.
+    if feeds.vsremoved.is_empty() {
+        part.skipped.push("removed VS Code extensions: no copy of Microsoft's RemovedPackages list".into());
+    } else {
+        part.checked.push(format!("editor extensions against Microsoft's removed list ({} ids)", feeds.vsremoved.len()));
+    }
+    for ext in &local.editor_extensions {
+        let Some((why, date)) = feeds.vsremoved.get(&ext.id.to_lowercase()) else { continue };
+        let (severity, source, advice) = match why.to_ascii_lowercase().as_str() {
+            "malware" => ("high", "vscode-marketplace-malware", "Remove it, and rotate the tokens and keys this Mac holds: it ran with your rights every time the editor opened."),
+            "untrustworthy" | "impersonation" | "typosquatting" => ("medium", "vscode-marketplace-removed", "Remove it unless you know exactly why you have it."),
+            _ => ("low", "vscode-marketplace-removed", "Remove it if you do not need it."),
+        };
+        part.add(
+            severity,
+            "app",
+            format!("The {} extension {} {} was removed from the VS Marketplace on {date} as {}. {advice}", ext.editor, ext.id, ext.version, why.to_lowercase()),
+            Some(format!("{} --uninstall-extension {}", ext.cli, ext.id)),
+            source,
+        );
     }
     let powerful: Vec<String> = local
         .extensions

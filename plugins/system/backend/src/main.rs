@@ -47,6 +47,7 @@ mod ssh;
 mod shares;
 mod sweep;
 mod tracer;
+mod triage;
 mod util;
 
 use alerts::{AlertStore, Candidate};
@@ -92,6 +93,8 @@ struct Shared {
     alerts: Mutex<AlertStore>,
     /// The last sweep and every finding's state (ignored ones included), as the graph holds them.
     findings: Mutex<findings::Store>,
+    /// What each sweep group and live incident is, before anyone is interrupted.
+    triage: Mutex<triage::Store>,
     /// Memory every 30 s for the last 30 minutes: what "why did my memory go down" is answered from.
     memory_log: Mutex<std::collections::VecDeque<MemPoint>>,
     sweep_lock: tokio::sync::Mutex<()>,
@@ -121,6 +124,7 @@ impl Shared {
             protection_actions: tokio::sync::Mutex::new(()),
             alerts: Mutex::new(AlertStore::default()),
             findings: Mutex::new(findings::Store::default()),
+            triage: Mutex::new(triage::Store::default()),
             memory_log: Mutex::new(Default::default()),
             schedules: Mutex::new(schedule::Store::default()),
             tracer: Mutex::new(tracer::Tracer::default()),
@@ -256,37 +260,51 @@ impl Shared {
         MemoryChanges { since: then.at, used_then: then.used, used_now: now.used, swap_then: then.swap, swap_now: now.swap, peak: peak.used, peak_at: peak.at, apps }
     }
 
-    /// Offer a candidate; when it fires, publish it and hand it to the notify plugin. True when
-    /// it fired.
-    fn fire(&self, mut candidate: Candidate) -> bool {
-        let about = about_of(&candidate.key);
+    /// Offer a candidate. Security kinds become incident facts and notify only through triage;
+    /// of the machine's own alerts only a failed schedule and a disk about to be full notify. True
+    /// when it fired.
+    fn fire(&self, candidate: Candidate) -> bool {
         if protection::security_kind(&candidate.alert.kind) {
             let event = protection::from_alert(&candidate.key, &candidate.alert, &self.snapshot());
             if !lock(&self.protection).loaded {
+                // Listed while incident memory is starting; it notifies once it is an incident.
                 protection::observe(event);
-                // Existing alerts remain available while incident memory is starting.
-            } else {
-                let Some(incident) = lock(&self.protection).record(event, &self.snapshot()) else { return false };
-                candidate.key = format!("incident:{}:{}", incident.id, incident.severity);
-                candidate.alert.text = incident.title;
-                candidate.alert.severity = incident.severity;
+                return self.offer(candidate, false);
             }
+            let due = lock(&self.protection).record(event, &self.snapshot());
+            return due.is_some_and(|incident| self.announce(&incident));
         }
+        let notify = candidate.alert.kind == "schedule" || candidate.alert.kind == "disk" && candidate.alert.severity == "high";
+        self.offer(candidate, notify)
+    }
+
+    /// List an alert (published to the pane) and, when asked, notify. True when it was listed.
+    fn offer(&self, candidate: Candidate, notify: bool) -> bool {
+        let about = about_of(&candidate.key);
         let key = candidate.key.clone();
         let Some(alert) = lock(&self.alerts).offer(candidate, about) else { return false };
         let Some(ctx) = self.ctx.get().cloned() else { return true };
         ctx.publish(topics::ALERT, serde_json::to_value(&alert).unwrap_or(Value::Null));
+        if notify {
+            let kind = if alert.kind == "security-incident" { notify::kinds::BLOCKED } else { notify::kinds::INFO };
+            Self::notify(&ctx, kind, title_of(&alert), alert.text.clone(), format!("system:{key}"), json!({"open": "system.alert", "id": alert.id}));
+        }
+        true
+    }
+
+    fn notify(ctx: &Ctx, kind: &str, title: &str, body: String, key: String, target: Value) {
         let notification = Notification {
-            kind: notify::kinds::INFO.into(),
-            title: title_of(&alert).into(),
-            body: alert.text.clone(),
-            key: Some(format!("system:{key}")),
+            kind: kind.into(),
+            title: title.into(),
+            body,
+            key: Some(key),
             project_id: None,
             session_id: None,
-            target: json!({"open": "system.alert", "id": alert.id}),
+            target,
             actions: Vec::new(),
             subtitle: None,
         };
+        let ctx = ctx.clone();
         tokio::spawn(async move {
             let Ok(params) = to_value(&notification) else { return };
             match tokio::time::timeout(Duration::from_secs(20), ctx.call(notify::methods::SEND, params)).await {
@@ -295,28 +313,59 @@ impl Shared {
                 Err(_) => tracing::info!("notify.send did not answer"),
             }
         });
-        true
     }
 
     fn snapshot(&self) -> Arc<Snapshot> {
         lock(&self.snapshot).clone()
     }
 
+    /// An incident is due to notify: its triage decides. A sweep group's comes with the sweep.
+    fn announce(&self, incident: &cc_protocol::contracts::system::SecurityIncident) -> bool {
+        if incident.key.starts_with("group:") {
+            return false;
+        }
+        self.gate(triage::incident_subject(incident))
+    }
+
+    /// Ask triage about a subject: notify now, or it is held (and notifies when triage says so),
+    /// or it stays quiet.
+    fn gate(&self, subject: triage::Subject) -> bool {
+        let mode = lock(&self.protection).config.triage.clone();
+        let gate = lock(&self.triage).gate(subject.clone(), &mode);
+        match gate {
+            triage::Gate::Notify => {
+                self.announce_now(&subject);
+                true
+            }
+            triage::Gate::Hold | triage::Gate::Quiet => false,
+        }
+    }
+
+    /// Notify about a subject triage showed: its name and why it needs the person.
+    fn announce_now(&self, subject: &triage::Subject) {
+        let reason = lock(&self.triage).get(&subject.item).map(|t| t.reason.clone()).unwrap_or_default();
+        let text = if reason.is_empty() { subject.name.clone() } else { format!("{}: {reason}", subject.name) };
+        self.offer(
+            Candidate {
+                key: format!("triage:{}:{}", protection::digest(&subject.item), subject.severity),
+                alert: Alert { kind: "security-incident".into(), severity: subject.severity.clone(), text, at: util::now_ms(), actions: vec!["show".into()], ..Default::default() },
+            },
+            true,
+        );
+    }
+
     fn record_protection(&self, observations: Vec<cc_protocol::contracts::system::SecurityObservation>) {
         let snapshot = self.snapshot();
         for event in observations.into_iter().take(4096) {
-            let notice = lock(&self.protection).record(event, &snapshot);
-            if let Some(incident) = notice {
-                // Already correlated: do not turn the incident notification into another fact.
-                self.fire(Candidate {
-                    key: format!("incident:{}:{}", incident.id, incident.severity),
-                    alert: Alert { kind: "security-incident".into(), severity: incident.severity, text: incident.title, at: incident.last_at, actions: vec!["show".into()], ..Default::default() },
-                });
+            let due = lock(&self.protection).record(event, &snapshot);
+            if let Some(incident) = due {
+                self.announce(&incident);
             }
         }
     }
 
     /// Security findings join protection as facts about their group: one incident per group.
+    /// Then every open group goes to triage (which notifies, when it does, by itself).
     fn record_sweep(&self, report: &SweepReport) {
         let findings: Vec<_> = report.findings.iter().filter(|f| !f.ignored && protection::security_kind(&f.kind)).take(200).collect();
         // Each group's incident is ABOUT what its findings are about.
@@ -340,6 +389,91 @@ impl Shared {
             }
         }).collect();
         self.record_protection(observations);
+        self.triage_groups(report);
+    }
+
+    /// Every open sweep group rated low or worse goes to triage.
+    fn triage_groups(&self, report: &SweepReport) {
+        let mut groups: std::collections::BTreeMap<&str, Vec<&cc_protocol::contracts::system::Finding>> = Default::default();
+        for f in report.findings.iter().filter(|f| !f.ignored && protection::rank(&f.severity) >= 1) {
+            groups.entry(f.group.as_str()).or_default().push(f);
+        }
+        for (group, findings) in groups {
+            let item = protection::group_subject(group);
+            let incident = lock(&self.protection).incidents().find(|i| i.key == item).cloned();
+            if let Some(subject) = triage::group_subject(group, &findings, incident) {
+                self.gate(subject);
+            }
+        }
+    }
+
+    /// The person's decisions and corrections, as what the model is told about similar items.
+    fn precedents(&self) -> Vec<triage::Precedent> {
+        let mut out: Vec<triage::Precedent> = Vec::new();
+        {
+            let store = lock(&self.findings);
+            for decision in store.decisions() {
+                let Some(worst) = store.last.findings.iter().filter(|f| f.group == decision.group).min_by_key(|f| sweep::rank(&f.severity)) else { continue };
+                let words = match decision.verdict.as_str() {
+                    "expected" => "that it is expected",
+                    "false_alarm" => "that it is a false alarm",
+                    "accepted" => "to accept the risk",
+                    _ => "that it waits on its maker",
+                };
+                let name = decision.group.rsplit('/').find(|p| !p.is_empty()).unwrap_or(&decision.group);
+                out.push(triage::Precedent {
+                    card: triage::card_of(&worst.kind, &worst.source, &worst.text).into(),
+                    rule: worst.source.clone(),
+                    signer: String::new(),
+                    text: format!("you decided {words} for {}", util::shorten(name, 60)),
+                    benign: matches!(decision.verdict.as_str(), "expected" | "false_alarm"),
+                    at: decision.at,
+                });
+            }
+        }
+        out.extend(lock(&self.triage).wrong().iter().cloned());
+        out
+    }
+
+    /// One triage, start to end; it notifies when triage says so.
+    async fn triage_one(self: &Arc<Self>, subject: triage::Subject) {
+        let Some(ctx) = self.ctx.get().cloned() else { return };
+        let (mode, investigate) = {
+            let p = lock(&self.protection);
+            (p.config.triage.clone(), p.config.investigate)
+        };
+        let precedents = self.precedents();
+        let s = self.clone();
+        let mine = subject.clone();
+        let similar = move |signer: &str| lock(&s.triage).similar(&mine, signer).cloned();
+        match triage::judge(&ctx, subject.clone(), self.snapshot(), precedents, mode == "shadow", investigate, similar).await {
+            Ok(outcome) => {
+                if let (Some(investigation), Some(incident)) = (outcome.investigation, subject.incident.as_ref()) {
+                    lock(&self.protection).keep_investigation(&incident.id, incident.revision, investigation);
+                }
+                let gate = lock(&self.triage).finish(&subject, outcome.triage, &outcome.signer);
+                if matches!(gate, triage::Gate::Notify) {
+                    self.announce_now(&subject);
+                }
+            }
+            Err(error) => {
+                let gate = lock(&self.triage).failed(&subject, &error);
+                if matches!(gate, Some(triage::Gate::Notify)) {
+                    self.announce_now(&subject);
+                }
+            }
+        }
+    }
+
+    /// The report with its triage (by group).
+    fn with_triage(&self, mut report: SweepReport) -> SweepReport {
+        let store = lock(&self.triage);
+        for f in &report.findings {
+            if let Some(t) = store.get(&protection::group_subject(&f.group)) {
+                report.triage.insert(f.group.clone(), t.clone());
+            }
+        }
+        report
     }
 
     /// Run the sweep (one at a time) and store its report (in the graph, with what it saw).
@@ -357,33 +491,13 @@ impl Shared {
         let marked = store.mark(report);
         drop(store);
         self.record_sweep(&marked);
-        tokio::spawn(self.clone().second_look(marked.findings.clone()));
-        marked
-    }
-
-    /// The model's second look at a sweep, when it is idle: what it raises shows one level higher
-    /// and alerts like any other finding. It can never lower or close one.
-    async fn second_look(self: Arc<Self>, findings: Vec<cc_protocol::contracts::system::Finding>) {
-        let Some(ctx) = self.ctx.get().cloned() else { return };
-        let raised = security_investigator::second_look(&ctx, &findings).await;
-        if raised.is_empty() {
-            return;
-        }
-        let keys: Vec<String> = raised.iter().map(|(key, _)| key.clone()).collect();
-        let report = {
-            let mut store = lock(&self.findings);
-            store.raise(raised);
-            let last = store.last.clone();
-            let mut report = store.mark(last);
-            report.findings.retain(|f| keys.contains(&f.key));
-            report
-        };
-        self.record_sweep(&report);
+        self.with_triage(marked)
     }
 
     /// The report with its findings' decisions and tried fixes, and the decisions in force.
     fn marked(&self, report: SweepReport) -> SweepReport {
-        lock(&self.findings).mark(report)
+        let report = lock(&self.findings).mark(report);
+        self.with_triage(report)
     }
 
     /// Some areas' checks, apart from the stored sweep (which they fall back on when late). What
@@ -448,28 +562,41 @@ impl Shared {
         let span = days * 86_400_000;
         let since = now - span;
         let bucket_ms = span / BUCKETS;
-        let mut history = History { since, bucket_ms, series: vec![[0; 4]; BUCKETS as usize], hits: Default::default(), ..Default::default() };
-        let mut add = |at: u64, severity: &str, group: &str| {
+        let mut history = History { since, bucket_ms, series: vec![[0; 4]; BUCKETS as usize], filtered: vec![0; BUCKETS as usize], hits: Default::default(), ..Default::default() };
+        let mut add = |at: u64, severity: &str, group: &str, filtered: bool| {
             if at < since || at > now {
                 return;
             }
             let i = (((at - since) / bucket_ms).min(BUCKETS - 1)) as usize;
-            history.series[i][usize::from(sweep::rank(&protection::normal_severity(severity))).min(3)] += 1;
+            if filtered {
+                history.filtered[i] += 1;
+            } else {
+                history.series[i][usize::from(sweep::rank(&protection::normal_severity(severity))).min(3)] += 1;
+            }
             let hits = history.hits.entry(group.to_owned()).or_default();
             if hits.last() != Some(&(i as u32)) {
                 hits.push(i as u32);
             }
         };
-        for entry in graph::stream_read(findings::STREAM, since).await.unwrap_or_default() {
-            add(entry.at_ms, &graph::text(&entry.value["severity"]), &graph::text(&entry.value["group"]));
+        let entries = graph::stream_read(findings::STREAM, since).await.unwrap_or_default();
+        let filtered: HashMap<String, bool> = lock(&self.triage).all().map(|t| (t.item.clone(), t.filtered())).collect();
+        let is_filtered = |item: &str| filtered.get(item).copied().unwrap_or(false);
+        for entry in entries {
+            let group = graph::text(&entry.value["group"]);
+            add(entry.at_ms, &graph::text(&entry.value["severity"]), &group, is_filtered(&protection::group_subject(&group)));
         }
         for incident in lock(&self.protection).incidents() {
+            // A sweep group's facts are its findings, already counted.
+            if incident.key.starts_with("group:") {
+                continue;
+            }
+            let filtered = is_filtered(&incident.key);
             for event in &incident.observations {
-                add(event.at, &event.severity, &incident.id);
+                add(event.at, &event.severity, &incident.id, filtered);
             }
         }
         for alert in lock(&self.alerts).list().alerts.iter().filter(|a| a.kind != "security-incident") {
-            add(alert.at, &alert.severity, &alert.id);
+            add(alert.at, &alert.severity, &alert.id, false);
         }
         history.markers = Self::markers(since, bucket_ms).await;
         history
@@ -502,6 +629,10 @@ impl Shared {
         for candidate in early {
             self.fire(candidate);
         }
+        // What the last sweep found and triage never settled is triaged now.
+        let last = lock(&self.findings).last.clone();
+        let report = self.marked(last);
+        self.triage_groups(&report);
     }
 
     async fn load_all(&self) -> Result<String, String> {
@@ -516,6 +647,7 @@ impl Shared {
         let notes = netwatch::load_digest().await?;
         let ports = sampler::load_ports().await?;
         let protection = protection::Store::load().await?;
+        let triage = triage::Store::load().await?;
         let summary = format!(
             "last sweep {} ({} findings), {} alerts, {} schedules, {} live traces, {feeds} feeds, {items} start items, {networks} networks, {servers} MCP servers, {notes} network notes, {ports} ports",
             findings.last.at,
@@ -529,6 +661,7 @@ impl Shared {
         *lock(&self.schedules) = schedules;
         lock(&self.tracer).restore(recordings);
         *lock(&self.protection) = protection;
+        *lock(&self.triage) = triage;
         Ok(summary)
     }
 
@@ -807,6 +940,7 @@ fn title_of(alert: &Alert) -> &'static str {
         "cve" => "A known vulnerability affects this Mac",
         "network" => "A program's network activity needs a look",
         "lan" => "Your network changed",
+        "security-incident" => "Security: this needs your look",
         _ => "System",
     }
 }
@@ -864,7 +998,7 @@ fn start(shared: &Arc<Shared>) {
         }
     });
 
-    // A single event-driven investigator borrows the active Gemma/Qwen at background priority.
+    // Investigations the person asked for borrow the active Gemma/Qwen at background priority.
     let s = shared.clone();
     tokio::spawn(async move {
         let mut every = tokio::time::interval(Duration::from_secs(10));
@@ -878,6 +1012,26 @@ fn start(shared: &Arc<Shared>) {
             let snapshot = s.snapshot();
             let result = security_investigator::investigate(&ctx, &incident, &snapshot).await;
             lock(&s.protection).finish_investigation(&incident.id, incident.revision, result);
+        }
+    });
+
+    // Triage, one item at a time: code, the model's quick look, an investigation. Once a week a
+    // digest says how much was looked at.
+    let s = shared.clone();
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(Duration::from_secs(3));
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            every.tick().await;
+            if !graph::ready() { continue; }
+            let digest = lock(&s.triage).digest();
+            if let (Some(text), Some(ctx)) = (digest, s.ctx.get()) {
+                Shared::notify(ctx, notify::kinds::INFO, "Security this week", text, "system:security-digest".into(), json!({"open": "system.alert"}));
+            }
+            let next = lock(&s.triage).next();
+            if let Some(subject) = next {
+                s.triage_one(subject).await;
+            }
         }
     });
 
@@ -1014,15 +1168,23 @@ async fn watch_launch_folders(shared: Arc<Shared>) {
                 continue;
             }
             let Ok(Some(item)) = tokio::task::spawn_blocking(move || launch::inspect(&path)).await else { continue };
-            let severity = if item.unsigned() || item.quarantined {
+            // The sweep's own rules: a disguised or injected item is high, a Homebrew service is not news.
+            let danger = item.danger();
+            let severity = if danger.is_some() || item.unsigned() && !item.homebrew() || item.quarantined {
                 "high"
+            } else if item.homebrew() {
+                "info"
             } else if item.signature == "missing" || item.signature == "unknown" {
                 "warn"
             } else {
                 "info"
             };
             let program = if item.program.is_empty() { "no program we can find".to_owned() } else { item.program.clone() };
-            let verdict = if item.program.is_empty() { String::new() } else { format!(", {}", item.verdict()) };
+            let verdict = match (&danger, item.program.is_empty()) {
+                (Some(why), _) => format!(": {why}"),
+                (None, true) => String::new(),
+                (None, false) => format!(", {}", item.verdict()),
+            };
             shared.fire(Candidate {
                 key: format!("persistence:{}", item.plist.display()),
                 alert: Alert {
@@ -1092,6 +1254,12 @@ fn stop_incident_process(pid: u32, started: u64, started_us: Option<u64>, execut
 async fn protection_status(shared: Arc<Shared>) -> Result<Value, RpcError> {
     tokio::task::spawn_blocking(move || {
         let mut status = lock(&shared.protection).status();
+        {
+            let triage = lock(&shared.triage);
+            for incident in &mut status.incidents {
+                incident.triage = triage.get(&incident.key).cloned();
+            }
+        }
         // Signature/provisioning checks may block on macOS; never hold the incident lock while
         // they run, or collection and alerting would wait behind a UI status request.
         status.deep_service = protection_sensors::service_installed();
@@ -1104,6 +1272,14 @@ async fn protection_status(shared: Arc<Shared>) -> Result<Value, RpcError> {
 async fn dispatch(shared: Arc<Shared>, method: &str, params: Value) -> Result<Value, RpcError> {
     match method {
         methods::PROTECTION_STATUS => protection_status(shared.clone()).await,
+        methods::TRIAGE_UNDO => {
+            let cc_protocol::contracts::system::TriageUndoParams { item } = parse_params(params)?;
+            let name = item.strip_prefix("group:").map(|g| g.rsplit('/').find(|p| !p.is_empty()).unwrap_or(g).to_owned()).unwrap_or_else(|| {
+                lock(&shared.protection).incidents().find(|i| i.key == item).map(|i| i.title.clone()).unwrap_or_else(|| item.clone())
+            });
+            lock(&shared.triage).undo(&item, &util::shorten(&name, 80)).map_err(RpcError::invalid_params)?;
+            Ok(json!({"ok": true}))
+        }
         methods::PROTECTION_CONFIGURE => {
             let config: cc_protocol::contracts::system::ProtectionConfig = parse_params(params)?;
             let _serial = shared.protection_actions.lock().await;
@@ -1121,7 +1297,8 @@ async fn dispatch(shared: Arc<Shared>, method: &str, params: Value) -> Result<Va
         }
         methods::INCIDENT_GET => {
             let IdParams { id } = parse_params(params)?;
-            let incident = lock(&shared.protection).incident(&id).ok_or_else(|| RpcError::not_found("That incident is no longer retained."))?;
+            let mut incident = lock(&shared.protection).incident(&id).ok_or_else(|| RpcError::not_found("That incident is no longer retained."))?;
+            incident.triage = lock(&shared.triage).get(&incident.key).cloned();
             to_value(&incident)
         }
         methods::INCIDENT_ACT => {
@@ -1192,6 +1369,7 @@ async fn dispatch(shared: Arc<Shared>, method: &str, params: Value) -> Result<Va
             lock(&shared.alerts).clear();
             lock(&shared.protection).clear();
             lock(&shared.findings).clear();
+            lock(&shared.triage).clear();
             Ok(json!({"ok": true}))
         }
         methods::CHECK => to_value(&shared.check(parse_params(params)?).await?),
@@ -1205,6 +1383,8 @@ async fn dispatch(shared: Arc<Shared>, method: &str, params: Value) -> Result<Va
             let status = tokio::task::spawn_blocking(keys::status).await.map_err(|_| RpcError::internal("Cannot read key status."))?;
             protection::keys_changed(&status);
             tokio::task::spawn_blocking(malware::check_keys);
+            // ThreatFox and URLhaus use the abuse.ch key: fetch them now, not at the next refresh.
+            tokio::spawn(feeds::refresh());
             to_value(&status)
         }
         methods::KEYS_STATUS => to_value(&tokio::task::spawn_blocking(keys::status).await.map_err(|e| RpcError::internal(e.to_string()))?),
@@ -1707,6 +1887,7 @@ fn main() {
             methods::FINDING_DECIDE,
             methods::FINDING_VERIFY,
             methods::SECURITY_HISTORY,
+            methods::TRIAGE_UNDO,
             methods::CHECK,
             methods::CVE,
             methods::ASK,

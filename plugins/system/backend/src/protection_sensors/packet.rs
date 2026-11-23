@@ -12,9 +12,18 @@ use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-const WINDOW: u64 = 60_000;
+/// Scans are counted over five minutes (as Zeek does): a slow scan still adds up, a burst of
+/// ordinary connections does not.
+const WINDOW: u64 = 300_000;
 const QUIET: u64 = 300_000;
 const LIMIT: usize = 4096;
+/// Distinct hosts on one port that make an outgoing sweep.
+const SWEEP_HOSTS: usize = 25;
+/// Distinct ports on one host that make a port scan, either way.
+const SCAN_PORTS: usize = 15;
+/// Web ports and local discovery (mDNS, SSDP, AirPlay, printers, UPnP/AirPlay 5000): every
+/// laptop talks to many hosts on them.
+const ORDINARY: [u16; 9] = [80, 443, 5353, 1900, 7000, 7100, 631, 9100, 5000];
 
 struct Packet {
     at: u64,
@@ -58,7 +67,10 @@ pub(super) struct PacketWatch {
     next_retry: Instant,
     locals: BTreeSet<IpAddr>,
     incoming: HashMap<(IpAddr, IpAddr), Bucket>,
-    outgoing: HashMap<IpAddr, Bucket>,
+    /// This Mac's attempts per (its address, port): the hosts it tried.
+    outgoing: HashMap<(IpAddr, u16), Bucket>,
+    /// This Mac's attempts per (its address, remote host): the ports it tried.
+    outgoing_ports: HashMap<(IpAddr, IpAddr), Bucket>,
     last_at: u64,
     dropped: u64,
     error: String,
@@ -73,6 +85,7 @@ impl PacketWatch {
             locals: BTreeSet::new(),
             incoming: HashMap::new(),
             outgoing: HashMap::new(),
+            outgoing_ports: HashMap::new(),
             last_at: 0,
             dropped: 0,
             error: String::new(),
@@ -107,6 +120,7 @@ impl PacketWatch {
             self.stop();
             self.incoming.clear();
             self.outgoing.clear();
+            self.outgoing_ports.clear();
             self.reported.clear();
             status.dropped = self.dropped;
             status.state = "disabled".into();
@@ -119,6 +133,7 @@ impl PacketWatch {
             self.stop();
             self.incoming.clear();
             self.outgoing.clear();
+            self.outgoing_ports.clear();
             self.reported.clear();
             self.locals = locals;
             self.next_retry = Instant::now();
@@ -242,6 +257,8 @@ impl PacketWatch {
             .retain(|_, b| now.saturating_sub(b.since) <= WINDOW);
         self.outgoing
             .retain(|_, b| now.saturating_sub(b.since) <= WINDOW);
+        self.outgoing_ports
+            .retain(|_, b| now.saturating_sub(b.since) <= WINDOW);
         self.reported
             .retain(|_, at| now.saturating_sub(*at) <= QUIET);
         for packet in packets {
@@ -268,15 +285,18 @@ impl PacketWatch {
                     bucket.ports.insert(packet.port);
                 }
                 let report_key = format!("scan:{}:{}", packet.source, packet.dest);
-                if bucket.ports.len() >= 20
+                if bucket.ports.len() >= SCAN_PORTS
                     && !self.reported.contains_key(&report_key)
                     && self.reported.len() < LIMIT
                 {
                     bucket.reported = packet.at;
                     self.reported.insert(report_key.clone(), packet.at);
+                    // The internet probes every laptop that has a public address now and then:
+                    // kept as evidence. A device on this network probing it is worth a look.
+                    let lan = on_lan(&packet.source);
                     result.observations.push(SecurityObservation {
-                        at: packet.at, source: "packet-watch".into(), kind: "port_scan".into(), severity: "medium".into(),
-                        summary: format!("{} sent TCP connection attempts to {} distinct ports on this Mac ({}) within 60 seconds. This is probing, not proof of a successful login or compromise.", packet.source, bucket.ports.len(), packet.dest),
+                        at: packet.at, source: "packet-watch".into(), kind: "port_scan".into(), severity: if lan { "medium" } else { "info" }.into(),
+                        summary: format!("{}{} sent TCP connection attempts to {} distinct ports on this Mac ({}) within 5 minutes. This is probing, not proof of a successful login or compromise.", packet.source, if lan { " (a device on this network)" } else { "" }, bucket.ports.len(), packet.dest),
                         rule: "network.port_scan".into(), subject: report_key, remote: Some(packet.source.to_string()), count: bucket.ports.len() as u64, ..Default::default()
                     });
                 }
@@ -284,41 +304,47 @@ impl PacketWatch {
                 && !to_local
                 && !packet.dest.is_multicast()
                 && !packet.dest.is_loopback()
+                && !ORDINARY.contains(&packet.port)
             {
-                if self.outgoing.len() >= LIMIT && !self.outgoing.contains_key(&packet.source) {
+                let new_bucket = |at| Bucket { since: at, ports: BTreeSet::new(), destinations: BTreeSet::new(), reported: 0 };
+                let hosts_key = (packet.source, packet.port);
+                let ports_key = (packet.source, packet.dest);
+                if (self.outgoing.len() >= LIMIT && !self.outgoing.contains_key(&hosts_key))
+                    || (self.outgoing_ports.len() >= LIMIT && !self.outgoing_ports.contains_key(&ports_key))
+                {
                     self.dropped = self.dropped.saturating_add(1);
                     continue;
                 }
-                let bucket = self
-                    .outgoing
-                    .entry(packet.source)
-                    .or_insert_with(|| Bucket {
-                        since: packet.at,
-                        ports: BTreeSet::new(),
-                        destinations: BTreeSet::new(),
-                        reported: 0,
-                    });
-                if bucket.destinations.len() < 128 {
-                    bucket.destinations.insert(packet.dest);
+                // Many hosts on one port: a sweep for a service (SSH, SMB, a database).
+                let hosts = self.outgoing.entry(hosts_key).or_insert_with(|| new_bucket(packet.at));
+                if hosts.destinations.len() < 128 {
+                    hosts.destinations.insert(packet.dest);
                 }
-                if bucket.ports.len() < 128 {
-                    bucket.ports.insert(packet.port);
-                }
-                // A wide fan-out on one or few ports deserves investigation, while normal browser
-                // fan-out over HTTPS alone is far too common to flag as scanning.
-                let ordinary_web = bucket.ports.iter().all(|p| [80, 443].contains(p));
-                let report_key = format!("sweep:{}", packet.source);
-                if bucket.destinations.len() >= 32
-                    && bucket.ports.len() <= 4
-                    && !ordinary_web
-                    && !self.reported.contains_key(&report_key)
-                    && self.reported.len() < LIMIT
-                {
-                    bucket.reported = packet.at;
+                let hosts_count = hosts.destinations.len();
+                let report_key = format!("sweep:{}:{}", packet.source, packet.port);
+                if hosts_count >= SWEEP_HOSTS && !self.reported.contains_key(&report_key) && self.reported.len() < LIMIT {
+                    hosts.reported = packet.at;
                     self.reported.insert(report_key.clone(), packet.at);
                     result.observations.push(SecurityObservation {
-                        at: packet.at, source: "packet-watch".into(), kind: "network_sweep".into(), severity: "medium".into(), summary: format!("This Mac ({}) sent TCP connection attempts to {} different addresses on a small set of ports within 60 seconds. This resembles a network sweep; legitimate discovery tools can do this too. Packet headers do not identify the responsible process.", packet.source, bucket.destinations.len()),
-                        rule: "network.address_sweep".into(), subject: report_key, count: bucket.destinations.len() as u64, ..Default::default()
+                        at: packet.at, source: "packet-watch".into(), kind: "network_sweep".into(), severity: "medium".into(),
+                        summary: format!("This Mac ({}) sent TCP connection attempts to {hosts_count} different addresses on port {} within 5 minutes. This resembles a network sweep; legitimate discovery tools can do this too. Packet headers do not identify the responsible process.", packet.source, packet.port),
+                        rule: "network.address_sweep".into(), subject: report_key, count: hosts_count as u64, ..Default::default()
+                    });
+                }
+                // Many ports on one host: this Mac scanning it.
+                let ports = self.outgoing_ports.entry(ports_key).or_insert_with(|| new_bucket(packet.at));
+                if ports.ports.len() < 128 {
+                    ports.ports.insert(packet.port);
+                }
+                let ports_count = ports.ports.len();
+                let report_key = format!("outscan:{}:{}", packet.source, packet.dest);
+                if ports_count >= SCAN_PORTS && !self.reported.contains_key(&report_key) && self.reported.len() < LIMIT {
+                    ports.reported = packet.at;
+                    self.reported.insert(report_key.clone(), packet.at);
+                    result.observations.push(SecurityObservation {
+                        at: packet.at, source: "packet-watch".into(), kind: "port_scan".into(), severity: "medium".into(),
+                        summary: format!("This Mac ({}) sent TCP connection attempts to {ports_count} distinct ports on {} within 5 minutes. This resembles a port scan; a developer's own tools can do this too. Packet headers do not identify the responsible process.", packet.source, packet.dest),
+                        rule: "network.outgoing_port_scan".into(), subject: report_key, remote: Some(packet.dest.to_string()), count: ports_count as u64, ..Default::default()
                     });
                 }
             }
@@ -329,6 +355,14 @@ impl PacketWatch {
         status.dropped = status.dropped.max(self.dropped);
         result.sensors.push(status);
         result
+    }
+}
+
+/// A private, link-local or carrier-grade NAT address: a device on this network (or a VPN's).
+fn on_lan(address: &IpAddr) -> bool {
+    match address {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local() || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1])),
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80 || (v6.segments()[0] & 0xfe00) == 0xfc00,
     }
 }
 

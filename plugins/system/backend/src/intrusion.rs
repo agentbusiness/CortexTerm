@@ -1,16 +1,14 @@
 //! Intrusion evidence: a digest of the unified log (fixed queries, each time-limited: XProtect,
-//! Gatekeeper, privacy grants, sudo, SSH and screen-sharing logins, new background items), the
-//! legacy finished eslogger recordings (import only), and the incident timeline. New deep
-//! collection uses the native, sanitized protection sensor; no raw eslogger command is offered.
+//! Gatekeeper, privacy grants, sudo, SSH and screen-sharing logins, new background items) and the
+//! incident timeline. Deep collection is the native protection sensor's.
 
 use crate::procs::Snapshot;
 use crate::sweep::Part;
 use crate::util::{now_ms, plural, run, shorten, tilde};
-use crate::{codesign, deep, malware, persist};
+use crate::{codesign, launch, malware, persist};
 use cc_protocol::contracts::system::{MonitorReport, Timeline, TimelineParams, TimelineRow};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::BufRead;
 use std::path::Path;
 use std::time::Duration;
 
@@ -123,7 +121,6 @@ pub fn checks() -> Part {
     part.checked.extend(checked);
     part.skipped.extend(failed);
     digest(&mut part, &rows);
-    eslogger(&mut part);
     part
 }
 
@@ -141,7 +138,10 @@ fn digest(part: &mut Part, rows: &[LogRow]) {
             "ssh" if row.message.contains("Accepted") => ("medium", format!("Someone logged in over SSH at {}: {message}", clock(row.at))),
             "ssh" => continue,
             "screen sharing" => ("medium", format!("Screen sharing authentication at {}: {message}", clock(row.at))),
-            "background items" => ("medium", format!("A new background item was registered at {}: {message}", clock(row.at))),
+            "background items" => {
+                let (severity, by) = background_item(&row.message);
+                (severity, format!("A new background item was registered at {}{by}: {message}", clock(row.at)))
+            }
             _ => continue,
         };
         if seen.len() > 40 {
@@ -154,11 +154,14 @@ fn digest(part: &mut Part, rows: &[LogRow]) {
         let severity = if failed_ssh >= 20 { "medium" } else { "info" };
         part.add(severity, "intrusion", format!("{} over SSH in the last 24 hours.", plural(failed_ssh, "failed login", "failed logins")), None, "system log");
     }
-    // One sudo process authenticates once; a wrong password says "incorrect".
+    // One sudo process authenticates once; a wrong password says "incorrect". A typo, or Touch ID
+    // falling back to the password, makes a wrong one now and then; guessing makes many, over
+    // several tries of sudo.
     let sudo: BTreeSet<u32> = rows.iter().filter(|r| r.query == "sudo").map(|r| r.pid).collect();
     let wrong = rows.iter().filter(|r| r.query == "sudo" && r.message.contains("incorrect")).count();
+    let wrong_tries: BTreeSet<u32> = rows.iter().filter(|r| r.query == "sudo" && r.message.contains("incorrect")).map(|r| r.pid).collect();
     if !sudo.is_empty() {
-        let severity = if wrong >= 3 { "medium" } else { "info" };
+        let severity = if wrong >= 6 && wrong_tries.len() >= 3 { "medium" } else { "info" };
         let mut text = format!("sudo asked for the password {} in the last 24 hours", plural(sudo.len(), "time", "times"));
         if wrong > 0 {
             text.push_str(&format!(", {} wrong", plural(wrong, "password was", "passwords were")));
@@ -167,81 +170,31 @@ fn digest(part: &mut Part, rows: &[LogRow]) {
     }
 }
 
-// --- Import finished legacy recordings; the supported producer lives in protection_sensors.
-
-fn eslogger(part: &mut Part) {
-    let recording = deep::eslogger(flag_events);
-    let Some((at, events, notes)) = recording.filter(|(at, _, _)| now_ms().saturating_sub(*at) < 7 * DAY_MS) else {
-        part.skipped.push("Native endpoint coverage is shown in Alerts & Security > Protection. Enable deep monitoring and explicitly install/start the signed sensor there. No raw eslogger capture is started or offered.".into());
-        return;
-    };
-    for (severity, text) in notes {
-        part.add(&severity, "intrusion", text, None, "eslogger");
+/// How much a background item registration matters, and who made the program: info when Apple
+/// or a notarized developer's app registers it (an app installing or updating its own helper),
+/// else medium.
+fn background_item(message: &str) -> (&'static str, String) {
+    // `url=Contents/Library/LaunchAgents/x.plist -- file:///Applications/X.app/` or a full URL.
+    let urls: Vec<&str> = message.split(|c: char| c.is_whitespace() || c == ',').filter_map(|w| w.trim_start_matches("url=").strip_prefix("file://")).collect();
+    let Some(base) = urls.first() else { return ("medium", String::new()) };
+    let decode = |text: &str| text.replace("%20", " ").replace("%28", "(").replace("%29", ")");
+    let mut path = std::path::PathBuf::from(decode(base));
+    if path.extension().is_some_and(|e| e == "plist")
+        && let Some(item) = launch::inspect(&path).filter(|i| i.program.starts_with('/'))
+    {
+        path = std::path::PathBuf::from(item.program);
     }
-    part.checked.push(format!("eslogger recording of {} ago ({})", crate::util::duration_text(now_ms().saturating_sub(at)), plural(events as usize, "event", "events")));
-}
-
-/// What an eslogger recording shows: how many events, and the notable ones (severity, text), at
-/// most 30.
-fn flag_events(file: &Path) -> (usize, Vec<(String, String)>) {
-    let Ok(handle) = std::fs::File::open(file) else { return (0, Vec::new()) };
-    let mut out = Vec::new();
-    // Each odd program is reported once, however often it ran.
-    let mut execs: BTreeMap<String, usize> = BTreeMap::new();
-    let mut flagged = 0;
-    let mut lines = 0;
-    for line in std::io::BufReader::new(handle).lines().map_while(Result::ok).take(2_000_000) {
-        lines += 1;
-        let Ok(record) = serde_json::from_str::<Value>(&line) else { continue };
-        let event = &record["event"];
-        let at = record["time"].as_str().unwrap_or("");
-        let note = if let Some(exec) = event.get("exec") {
-            let target = &exec["target"];
-            let path = target["executable"]["path"].as_str().unwrap_or("");
-            let platform = target["is_platform_binary"].as_bool().unwrap_or(false);
-            let unsigned = target["team_id"].is_null() && target["signing_id"].is_null();
-            let odd = ["/tmp/", "/private/tmp/", "/private/var/tmp/", "/Users/Shared/"].iter().any(|p| path.starts_with(p)) || path.contains("/.");
-            let count = execs.entry(path.to_owned()).or_default();
-            *count += 1;
-            match (!platform && odd && *count == 1, unsigned) {
-                (false, _) => None,
-                (true, true) => Some(("high", format!("An unsigned program ran from {path}"))),
-                (true, false) => Some(("medium", format!("A program ran from {path}"))),
-            }
-        } else if let Some(add) = event.get("btm_launch_item_add") {
-            let item = add["item"]["item_url"].as_str().or_else(|| add["executable_path"].as_str()).unwrap_or("an item");
-            Some(("medium", format!("A background item was added: {item}")))
-        } else if let Some(hit) = event.get("xp_malware_detected").or_else(|| event.get("xp_malware_remediated")) {
-            let what = hit["malware_identifier"].as_str().unwrap_or("malware");
-            let path = hit["detected_path"].as_str().unwrap_or("");
-            Some(("high", format!("XProtect found {what} in {path}")))
-        } else if let Some(tcc) = event.get("tcc_modify") {
-            let by = record["process"]["executable"]["path"].as_str().unwrap_or("");
-            let platform = record["process"]["is_platform_binary"].as_bool().unwrap_or(false);
-            let service = tcc["service"].as_str().unwrap_or("a permission");
-            let who = tcc["identity"].as_str().unwrap_or("a program");
-            (!platform).then(|| ("medium", format!("{by} changed the {service} permission of {who}")))
-        } else if let Some(over) = event.get("gatekeeper_user_override") {
-            let path = over["file"]["path"].as_str().or_else(|| over["file_path"].as_str()).unwrap_or("a file");
-            Some(("medium", format!("Gatekeeper was overridden for {path}")))
-        } else if let Some(login) = event.get("openssh_login") {
-            let ok = login["success"].as_bool().unwrap_or(false);
-            ok.then(|| ("medium", format!("SSH login as {} from {}", login["username"].as_str().unwrap_or("?"), login["source_address"].as_str().unwrap_or("?"))))
-        } else if event.get("screensharing_attach").is_some() {
-            Some(("medium", "A screen-sharing session attached".to_owned()))
-        } else if let Some(user) = event.get("od_create_user") {
-            Some(("high", format!("A user account was created: {}", user["user_name"].as_str().unwrap_or("?"))))
-        } else {
-            None
-        };
-        if let Some((severity, text)) = note
-            && flagged < 30
-        {
-            flagged += 1;
-            out.push((severity.to_owned(), format!("{text} ({}).", at.get(..19).unwrap_or(at).replace('T', " "))));
-        }
+    if !path.exists() {
+        return ("medium", String::new());
     }
-    (lines, out)
+    let sig = codesign::check(&path);
+    if sig.apple {
+        return ("info", " by Apple's own software".into());
+    }
+    if codesign::notarized(&path) == Some(true) {
+        return ("info", format!(" by {}, notarized by Apple", sig.signer()));
+    }
+    ("medium", format!(" by {} ({})", tilde(&path), if sig.unsigned() { "not properly signed" } else { "not notarized" }))
 }
 
 // --- 46. The incident timeline.

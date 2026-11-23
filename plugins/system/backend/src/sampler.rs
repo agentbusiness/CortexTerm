@@ -572,11 +572,12 @@ impl Sampler {
             // they are recorded with the rest, not alerted.
             let apple = || exe_of.get(&port.pid).is_some_and(|exe| !exe.is_empty() && crate::codesign::check(std::path::Path::new(exe)).apple);
             if fresh && port.public && !self.watch.ports_baseline && !apple() {
+                let severity = port_severity(&self.snapshot, port.pid, exe_of.get(&port.pid).map(String::as_str).unwrap_or(""));
                 found.push(Candidate {
                     key: format!("port:{key}"),
                     alert: Alert {
                         kind: "port".into(),
-                        severity: "warn".into(),
+                        severity: severity.into(),
                         text: format!(
                             "{} (pid {}) started listening on port {} on every network interface, so other machines on your network can reach it.",
                             port.process, port.pid, port.port
@@ -606,4 +607,40 @@ impl Sampler {
         }
         found
     }
+}
+
+/// How much a new port open to the network matters. A developer's server (an interpreter, or a
+/// program built in a project folder, started from a terminal or editor) and a properly signed
+/// program are info; an unsigned or ad-hoc program elsewhere, or a server nobody started by
+/// hand, is a warning.
+fn port_severity(snapshot: &crate::procs::Snapshot, pid: u32, exe: &str) -> &'static str {
+    const INTERPRETERS: [&str; 13] = ["node", "python", "python3", "ruby", "bun", "deno", "java", "php", "perl", "dotnet", "beam.smp", "uvicorn", "gunicorn"];
+    if exe.is_empty() {
+        return "warn";
+    }
+    let path = std::path::Path::new(exe);
+    let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let interpreter = INTERPRETERS.contains(&name.as_str()) || name.starts_with("python3.");
+    let home = crate::util::home();
+    let in_project = path.starts_with(&home)
+        && (["/target/debug/", "/target/release/", "/node_modules/", "/.venv/", "/DerivedData/", "/build/", "/dist/"].iter().any(|b| exe.contains(b))
+            || path.ancestors().skip(1).take_while(|dir| *dir != home).any(|dir| dir.join(".git").exists()));
+    let by_pid: HashMap<u32, &crate::procs::Entry> = snapshot.entries.iter().map(|e| (e.proc.pid, e)).collect();
+    let mut by_hand = false;
+    let mut parent = by_pid.get(&pid).map(|e| e.proc.ppid).unwrap_or(0);
+    for _ in 0..20 {
+        let Some(up) = by_pid.get(&parent).filter(|_| parent > 1) else { break };
+        if crate::agents::is_person(up) {
+            by_hand = true;
+            break;
+        }
+        parent = up.proc.ppid;
+    }
+    let quiet = if interpreter || in_project {
+        by_hand
+    } else {
+        let sig = crate::codesign::check(path);
+        sig.status == "signed" && !sig.team_id.is_empty()
+    };
+    if quiet { "info" } else { "warn" }
 }

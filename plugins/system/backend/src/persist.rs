@@ -159,10 +159,11 @@ pub fn checks(discovery: crate::filesystem::Shared) -> Part {
         for (key, item) in &items {
             let change = match baseline.items.get(key) {
                 None => "added",
-                Some(old) if old.value != item.value || old.target != item.target => "changed",
+                // A shell file's line hashes are not part of what it is (older sweeps kept none).
+                Some(old) if content(&old.value) != content(&item.value) || old.target != item.target => "changed",
                 _ => continue,
             };
-            let (severity, why) = judge(item);
+            let (severity, why) = judge(key, item, baseline.items.get(key));
             let verb = if change == "added" { "New" } else { "Changed" };
             let starts = if item.target.is_empty() { String::new() } else { format!(", which starts {}", tilde(Path::new(&item.target))) };
             baseline.changes.push(Change {
@@ -214,9 +215,54 @@ pub fn checks(discovery: crate::filesystem::Shared) -> Part {
     part
 }
 
+/// Folders right in the home folder that toolchains and developer apps make; a program started
+/// from one of them is not hidden away.
+const TOOL_FOLDERS: [&str; 30] = [
+    ".local", ".cargo", ".rustup", ".bun", ".deno", ".nvm", ".volta", ".fnm", ".pyenv", ".rbenv", ".nodenv", ".asdf", ".sdkman",
+    ".docker", ".orbstack", ".colima", ".lima", ".rd", ".npm", ".npm-global", ".pnpm", ".yarn", ".go", ".gradle", ".m2",
+    ".conda", ".miniconda3", ".dotnet", ".ollama", ".lmstudio",
+];
+
+/// Whether a program sits in a hidden folder that is worth a look: a dot-folder in the home folder
+/// that no known toolchain makes, or any dot-folder deeper down outside the home folder's own.
+fn hidden(target: &Path) -> bool {
+    let home = home();
+    match target.strip_prefix(&home) {
+        Ok(rest) => {
+            let mut parts = rest.components().map(|c| c.as_os_str().to_string_lossy().into_owned());
+            let first = parts.next().unwrap_or_default();
+            if first.starts_with('.') {
+                return !TOOL_FOLDERS.contains(&first.as_str());
+            }
+            // ~/Library/.hidden/... and the like; app data folders inside ~/Library are fine.
+            let rest: Vec<String> = parts.collect();
+            rest.iter().take(rest.len().saturating_sub(1)).any(|p| p.starts_with('.'))
+        }
+        Err(_) => {
+            let text = target.display().to_string();
+            let package = ["/opt/homebrew/", "/usr/local/", "/nix/", "/opt/"].iter().any(|p| text.starts_with(p));
+            !package && target.parent().is_some_and(|dir| dir.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.')))
+        }
+    }
+}
+
 /// medium, or high (with why) when what it starts is unsigned, quarantined, hidden or temporary;
-/// info (Apple) or low (a named developer) when the program's signature and seal check out.
-fn judge(item: &Item) -> (&'static str, String) {
+/// info (Apple, or a toolchain's lines in a shell file) or low (a named developer, a Homebrew
+/// service) when it checks out.
+fn judge(key: &str, item: &Item, old: Option<&Item>) -> (&'static str, String) {
+    if key.starts_with("shell startup file:") {
+        return shell_change(Path::new(key.trim_start_matches("shell startup file:")), old);
+    }
+    if let Some(plist) = key.strip_prefix("launch:")
+        && let Some(found) = launch::inspect(Path::new(plist))
+    {
+        if let Some(why) = found.danger() {
+            return ("high", format!(": {why}"));
+        }
+        if found.homebrew() && !found.quarantined {
+            return ("low", " (a Homebrew service, built by Homebrew on this Mac)".into());
+        }
+    }
     if item.target.is_empty() {
         return ("medium", String::new());
     }
@@ -225,7 +271,7 @@ fn judge(item: &Item) -> (&'static str, String) {
     if ["/tmp/", "/private/tmp/", "/private/var/tmp/", "/Users/Shared/"].iter().any(|p| text.starts_with(p)) {
         return ("high", " from a temporary or shared folder".into());
     }
-    if target.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.')) {
+    if hidden(target) {
         return ("high", " from a hidden folder".into());
     }
     if !target.exists() {
@@ -244,6 +290,96 @@ fn judge(item: &Item) -> (&'static str, String) {
         Some(by) => ("low", format!(" (signed by {by}, its seal intact)")),
         None => ("medium", String::new()),
     }
+}
+
+/// What a toolchain's installer adds to a shell startup file (nvm, conda, bun, rustup, Homebrew …).
+const TOOL_LINES: [&str; 44] = [
+    "nvm", "conda", "mamba", "bun", "cargo/env", "rustup", "brew shellenv", "/opt/homebrew", "pyenv", "rbenv", "nodenv", "fnm ",
+    "volta", "sdkman", "direnv hook", "starship init", "zoxide init", "orbstack", ".docker/", "pnpm", "deno", "jenv", "asdf",
+    "mise activate", "goenv", "google-cloud-sdk", ".lmstudio", ".local/bin", "antigravity", "windsurf", ".cursor", "kiro",
+    "opencode", "dotnet", "go/bin", "gvm", "ghcup", "opam", "juliaup", ".fzf", "iterm2_shell_integration", "test -e", "compinit", "zsh-",
+];
+
+/// Words in a shell line that fetch, decode or run something from elsewhere.
+const FETCH: [&str; 10] = ["curl ", "wget ", "base64 -d", "base64 --decode", "| sh", "| bash", "|sh", "|bash", "osascript", "nc "];
+
+/// A shell startup file's change: info when every added line is a toolchain's, high when one
+/// fetches or decodes something, else medium naming the added lines (secrets masked).
+fn shell_change(path: &Path, old: Option<&Item>) -> (&'static str, String) {
+    // A new file adds all its lines; an old fingerprint without line hashes cannot tell which.
+    let old = match old {
+        None => Default::default(),
+        Some(old) => match line_hashes(&old.value) {
+            Some(lines) => lines,
+            None => return ("medium", String::new()),
+        },
+    };
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let added: Vec<&str> = shell_lines(&text).filter(|l| !old.contains(&short_hash(l))).collect();
+    if added.is_empty() {
+        return ("info", " (lines were only removed or moved)".into());
+    }
+    let structure = |l: &str| {
+        let word = l.split_whitespace().next().unwrap_or("");
+        ["if", "then", "else", "elif", "fi", "done", "esac", "}", "unset", "[", "[[", "eval", "__conda_setup"].iter().any(|w| word == *w || word.starts_with("__conda"))
+    };
+    let lower = |l: &str| l.to_lowercase();
+    let shown = added.iter().take(3).map(|l| crate::util::shorten(&mask_line(l), 120)).collect::<Vec<_>>().join("; ");
+    if added.iter().any(|l| FETCH.iter().any(|f| lower(l).contains(f))) {
+        return ("high", format!(": a line now fetches or decodes something when a shell starts ({shown})"));
+    }
+    if added.iter().all(|l| TOOL_LINES.iter().any(|t| lower(l).contains(t)) || (structure(l) && !l.contains("://"))) {
+        return ("info", format!(" (a toolchain's lines: {shown})"));
+    }
+    ("medium", format!(" (added: {shown})"))
+}
+
+/// The lines of a shell file that do something: not empty, not comments.
+fn shell_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'))
+}
+
+/// 8 hex of SHA-256: enough to tell lines of one file apart.
+fn short_hash(line: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(line.as_bytes()).iter().take(4).map(|b| format!("{b:02x}")).collect()
+}
+
+/// A shell file's fingerprint: its hash, then the hashes of its first 400 lines that do something,
+/// so a change can name what was added.
+fn shell_fingerprint(path: &Path) -> String {
+    let hash = fingerprint(path);
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let lines: Vec<String> = shell_lines(&text).take(400).map(short_hash).collect();
+    format!("{hash} lines:{}", lines.join(","))
+}
+
+/// A fingerprint without a shell file's line hashes.
+fn content(value: &str) -> &str {
+    value.split(" lines:").next().unwrap_or(value)
+}
+
+fn line_hashes(value: &str) -> Option<std::collections::HashSet<String>> {
+    let (_, lines) = value.split_once(" lines:")?;
+    Some(lines.split(',').filter(|h| !h.is_empty()).map(str::to_owned).collect())
+}
+
+/// A shell line with secret values hidden: `export OPENAI_API_KEY=…`.
+fn mask_line(line: &str) -> String {
+    let secret_name = |name: &str| {
+        let upper = name.to_uppercase();
+        ["KEY", "TOKEN", "SECRET", "PASS", "AUTH", "CREDENTIAL", "COOKIE", "SESSION"].iter().any(|w| upper.contains(w))
+    };
+    line.split_whitespace()
+        .map(|word| match word.split_once('=') {
+            Some((name, value)) if !value.is_empty() && secret_name(name) => format!("{name}=…"),
+            _ if word.len() >= 24 && word.chars().all(|c| c.is_ascii_alphanumeric() || "_-+/=".contains(c)) && word.chars().any(|c| c.is_ascii_digit()) => {
+                format!("{}…", &word[..4])
+            }
+            _ => word.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A fingerprint of a file: its SHA-256, or its size and time for a folder or an unreadable file.
@@ -316,11 +452,19 @@ fn snapshot(part: &mut Part, discovery: &crate::filesystem::Discovery) -> BTreeM
             file(&mut items, "emond rule", &path, String::new());
         }
     }
+    let shell = |items: &mut BTreeMap<String, Item>, path: &Path| {
+        if std::fs::symlink_metadata(path).is_ok() {
+            items.insert(
+                format!("shell startup file:{}", path.display()),
+                Item { what: format!("shell startup file {}", tilde(path)), value: shell_fingerprint(path), target: String::new() },
+            );
+        }
+    };
     for name in [".zshrc", ".zprofile", ".zshenv", ".zlogin", ".zlogout", ".bash_profile", ".bashrc", ".profile"] {
-        file(&mut items, "shell startup file", &home().join(name), String::new());
+        shell(&mut items, &home().join(name));
     }
     for path in ["/etc/zshrc", "/etc/zprofile", "/etc/zshenv", "/etc/profile", "/etc/bashrc"] {
-        file(&mut items, "shell startup file", Path::new(path), String::new());
+        shell(&mut items, Path::new(path));
     }
     for path in entries(Path::new("/etc/paths.d")) {
         file(&mut items, "PATH entry", &path, String::new());
@@ -341,11 +485,27 @@ fn snapshot(part: &mut Part, discovery: &crate::filesystem::Discovery) -> BTreeM
             items.insert("npm:registry".into(), Item { what: format!("npm registry setting ({})", registries.join(", ")), value: registries.join("\n"), target: String::new() });
         }
     }
+    // Every project the disk walk found (any folder with .git, .vscode, a lockfile …).
     for repo in &discovery.projects {
         for editor in [".vscode", ".cursor"] {
             let tasks = repo.join(editor).join("tasks.json");
-            if std::fs::read_to_string(&tasks).is_ok_and(|t| t.contains("folderOpen")) {
-                file(&mut items, "editor task that runs when the folder opens", &tasks, String::new());
+            let Ok(text) = std::fs::read_to_string(&tasks) else { continue };
+            if !text.contains("folderOpen") {
+                continue;
+            }
+            file(&mut items, "editor task that runs when the folder opens", &tasks, String::new());
+            if let Some((what, command)) = folder_open_fetch(&text) {
+                part.add(
+                    "high",
+                    "persistence",
+                    format!(
+                        "{} runs a task as soon as the folder is opened in the editor, and it {what}: {}. Malicious repositories spread this way; do not open the folder in VS Code or Cursor until it is removed.",
+                        tilde(&tasks),
+                        crate::util::shorten(&crate::agents::mask(&command), 160)
+                    ),
+                    None,
+                    "editor tasks",
+                );
             }
         }
     }
@@ -357,6 +517,31 @@ fn snapshot(part: &mut Part, discovery: &crate::filesystem::Discovery) -> BTreeM
     }
     part.checked.push(format!("persistence baseline ({})", plural(items.len(), "item", "items")));
     items
+}
+
+/// The first task in a tasks.json that runs when the folder opens and fetches, decodes or runs
+/// code from its command line: what it does, and its command.
+fn folder_open_fetch(text: &str) -> Option<(&'static str, String)> {
+    let Some(value) = crate::agents::parse_jsonc(text) else {
+        return crate::agents::fetches(text).map(|what| (what, "(the file is not valid JSON)".to_owned()));
+    };
+    for task in value.get("tasks").and_then(|t| t.as_array()).into_iter().flatten() {
+        if task.pointer("/runOptions/runOn").and_then(|v| v.as_str()) != Some("folderOpen") {
+            continue;
+        }
+        let mut words: Vec<String> = Vec::new();
+        for place in [task, &task["osx"], &task["linux"], &task["windows"]] {
+            if let Some(command) = place.get("command").and_then(|v| v.as_str()) {
+                words.push(command.to_owned());
+            }
+            words.extend(place.get("args").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|a| a.as_str().map(str::to_owned)));
+        }
+        let command = words.join(" ");
+        if let Some(what) = crate::agents::fetches(&command) {
+            return Some((what, command));
+        }
+    }
+    None
 }
 
 // --- 39. The full login-items database, read from a dump the person makes.

@@ -1,14 +1,12 @@
-//! What the root-only commands the sweep offers saw (the full login-items database, an hour of
-//! eslogger). The person runs the command in a terminal; it writes into this user's temporary
+//! What the root-only command the sweep offers saw (the full login-items database). The person
+//! runs the command in a terminal; it writes into this user's temporary
 //! folder (`$TMPDIR/cortexterm-deep`), and the next sweep moves what it says into the graph and
 //! deletes the file:
 //!
 //! - the login-items database (`sfltool dumpbtm`): each item as `(:StartItem {key: btm:…, source:
 //!   btm, label, identifier, kind, disposition, program, url, team, developer})-[:ON]->(:Machine)`
 //!   (`-[:STARTS]->(:Binary)` when it names a program), the dump as `(:MacSetting {key: btm_dump,
-//!   value*, checked_ms, items})`;
-//! - eslogger: what it flagged in the stream `eslogger` (`{capture, severity, text}`), the
-//!   recording as `(:MacSetting {key: eslogger, value*, checked_ms, events})`.
+//!   value*, checked_ms, items})`.
 //!
 //! Blocking: called from the sweep's checks.
 
@@ -146,30 +144,4 @@ pub fn btm() -> Option<(u64, Vec<BTreeMap<String, String>>)> {
         .map(|row| BTM_FIELDS.iter().zip(row).map(|((field, _), value)| ((*field).to_owned(), graph::text(value))).collect())
         .collect();
     Some((at, records))
-}
-
-/// An eslogger recording: when it was made, how many events, and what was flagged
-/// (severity, text). A new recording is read with `flag` and moved into the graph first.
-pub fn eslogger(flag: impl Fn(&std::path::Path) -> (usize, Vec<(String, String)>)) -> Option<(u64, u64, Vec<(String, String)>)> {
-    if !graph::ready() {
-        return None;
-    }
-    if let Some((path, at)) = finished("eslogger.jsonl") {
-        let (events, notes) = flag(&path);
-        let mut batch = Batch::new();
-        setting_unit(&mut batch, "eslogger", format!("{events} events"), at, ("events", events as u64));
-        graph::put(batch);
-        let records = notes.iter().map(|(severity, text)| json!({"capture": at, "severity": severity, "text": text})).collect();
-        graph::append("eslogger", records, 8);
-        let _ = std::fs::remove_file(&path);
-        return Some((at, events as u64, notes));
-    }
-    let (at, events) = setting("eslogger", "events")?;
-    let notes = graph::block(graph::stream_read("eslogger", at.saturating_sub(1)))?
-        .ok()?
-        .into_iter()
-        .filter(|entry| entry.value["capture"].as_u64() == Some(at))
-        .map(|entry| (graph::text(&entry.value["severity"]), graph::text(&entry.value["text"])))
-        .collect();
-    Some((at, events, notes))
 }

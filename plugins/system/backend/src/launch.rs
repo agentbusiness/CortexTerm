@@ -26,6 +26,10 @@ pub struct Item {
     pub signature: String,
     pub team: String,
     pub quarantined: bool,
+    /// Signed by Apple (only looked at for a `com.apple.` label).
+    pub apple: bool,
+    /// What its `EnvironmentVariables` put in `DYLD_INSERT_LIBRARIES` (empty when nothing).
+    pub inserts: String,
 }
 
 impl Item {
@@ -41,6 +45,33 @@ impl Item {
     /// Not properly signed (unsigned or ad-hoc).
     pub fn unsigned(&self) -> bool {
         self.signature == "unsigned" || self.signature == "adhoc"
+    }
+
+    /// A Homebrew service (`brew services`): a formula's own program, started from Homebrew's
+    /// folders. Homebrew builds them on this Mac, so they are only ad-hoc signed.
+    pub fn homebrew(&self) -> bool {
+        let file = self.plist.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        (self.label.starts_with("homebrew.mxcl.") || file.starts_with("homebrew.mxcl."))
+            && ["/opt/homebrew/", "/usr/local/Cellar/", "/usr/local/opt/", "/home/linuxbrew/.linuxbrew/"].iter().any(|p| self.program.starts_with(p))
+    }
+
+    /// Why this item is a clear sign of an intruder, when it is one: it wears Apple's name
+    /// without Apple's signature, it injects a library into what it starts, or it starts an
+    /// unsigned program from a temporary or shared folder or from inside ~/Library.
+    pub fn danger(&self) -> Option<String> {
+        if self.label.starts_with("com.apple.") && self.program.starts_with('/') && !self.apple {
+            return Some(format!("its label {} claims to be Apple's but {} is not signed by Apple", self.label, self.program));
+        }
+        if !self.inserts.is_empty() {
+            return Some(format!("it sets DYLD_INSERT_LIBRARIES={}, which injects code into the program it starts", self.inserts));
+        }
+        let library = home().join("Library").display().to_string();
+        let odd = ["/tmp/", "/private/tmp/", "/private/var/tmp/", "/Users/Shared/"].iter().any(|p| self.program.starts_with(p))
+            || (self.program.starts_with(&format!("{library}/")) && !self.program.starts_with(&format!("{library}/Application Support/")));
+        if odd && self.unsigned() {
+            return Some(format!("it starts {}, an unsigned program in a temporary, shared or hidden library folder", self.program));
+        }
+        None
     }
 
     /// "which is not signed", "which is signed (team ABCD1234)", ...
@@ -88,7 +119,15 @@ pub fn inspect(plist: &Path) -> Option<Item> {
         host::signature(path)
     };
     let quarantined = path.exists() && host::quarantined(path);
-    Some(Item { plist: plist.to_path_buf(), label, program, signature, team, quarantined })
+    let apple = label.starts_with("com.apple.") && path.exists() && crate::codesign::check(path).apple;
+    let inserts = dict
+        .get("EnvironmentVariables")
+        .and_then(|v| v.as_dictionary())
+        .and_then(|env| env.get("DYLD_INSERT_LIBRARIES"))
+        .and_then(|v| v.as_string())
+        .unwrap_or("")
+        .to_owned();
+    Some(Item { plist: plist.to_path_buf(), label, program, signature, team, quarantined, apple, inserts })
 }
 
 /// Every plist in the launch folders.

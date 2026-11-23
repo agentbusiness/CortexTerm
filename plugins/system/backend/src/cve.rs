@@ -1,11 +1,14 @@
-//! One advisory (CVE, GHSA or another OSV id) checked against this Mac. NVD, OSV and EPSS say
-//! what it is and what it covers; CISA KEV and Apple's release notes (SOFA) come from the sweep's
-//! kept feeds. Code compares the versions; nothing is run or changed. When nothing could be
+//! One advisory (CVE, GHSA or another OSV id) checked against this Mac. The CVE.org record (with
+//! CISA's Vulnrichment SSVC), OSV and EPSS say what it is; NVD adds the CPEs it covers and is only
+//! a fallback for CVSS (it stopped enriching most CVEs in April 2026). CISA KEV and Apple's release
+//! notes (SOFA) come from the sweep's kept feeds. What is installed is what the last sweep
+//! recorded in the graph; the disk is walked only when the graph has nothing yet. Code compares the versions; nothing is run or changed. When nothing could be
 //! compared the verdict is `unknown`, never `not-affected`.
 //!
 //! The advisory is kept in the graph (and reused for a day):
 //! `(:Advisory {key: id, aliases, title, summary, published, modified, cvss_*, cwe, epss*,
-//! epss_percentile, kev, ransomware, kev_added, fetched_ms, found, checked, skipped})-[:SEEN_ON]->(:Machine)`, what it covers as
+//! epss_percentile, ssvc_exploitation, ssvc_automatable, kev, ransomware, kev_added, fetched_ms,
+//! found, checked, skipped})-[:SEEN_ON]->(:Machine)`, what it covers as
 //! `(:AdvisoryCpe)-[:OF]->(:Advisory)` and `(:AdvisoryRange)-[:OF]->(:AdvisoryPackage)-[:OF]->(:Advisory)`,
 //! its references as `-[:CITES {tags}]->(:Reference {key: url})`. What it was compared with on this
 //! Mac is `(:Advisory)-[:AFFECTS {verdict*, version, fixed_in, fix}]->(:App | :Formula | :Package | :OS)`.
@@ -45,8 +48,73 @@ struct Advisory {
     cpes: Vec<Cpe>,
     packages: Vec<OsvPackage>,
     epss: Option<Epss>,
+    /// CISA's Vulnrichment decision points, from the CVE.org record.
+    ssvc: Option<Ssvc>,
     checked: Vec<String>,
     skipped: Vec<String>,
+}
+
+/// CISA's SSVC: exploitation `none | poc | active` and whether it is automatable.
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct Ssvc {
+    exploitation: String,
+    automatable: bool,
+}
+
+/// How much an advisory on installed software matters, by what is known of its exploitation (a
+/// CVSS score alone never raises it): `high` when CISA KEV lists it or the vendor marks it
+/// exploited (or it is a malicious-package record); `medium` when EPSS is at least 0.1, or CISA's
+/// SSVC says exploitation poc or active and automatable; otherwise `low`, which is counted
+/// quietly, never alerted one by one.
+pub fn priority(id: &str, kev: bool, vendor_exploited: bool, epss: Option<f64>, ssvc: Option<(&str, bool)>) -> &'static str {
+    if kev || vendor_exploited || id.starts_with("MAL-") {
+        "high"
+    } else if epss.is_some_and(|e| e >= 0.1) || ssvc.is_some_and(|(exploitation, automatable)| automatable && matches!(exploitation, "poc" | "active")) {
+        "medium"
+    } else {
+        "low"
+    }
+}
+
+/// The priority of a set of advisory ids on one installed thing (a formula, a tool), the worst of
+/// them, and why: CISA KEV from the kept feed, EPSS in one request, CISA's SSVC for at most ten
+/// CVEs. What `brew vulns` and OSV list per package is rated with this instead of its CVSS.
+pub async fn prioritise(client: &reqwest::Client, ids: &[String]) -> (&'static str, String) {
+    let kev: BTreeSet<String> = inventory::cached_feed_async(inventory::KEV_FILE)
+        .await
+        .and_then(|b| serde_json::from_slice::<Vec<KevRow>>(&b).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    let cves: Vec<&String> = ids.iter().filter(|id| id.starts_with("CVE-")).take(100).collect();
+    if let Some(id) = ids.iter().find(|id| kev.contains(*id) || id.starts_with("MAL-")) {
+        let why = if id.starts_with("MAL-") { format!("{id} is a malicious-package record") } else { format!("{id} is on CISA's known exploited list") };
+        return ("high", why);
+    }
+    let mut epss: BTreeMap<String, f64> = BTreeMap::new();
+    if !cves.is_empty() {
+        let list = cves.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(",");
+        if let Ok(Some(answer)) = get_json(client, format!("https://api.first.org/data/v1/epss?cve={list}"), "EPSS").await {
+            for row in answer["data"].as_array().into_iter().flatten() {
+                if let (Some(id), Some(score)) = (row["cve"].as_str(), row["epss"].as_str().and_then(|e| e.parse::<f64>().ok())) {
+                    epss.insert(id.to_owned(), score);
+                }
+            }
+        }
+    }
+    if let Some((id, score)) = epss.iter().filter(|(_, e)| **e >= 0.1).max_by(|a, b| a.1.total_cmp(b.1)) {
+        return ("medium", format!("{id} has a {:.0}% exploit likelihood in the next 30 days (EPSS)", score * 100.0));
+    }
+    for id in cves.iter().take(10) {
+        if let Ok(Some(record)) = get_json(client, format!("https://cveawg.mitre.org/api/cve/{id}"), "CVE.org").await
+            && let Some(ssvc) = read_ssvc(&record)
+            && priority(id, false, false, None, Some((&ssvc.exploitation, ssvc.automatable))) == "medium"
+        {
+            return ("medium", format!("CISA rates {id} as exploitation {} and automatable (SSVC)", ssvc.exploitation));
+        }
+    }
+    ("low", "none of them is known to be exploited or likely to be".into())
 }
 
 /// One vulnerable CPE match from NVD (empty strings are absent bounds).
@@ -111,14 +179,9 @@ pub async fn report(raw: &str) -> Result<CveReport, String> {
     let id = normalise(raw)?;
     let client = client()?;
     // What is on this Mac, while the advisory is looked up.
-    let gathering = tokio::task::spawn_blocking(Mac::gather);
-    let (advisory, feeds) = tokio::join!(advisory(&client, &id), Feeds::load(&client));
-    let mac = match tokio::time::timeout(Duration::from_secs(90), gathering).await {
-        Ok(Ok(mac)) => Some(mac),
-        _ => None,
-    };
+    let (advisory, feeds, (mac, recorded)) = tokio::join!(advisory(&client, &id), Feeds::load(&client), Mac::load());
     let report = assemble(id, &advisory, &feeds, mac.as_ref());
-    let present = remember(mac.as_ref()).await;
+    let present = if recorded { mac.as_ref().map(|m| m.graph().refs()).unwrap_or_default() } else { remember(mac.as_ref()).await };
     record(&report, &present);
     Ok(report)
 }
@@ -204,19 +267,19 @@ pub struct Batch {
     feeds: Feeds,
     mac: Option<Mac>,
     present: std::collections::HashSet<cc_protocol::contracts::memory::GraphRef>,
+    /// What Apple marks as exploited in releases newer than this Mac's.
+    exploited: BTreeSet<String>,
 }
 
 impl Batch {
     pub async fn new() -> Result<Batch, String> {
         let client = client()?;
-        let gathering = tokio::task::spawn_blocking(Mac::gather);
-        let feeds = Feeds::load(&client).await;
-        let mac = match tokio::time::timeout(Duration::from_secs(90), gathering).await {
-            Ok(Ok(mac)) => Some(mac),
-            _ => None,
-        };
-        let present = remember(mac.as_ref()).await;
-        Ok(Batch { client, feeds, mac, present })
+        let (feeds, (mac, recorded)) = tokio::join!(Feeds::load(&client), Mac::load());
+        // A recorded inventory is already in the graph; only a fresh walk is written.
+        let present = if recorded { mac.as_ref().map(|m| m.graph().refs()).unwrap_or_default() } else { remember(mac.as_ref()).await };
+        let mut batch = Batch { client, feeds, mac, present, exploited: BTreeSet::new() };
+        batch.exploited = batch.apple_exploited().into_iter().collect();
+        Ok(batch)
     }
 
     /// Write what a report said about this Mac (`record`).
@@ -282,10 +345,15 @@ impl Batch {
         &self.client
     }
 
-    pub async fn report(&self, raw: &str) -> Result<CveReport, String> {
+    /// The report for one advisory and its [`priority`].
+    pub async fn report(&self, raw: &str) -> Result<(CveReport, &'static str), String> {
         let id = normalise(raw)?;
         let advisory = advisory(&self.client, &id).await;
-        Ok(assemble(id, &advisory, &self.feeds, self.mac.as_ref()))
+        let report = assemble(id, &advisory, &self.feeds, self.mac.as_ref());
+        let vendor = std::iter::once(&report.id).chain(&report.aliases).any(|a| self.exploited.contains(a));
+        let ssvc = advisory.ssvc.as_ref().map(|s| (s.exploitation.as_str(), s.automatable));
+        let rated = priority(&report.id, report.kev.is_some(), vendor, report.epss.as_ref().map(|e| e.score), ssvc);
+        Ok((report, rated))
     }
 }
 
@@ -440,6 +508,9 @@ fn advisory_batch(id: &str, a: &Advisory) -> Option<graph::Batch> {
     if let Some(e) = &a.epss {
         node.t("epss", e.score).p("epss_percentile", e.percentile);
     }
+    if let Some(ssvc) = &a.ssvc {
+        node.p("ssvc_exploitation", ssvc.exploitation.clone()).p("ssvc_automatable", ssvc.automatable);
+    }
     // This Mac holds the advisory: its references, CPEs and packages are new with it, so they
     // cannot (memory refuses a group of new nodes that reaches nothing stored).
     unit.edge(me.clone(), "SEEN_ON", graph::machine()?);
@@ -487,7 +558,7 @@ async fn stored(id: &str) -> Option<Advisory> {
     let k = json!({"k": id});
     let rows = graph::query(
         "MATCH (a:Advisory {key: $k}) WHERE a.fetched_ms IS NOT NULL RETURN a.fetched_ms, a.found, a.aliases, a.title, a.summary, a.published, a.modified, \
-         a.cwe, a.checked, a.skipped, a.cvss_version, a.cvss_score, a.cvss_severity, a.cvss_vector, a.epss, a.epss_percentile",
+         a.cwe, a.checked, a.skipped, a.cvss_version, a.cvss_score, a.cvss_severity, a.cvss_vector, a.epss, a.epss_percentile, a.ssvc_exploitation, a.ssvc_automatable",
         k.clone(),
     )
     .await
@@ -507,6 +578,7 @@ async fn stored(id: &str) -> Option<Advisory> {
         skipped: graph::texts(&row[9]),
         cvss: row[11].as_f64().map(|score| Cvss { version: graph::text(&row[10]), score, severity: graph::text(&row[12]), vector: graph::text(&row[13]) }),
         epss: row[14].as_f64().map(|score| Epss { score, percentile: row[15].as_f64().unwrap_or(0.0) }),
+        ssvc: row[16].as_str().filter(|e| !e.is_empty()).map(|e| Ssvc { exploitation: e.to_owned(), automatable: row[17].as_bool().unwrap_or(false) }),
         ..Default::default()
     };
     let at_k = json!({"k": id, "at": at});
@@ -584,13 +656,18 @@ async fn fetch(client: &reqwest::Client, id: &str) -> Advisory {
     let mut osv_records: Vec<Value> = Vec::new();
     let mut cve = id.starts_with("CVE-").then(|| id.to_owned());
 
+    // NVD's CVSS is kept apart: it is used only when CVE.org and OSV have none.
+    let mut nvd_cvss = None;
     let first = if let Some(cve) = &cve {
-        let (nvd, osv, epss) = tokio::join!(
+        let (nvd, osv, epss, record) = tokio::join!(
             get_json(client, format!("https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve}"), "NVD"),
             get_json(client, osv_url(cve), "OSV"),
-            epss(client, cve)
+            epss(client, cve),
+            get_json(client, format!("https://cveawg.mitre.org/api/cve/{cve}"), "CVE.org")
         );
         read_nvd(&mut advisory, nvd);
+        nvd_cvss = advisory.cvss.take();
+        read_cveorg(&mut advisory, record);
         advisory.epss = epss;
         osv
     } else {
@@ -635,16 +712,31 @@ async fn fetch(client: &reqwest::Client, id: &str) -> Advisory {
     if cve.is_none() {
         cve = advisory.aliases.iter().find(|a| a.starts_with("CVE-")).cloned();
         if let Some(cve) = &cve {
-            let (nvd, epss) = tokio::join!(
+            let (nvd, epss, record) = tokio::join!(
                 get_json(client, format!("https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve}"), "NVD"),
-                epss(client, cve)
+                epss(client, cve),
+                get_json(client, format!("https://cveawg.mitre.org/api/cve/{cve}"), "CVE.org")
             );
+            let osv_cvss = advisory.cvss.take();
             read_nvd(&mut advisory, nvd);
+            nvd_cvss = advisory.cvss.take();
+            advisory.cvss = osv_cvss;
+            read_cveorg(&mut advisory, record);
             advisory.epss = epss;
         }
     }
     for record in &osv_records {
         read_osv(&mut advisory, record);
+    }
+    if advisory.cvss.is_none() && nvd_cvss.is_some() {
+        advisory.cvss = nvd_cvss;
+        advisory.checked.push("CVSS from NVD (CVE.org and OSV have none)".into());
+    }
+    // NVD is a fallback: when CVE.org answered, NVD not answering does not fail the lookup.
+    if advisory.checked.iter().any(|c| c == "CVE.org") {
+        let (nvd, rest): (Vec<String>, Vec<String>) = advisory.skipped.drain(..).partition(|s| s.starts_with("NVD"));
+        advisory.skipped = rest;
+        advisory.checked.extend(nvd.into_iter().map(|e| format!("NVD (not reached: {e})")));
     }
     if advisory.epss.is_some() {
         advisory.checked.push("EPSS".into());
@@ -765,6 +857,73 @@ fn read_nvd(advisory: &mut Advisory, answer: Result<Option<Value>, String>) {
             }
         }
     }
+}
+
+/// The CVE.org record (CVE JSON 5): the CNA's own CVSS, else CISA's (ADP), the newest version
+/// first; CISA's Vulnrichment SSVC; the description when nothing else gave one. A failed lookup is
+/// only noted: NVD and OSV still answer.
+fn read_cveorg(advisory: &mut Advisory, answer: Result<Option<Value>, String>) {
+    let record = match answer {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            advisory.checked.push("CVE.org (no record)".into());
+            return;
+        }
+        Err(error) => {
+            advisory.checked.push(format!("CVE.org (not reached: {error})"));
+            return;
+        }
+    };
+    advisory.found = true;
+    advisory.checked.push("CVE.org".into());
+    let containers = &record["containers"];
+    let cna = &containers["cna"];
+    if advisory.summary.is_empty() {
+        let description = cna["descriptions"].as_array().into_iter().flatten().find(|d| d["lang"].as_str().is_some_and(|l| l.starts_with("en"))).and_then(|d| d["value"].as_str()).unwrap_or("");
+        advisory.summary = shorten(&description.split_whitespace().collect::<Vec<_>>().join(" "), 600);
+    }
+    if advisory.title.is_empty() {
+        advisory.title = shorten(cna["title"].as_str().unwrap_or("").trim(), 160);
+    }
+    if advisory.published.is_empty() {
+        advisory.published = date(record["cveMetadata"]["datePublished"].as_str().unwrap_or(""));
+        advisory.modified = date(record["cveMetadata"]["dateUpdated"].as_str().unwrap_or(""));
+    }
+    let metrics = std::iter::once(cna).chain(containers["adp"].as_array().into_iter().flatten()).flat_map(|c| c["metrics"].as_array().into_iter().flatten());
+    let mut best: Option<(usize, Cvss)> = None;
+    for metric in metrics {
+        for (rank, (key, version)) in [("cvssV4_0", "4.0"), ("cvssV3_1", "3.1"), ("cvssV3_0", "3.0"), ("cvssV2_0", "2.0")].iter().enumerate() {
+            let data = &metric[*key];
+            let Some(score) = data["baseScore"].as_f64() else { continue };
+            if best.as_ref().is_some_and(|(r, _)| *r <= rank) {
+                continue;
+            }
+            let severity = data["baseSeverity"].as_str().unwrap_or("").to_ascii_uppercase();
+            let severity = if severity.is_empty() { severity_of_score(score).to_owned() } else { severity };
+            best = Some((rank, Cvss { version: (*version).into(), score, severity, vector: data["vectorString"].as_str().unwrap_or("").to_owned() }));
+        }
+    }
+    if let Some((_, cvss)) = best {
+        advisory.cvss = Some(cvss);
+    }
+    if let Some(ssvc) = read_ssvc(&record) {
+        advisory.checked.push(format!("CISA Vulnrichment SSVC (exploitation {}, automatable {})", ssvc.exploitation, if ssvc.automatable { "yes" } else { "no" }));
+        advisory.ssvc = Some(ssvc);
+    }
+}
+
+/// CISA's SSVC decision points in a CVE.org record's ADP container.
+fn read_ssvc(record: &Value) -> Option<Ssvc> {
+    let content = record["containers"]["adp"]
+        .as_array()?
+        .iter()
+        .flat_map(|adp| adp["metrics"].as_array().into_iter().flatten())
+        .find(|m| m["other"]["type"].as_str().is_some_and(|t| t.eq_ignore_ascii_case("ssvc")))?["other"]["content"]
+        .clone();
+    let option = |name: &str| {
+        content["options"].as_array().into_iter().flatten().find_map(|o| o.as_object()?.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).and_then(|(_, v)| v.as_str().map(str::to_ascii_lowercase)))
+    };
+    Some(Ssvc { exploitation: option("Exploitation")?, automatable: option("Automatable").is_some_and(|a| a == "yes") })
 }
 
 fn read_osv(advisory: &mut Advisory, record: &Value) {
@@ -968,6 +1127,44 @@ struct Mac {
 }
 
 impl Mac {
+    /// What is on this Mac: as the last sweep recorded it in the graph (and whether it was), else a
+    /// fresh walk of the disk, given 90 s.
+    async fn load() -> (Option<Mac>, bool) {
+        if let Some(local) = Local::recorded().await {
+            return (Some(Mac::recorded(local).await), true);
+        }
+        match tokio::time::timeout(Duration::from_secs(90), tokio::task::spawn_blocking(Mac::gather)).await {
+            Ok(Ok(mac)) => (Some(mac), false),
+            _ => (None, false),
+        }
+    }
+
+    /// The recorded apps and projects, with Homebrew and the global tools as recorded too.
+    async fn recorded(local: Local) -> Mac {
+        let mut mac = Mac { skipped: local.part.skipped.clone(), local, ..Default::default() };
+        if let Ok(rows) = graph::query_all("MATCH (f:Formula)-[:INSTALLED_ON]->(:Machine) WHERE f.ended_ms IS NULL RETURN f.key, f.kind, f.version ORDER BY f.key", json!({})).await {
+            for row in rows {
+                let entry = (graph::text(&row[0]), graph::text(&row[2]));
+                if graph::text(&row[1]) == "cask" { mac.casks.push(entry) } else { mac.formulae.push(entry) }
+            }
+        }
+        if let Ok(rows) = graph::query_all("MATCH (p:Package)-[e:INSTALLED_ON]->(:Machine) RETURN p.ecosystem, p.name, e.manager, e.version ORDER BY p.key", json!({})).await {
+            for row in rows {
+                let ecosystem = ["npm", "PyPI", "crates.io"].into_iter().find(|e| *e == graph::text(&row[0]));
+                let manager = ["npm", "pipx", "cargo"].into_iter().find(|m| *m == graph::text(&row[2]));
+                let (Some(ecosystem), Some(manager)) = (ecosystem, manager) else { continue };
+                let name = graph::text(&row[1]);
+                let fix = match manager {
+                    "npm" => format!("npm install -g {name}@latest"),
+                    "pipx" => format!("pipx upgrade {name}"),
+                    _ => format!("cargo install {name}"),
+                };
+                mac.tools.push(Package { ecosystem, manager, name, version: graph::text(&row[3]), fix });
+            }
+        }
+        mac
+    }
+
     fn gather() -> Mac {
         let local = Local::installed();
         let (part, tools) = sweep::global_tools();
@@ -1685,6 +1882,9 @@ fn verdict(report: &mut CveReport, advisory: &Advisory, looked: bool) {
         && let Some(epss) = &report.epss
     {
         risk.push(format!("exploit likelihood {:.1}% in the next 30 days (EPSS)", epss.score * 100.0));
+    }
+    if let Some(ssvc) = advisory.ssvc.as_ref().filter(|s| s.exploitation != "none") {
+        risk.push(format!("CISA rates its exploitation {}{} (SSVC)", ssvc.exploitation, if ssvc.automatable { " and automatable" } else { "" }));
     }
     let risk = if risk.is_empty() { String::new() } else { format!("; {}", risk.join(", ")) };
     let covers = !advisory.cpes.is_empty() || !advisory.packages.is_empty() || report.affects.iter().any(|a| a.source == "apple");

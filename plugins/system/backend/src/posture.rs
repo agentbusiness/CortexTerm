@@ -357,29 +357,43 @@ fn profiles(part: &mut Part) {
 }
 
 /// Certificates the admin or user marked as trusted (an interception proxy's root CA lets it
-/// read HTTPS traffic).
+/// read HTTPS traffic). A developer's own roots (mkcert, a debugging proxy, a signing
+/// certificate) are low with what they are; a company's or antivirus's inspection root is low too;
+/// adware roots are high; any other is medium.
 fn certificates(part: &mut Part) {
-    let interceptors = ["charles", "mitmproxy", "fiddler", "burp", "proxyman", "portswigger", "zscaler", "netskope", "kaspersky", "avast", "avg", "eset", "bitdefender", "superfish", "komodia"];
+    let developer = [
+        "mkcert", "charles", "mitmproxy", "fiddler", "burp", "portswigger", "proxyman", "caddy local authority", "laravel valet",
+        "herd", "httptoolkit", "http toolkit", "apple development", "apple distribution", "developer id", "iphone developer",
+        "mac developer", "localhost",
+    ];
+    let inspection = ["zscaler", "netskope", "forcepoint", "palo alto", "fortinet", "cisco umbrella", "kaspersky", "avast", "avg", "eset", "bitdefender", "norton", "sophos"];
+    let adware = ["superfish", "komodia", "edellroot", "privdog"];
     for (args, domain) in [(vec!["dump-trust-settings", "-d"], "an administrator"), (vec!["dump-trust-settings"], "you")] {
         let Some(text) = read(part, "trusted certificates", "/usr/bin/security", &args) else { continue };
         part.checked.push(format!("certificates trusted by {domain}"));
         let certs: Vec<String> =
             text.lines().filter_map(|l| l.strip_prefix("Cert ").and_then(|r| r.split_once(": ")).map(|(_, name)| name.trim().to_owned())).collect();
-        if certs.is_empty() {
-            continue;
+        let of = |list: &[&str]| -> Vec<String> { certs.iter().filter(|c| list.iter().any(|i| c.to_lowercase().contains(i))).cloned().collect() };
+        let (bad, dev, company) = (of(&adware), of(&developer), of(&inspection));
+        let other: Vec<String> = certs.iter().filter(|c| !bad.contains(c) && !dev.contains(c) && !company.contains(c)).cloned().collect();
+        let groups = [
+            ("high", bad, "known adware roots that read encrypted web traffic; remove them in Keychain Access"),
+            ("medium", other, "a trusted certificate that is not Apple's can be used to read encrypted web traffic; remove any you do not recognise in Keychain Access"),
+            ("low", company, "a company's or an antivirus's HTTPS inspection; fine when you know it is there"),
+            ("low", dev, "developer roots (local HTTPS, a debugging proxy, code signing); fine while you use the tool that made them"),
+        ];
+        for (severity, list, why) in groups {
+            if list.is_empty() {
+                continue;
+            }
+            part.add(
+                severity,
+                "posture",
+                format!("{} marked as trusted by {domain}: {}: {why}.", plural(list.len(), "certificate is", "certificates are"), names(&list)),
+                None,
+                "trust settings",
+            );
         }
-        let suspicious = certs.iter().any(|c| interceptors.iter().any(|i| c.to_lowercase().contains(i)));
-        part.add(
-            if suspicious { "medium" } else { "low" },
-            "posture",
-            format!(
-                "{} marked as trusted by {domain}: {}. A trusted certificate that is not Apple's can be used to read encrypted web traffic; remove any you do not recognise in Keychain Access.",
-                plural(certs.len(), "certificate is", "certificates are"),
-                names(&certs)
-            ),
-            None,
-            "trust settings",
-        );
     }
 }
 
@@ -414,18 +428,37 @@ fn network_settings(part: &mut Part) {
         }
     }
     part.checked.push("per-domain DNS resolvers".into());
-    let resolvers: Vec<String> = std::fs::read_dir("/etc/resolver")
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| !n.starts_with('.'))
-        .collect();
-    if !resolvers.is_empty() {
+    // A resolver file a VPN or developer tool writes says so in a comment or points at its own
+    // server; those are info, anything else low.
+    let tools = ["docker", "orbstack", "valet", "herd", "tailscale", "zerotier", "wireguard", "openvpn", "cisco", "anyconnect", "globalprotect", "forticlient", "nordvpn", "expressvpn", "mullvad", "protonvpn", "dnsmasq", "minikube", "colima", "lima", "podman", "kubernetes", "nextdns", "100.100.100.100"];
+    let (mut known, mut unknown) = (Vec::new(), Vec::new());
+    for entry in std::fs::read_dir("/etc/resolver").into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let text = std::fs::read_to_string(entry.path()).unwrap_or_default().to_lowercase();
+        let local_name = ["test", "localhost", "local", "docker", "internal", "orb.local", "ts.net", "lan", "home.arpa"].iter().any(|t| name == *t || name.ends_with(&format!(".{t}")));
+        if local_name || tools.iter().any(|t| text.contains(t) || name.contains(t)) {
+            known.push(name);
+        } else {
+            unknown.push(name);
+        }
+    }
+    if !unknown.is_empty() {
         part.add(
             "low",
             "posture",
-            format!("/etc/resolver sends DNS for {} to its own server ({}). VPNs and Docker do this; anything else is worth a look.", plural(resolvers.len(), "domain", "domains"), names(&resolvers)),
+            format!("/etc/resolver sends DNS for {} to its own server ({}). VPNs and developer tools do this; anything else is worth a look.", plural(unknown.len(), "domain", "domains"), names(&unknown)),
+            None,
+            "resolver",
+        );
+    }
+    if !known.is_empty() {
+        part.add(
+            "info",
+            "posture",
+            format!("/etc/resolver sends DNS for {} to a VPN's or developer tool's server ({}).", plural(known.len(), "domain", "domains"), names(&known)),
             None,
             "resolver",
         );
@@ -442,7 +475,15 @@ fn network_settings(part: &mut Part) {
                 .filter(|l| !l.split_whitespace().skip(1).all(|name| defaults.contains(&name)))
                 .collect();
             let sensitive = ["apple.com", "icloud", "mzstatic", "microsoft", "google", "github", "brew.sh", "osv.dev", "virustotal", "malwarebytes", "objective-see"];
-            let blocked: Vec<&str> = extra.iter().copied().filter(|l| sensitive.iter().any(|s| l.contains(s))).collect();
+            // Ad-block lists send these names nowhere (0.0.0.0, 127.0.0.1, ::); only a line that
+            // sends one to a real address redirects it.
+            let nowhere = ["0.0.0.0", "127.0.0.1", "::", "::1", "0:0:0:0:0:0:0:0", "0:0:0:0:0:0:0:1", "255.255.255.255"];
+            let blocked: Vec<&str> = extra
+                .iter()
+                .copied()
+                .filter(|l| l.split_whitespace().next().is_some_and(|address| !nowhere.contains(&address)))
+                .filter(|l| l.split_whitespace().skip(1).any(|name| sensitive.iter().any(|s| name.to_lowercase().contains(s))))
+                .collect();
             if !blocked.is_empty() {
                 part.add(
                     "medium",
@@ -464,11 +505,36 @@ fn sudo(part: &mut Part) {
         Err(error) => part.skipped.push(format!("passwordless sudo: {error}")),
         Ok(out) => {
             part.checked.push("passwordless sudo".into());
-            if out.stdout.lines().any(|l| l.contains("NOPASSWD") && (l.contains("ALL") || l.contains("/bin/sh") || l.contains("/bin/bash") || l.contains("/bin/zsh"))) {
+            // `(ALL) NOPASSWD: ALL` lets anything become root; `(ALL) NOPASSWD: /sbin/pfctl` only
+            // that command. A shell or an editor in the list is as good as ALL.
+            let mut limited: Vec<String> = Vec::new();
+            let mut any = false;
+            for line in out.stdout.lines().filter(|l| l.contains("NOPASSWD:")) {
+                let commands: Vec<&str> = line.split("NOPASSWD:").nth(1).unwrap_or("").split(',').map(str::trim).filter(|c| !c.is_empty()).collect();
+                let shell = |c: &&str| {
+                    let program = c.split_whitespace().next().unwrap_or("");
+                    let name = program.rsplit('/').next().unwrap_or("");
+                    program == "ALL" || ["sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "su", "env", "python", "python3", "perl", "ruby", "node", "vi", "vim", "nano", "less", "tee", "chmod", "chown", "cp", "mv", "dd"].contains(&name)
+                };
+                if commands.iter().any(shell) {
+                    any = true;
+                } else {
+                    limited.extend(commands.iter().map(|c| c.to_string()));
+                }
+            }
+            if any {
                 part.add(
                     "high",
                     "posture",
-                    "sudo works without a password, so any script you run can become root.".into(),
+                    "sudo works without a password for any command (or a shell), so any script you run can become root.".into(),
+                    Some("sudo visudo".into()),
+                    "sudo",
+                );
+            } else if !limited.is_empty() {
+                part.add(
+                    "low",
+                    "posture",
+                    format!("sudo runs {} without a password: {}. Fine when you set it up; anything you run can use it.", plural(limited.len(), "command", "commands"), names(&limited)),
                     Some("sudo visudo".into()),
                     "sudo",
                 );

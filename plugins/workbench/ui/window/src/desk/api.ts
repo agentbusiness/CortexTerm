@@ -307,13 +307,38 @@ export interface SweepReport {
   decisions?: Decision[];
   /** The latest checks after a fix, newest first. */
   fixes?: { at: number; group: string; text: string; command: string; gone: boolean }[];
+  /** Group -> its triage. */
+  triage?: Record<string, Triage>;
 }
+
+/** What triage made of a sweep group or live incident: code first, then the model, then an
+ * investigation. Filed as normal (expected, false_alarm, not shadow) shows grey and never notifies. */
+export interface Triage {
+  item: string;
+  /** pending | shown | expected | false_alarm */
+  verdict: string;
+  /** code | model | investigation | person */
+  by: string;
+  reason: string;
+  facts: string[];
+  basis: string[];
+  card: string;
+  similar: boolean;
+  severity: string;
+  at: number;
+  shadow: boolean;
+  notified_at: number;
+}
+
+export const filedAway = (triage?: Triage | null) => !!triage && !triage.shadow && (triage.verdict === 'expected' || triage.verdict === 'false_alarm');
 
 /** `system.security.history`: per bucket, new high, medium, low and info; per group, its buckets. */
 export interface History {
   since: number;
   bucket_ms: number;
   series: [number, number, number, number][];
+  /** Per bucket: what triage filed as normal (not in `series`). */
+  filtered?: number[];
   hits: Record<string, number[]>;
   /** What changed on the computer meanwhile (`macOS 26.1`, `3 apps updated`). */
   markers?: { at: number; text: string }[];
@@ -444,4 +469,5 @@ export interface SecurityInvestigation {
 export interface SecurityIncident {
   id: string; key: string; first_at: number; last_at: number; title: string; severity: string; state: string;
   observations: SecurityObservation[]; investigation?: SecurityInvestigation | null; revision: number; omitted_observations?: number;
+  triage?: Triage | null;
 }

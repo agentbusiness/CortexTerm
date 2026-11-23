@@ -266,9 +266,11 @@ fn devices(part: &mut Part) {
     let (cams, mics) = (cameras(), microphones());
     part.checked.push(format!("camera and microphone use ({} and {})", plural(cams.len(), "camera", "cameras"), plural(mics.len(), "microphone", "microphones")));
     for (kind, list) in [("camera", cams), ("microphone", mics)] {
+        // Any call or recording keeps a device busy, and the device does not say which program
+        // uses it: a note, not a warning (the protection watchers judge the program).
         for (name, _) in list.into_iter().filter(|(_, on)| *on) {
             part.add(
-                "medium",
+                "info",
                 "privacy",
                 format!("The {kind} {name} was in use during the sweep. If you were not in a call or recording, check which app uses it (Control Center shows it)."),
                 None,
@@ -376,6 +378,20 @@ fn permissions(part: &mut Part) {
             );
             continue;
         };
+        // An interpreter with a strong permission hands it to every script it runs, Apple's own
+        // osascript and shells included.
+        let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let interpreter = INTERPRETERS.contains(&name.as_str()) || name.starts_with("python3.") || name.starts_with("python2.");
+        if interpreter && severity == "high" {
+            part.add(
+                "high",
+                "privacy",
+                format!("{} has permission to {what}; it is an interpreter, so every script it runs gets that permission too. Remove it in System Settings unless you granted it on purpose.", tilde(&path)),
+                None,
+                "tcc",
+            );
+            continue;
+        }
         let sig = codesign::check(&path);
         if sig.apple || !sig.unsigned() && sig.status != "unknown" {
             continue;
@@ -385,8 +401,32 @@ fn permissions(part: &mut Part) {
             "unsigned" => "not signed",
             _ => "of unknown signature",
         };
+        // A program you built yourself (Xcode, cargo, a project's build folder) is ad-hoc signed
+        // and not quarantined: worth knowing, not a sign of attack.
+        if local_build(&path) {
+            let severity = if severity == "high" { "medium" } else { "low" };
+            part.add(severity, "privacy", format!("{} has permission to {what} and is {state}; it is a build made on this Mac in a project folder.", tilde(&path)), None, "tcc");
+            continue;
+        }
         part.add(severity, "privacy", format!("{} has permission to {what} and is {state}.", tilde(&path)), None, "tcc");
     }
+}
+
+const INTERPRETERS: [&str; 16] = [
+    "osascript", "python", "python3", "python2", "node", "bash", "zsh", "sh", "dash", "fish", "perl", "ruby", "bun", "deno", "pwsh", "tclsh",
+];
+
+/// Built on this Mac: in a build folder (Xcode's DerivedData, cargo's target, build, dist) or in a
+/// folder of a git project under the home folder, and never downloaded (no quarantine flag).
+fn local_build(path: &Path) -> bool {
+    if crate::host::quarantined(path) {
+        return false;
+    }
+    let home = home();
+    let text = path.display().to_string();
+    let build = ["/DerivedData/", "/target/debug/", "/target/release/", "/.build/", "/build/", "/dist/", "/out/"].iter().any(|b| text.contains(b));
+    let project = path.starts_with(&home) && path.ancestors().skip(1).take_while(|dir| *dir != home).any(|dir| dir.join(".git").exists());
+    build || project
 }
 
 // --- 50. iPhone backups and MVT.

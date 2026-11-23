@@ -1,4 +1,6 @@
-//! The lookup keys the person saves (VirusTotal, abuse.ch), kept in the macOS Keychain: generic
+//! The lookup keys the person saves (VirusTotal, abuse.ch), kept in the macOS Keychain. The one
+//! abuse.ch Auth-Key serves MalwareBazaar's hash lookups and the ThreatFox and URLhaus downloads
+//! (`feeds`); without it those sources are reported as disabled. Keys are generic
 //! passwords of the service [`SERVICE`] whose accounts are the key names. `ABUSE_CH_KEY` in the
 //! environment overrides the saved abuse.ch key. A key file an older version read
 //! (`<data>/keys/<name>`) is moved into the Keychain once at start and deleted; off macOS the keys

@@ -32,8 +32,8 @@ pub struct Signature {
     pub hardened_runtime: bool,
     /// Risky entitlements it has (short names, e.g. `cs.disable-library-validation`).
     pub risky: Vec<String>,
-    /// Whether Gatekeeper accepts it as notarized or from the App Store; `None` until
-    /// [`assess`] ran.
+    /// Whether Gatekeeper accepts it as notarized or from the App Store; `None` when
+    /// [`check`] made it (ask [`notarized`]).
     pub notarized: Option<bool>,
 }
 
@@ -42,29 +42,49 @@ impl Signature {
     pub fn unsigned(&self) -> bool {
         self.status == "unsigned" || self.status == "adhoc"
     }
-}
 
-type Cache = Mutex<HashMap<PathBuf, (Option<SystemTime>, Signature)>>;
-
-fn cache() -> &'static Cache {
-    static CACHE: OnceLock<Cache> = OnceLock::new();
-    CACHE.get_or_init(Default::default)
-}
-
-fn cached(path: &Path, mtime: Option<SystemTime>) -> Option<Signature> {
-    let cache = cache().lock().ok()?;
-    let (when, sig) = cache.get(path)?;
-    (*when == mtime).then(|| sig.clone())
-}
-
-fn store(path: &Path, mtime: Option<SystemTime>, sig: &Signature) {
-    if let Ok(mut cache) = cache().lock() {
-        cache.insert(path.to_path_buf(), (mtime, sig.clone()));
+    /// Who signed it, in words: "Apple", the certificate ("Developer ID Application: Example Ltd
+    /// (ABCD123456)"), else the team; empty when nobody did.
+    pub fn signer(&self) -> String {
+        if self.status != "signed" {
+            String::new()
+        } else if self.apple {
+            "Apple".into()
+        } else if !self.authority.is_empty() {
+            self.authority.clone()
+        } else {
+            self.team_id.clone()
+        }
     }
 }
 
-fn mtime(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+/// A file's modification time and size: a cached answer holds while they do.
+type Stamp = (Option<SystemTime>, u64);
+
+type Cache<T> = Mutex<HashMap<PathBuf, (Stamp, T)>>;
+
+fn cache() -> &'static Cache<Signature> {
+    static CACHE: OnceLock<Cache<Signature>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn cached<T: Clone>(cache: &Cache<T>, path: &Path, stamp: Stamp) -> Option<T> {
+    let cache = cache.lock().ok()?;
+    let (when, value) = cache.get(path)?;
+    (*when == stamp).then(|| value.clone())
+}
+
+fn store<T: Clone>(cache: &Cache<T>, path: &Path, stamp: Stamp, value: &T) {
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(path.to_path_buf(), (stamp, value.clone()));
+    }
+}
+
+fn stamp(path: &Path) -> Stamp {
+    match std::fs::metadata(path) {
+        Ok(meta) => (meta.modified().ok(), meta.len()),
+        Err(_) => (None, 0),
+    }
 }
 
 /// Who vouches for a file: the app or other bundle it is part of (or the file itself), signed by
@@ -84,13 +104,53 @@ pub fn vouched(path: &Path) -> Option<String> {
 
 /// The signature of a program or app bundle (`codesign`, fast). Blocking.
 pub fn check(path: &Path) -> Signature {
-    let when = mtime(path);
-    if let Some(sig) = cached(path, when) {
+    let when = stamp(path);
+    if let Some(sig) = cached(cache(), path, when) {
         return sig;
     }
     let sig = read(path);
-    store(path, when, &sig);
+    store(cache(), path, when, &sig);
     sig
+}
+
+/// Whether Apple notarized a program or app (or it is Apple's own or from the App Store), as
+/// Gatekeeper assesses it locally (`spctl`, a stapled or cached ticket; it does not wait on the
+/// network). Of a file inside an app, the app's. `Some(false)` for unsigned and ad-hoc code,
+/// `None` when it could not be told. Cached like [`check`]. Blocking.
+pub fn notarized(path: &Path) -> Option<bool> {
+    static CACHE: OnceLock<Cache<Option<bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let owner = path.ancestors().find(|dir| dir.extension().is_some_and(|e| e == "app")).unwrap_or(path);
+    let when = stamp(owner);
+    if let Some(answer) = cached(cache, owner, when) {
+        return answer;
+    }
+    let sig = check(owner);
+    let answer = if !cfg!(target_os = "macos") || !owner.exists() {
+        None
+    } else if sig.apple {
+        Some(true)
+    } else if sig.unsigned() {
+        Some(false)
+    } else {
+        // An app is assessed as one to run; a bare program as one to install (to run, spctl
+        // rejects anything that is not an app).
+        let kind = if owner.extension().is_some_and(|e| e == "app") { "exec" } else { "install" };
+        let target = owner.display().to_string();
+        run("/usr/sbin/spctl", &["--assess", "-vv", "--type", kind, &target], Duration::from_secs(10)).ok().and_then(|out| {
+            let text = format!("{}{}", out.stdout, out.stderr);
+            let source = text.lines().find_map(|l| l.strip_prefix("source=")).unwrap_or("").trim().to_owned();
+            if out.ok && (source.starts_with("Notarized") || source.contains("Apple") || source.contains("App Store")) {
+                Some(true)
+            } else if text.contains(": rejected") || source.starts_with("Unnotarized") || out.ok {
+                Some(false)
+            } else {
+                None
+            }
+        })
+    };
+    store(cache, owner, when, &answer);
+    answer
 }
 
 

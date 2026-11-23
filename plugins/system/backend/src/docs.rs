@@ -79,6 +79,21 @@ pub fn get_blocking(name: &str) -> Option<Doc> {
     Some(doc)
 }
 
+/// Drop a list that is no longer used: its file, its index entry and its copy in RAM.
+pub fn remove(name: &str) {
+    if lock(&INDEX).as_mut().and_then(|index| index.remove(name)).is_none() {
+        return;
+    }
+    if let Some(cache) = lock(&CACHE).as_mut() {
+        cache.remove(name);
+    }
+    if let Err(error) = std::fs::remove_file(dir().join(name))
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::info!("feed {name}: could not be removed: {error}");
+    }
+}
+
 /// Keep a fresh copy, in RAM and on disk (written whole, then renamed into place).
 pub fn put(name: &str, bytes: Vec<u8>, fetched_ms: u64) {
     let (dir, size) = (dir(), bytes.len());

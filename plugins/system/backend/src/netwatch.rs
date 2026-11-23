@@ -2,11 +2,19 @@
 //! bytes they moved (Apple's NetworkStatistics, no root). Each remote address is named by its owner
 //! network and country, and checked against the cached threat lists.
 //!
-//! It interrupts (alerts) only for high-confidence signs: a threat-list address, a stealer's drop
-//! (Telegram's network, Discord webhooks, paste and file-drop sites, tunnels) from an app that has
-//! no business there, an unsigned or quarantined program online for the first time, a regular
-//! "call home" rhythm to a small network, an upload far above the app's normal, a gateway change.
-//! Everything else goes into the network digest, which the sweep lists.
+//! It interrupts (alerts) only for high-confidence signs: an address on a hard list (Spamhaus DROP
+//! or ASN-DROP, abuse.ch ThreatFox) outside the big clouds, a ThreatFox or URLhaus domain or URL on
+//! a process's command line, a stealer's drop (Telegram's network, Discord webhooks, paste and
+//! file-drop sites, tunnels) from an app that has no business there, an unsigned or quarantined
+//! program online for the first time, a regular "call home" rhythm to a small network, an upload
+//! far above the app's normal (backup and sync apps, known by their signer, excepted), a gateway
+//! change. Everything else goes into the network digest, which the sweep lists: the Tor exit list
+//! and Hagezi's IPs are context there, never an alert.
+//!
+//! Alert keys that are hard evidence: `network:threat:*` (a live connection to a DROP, ASN-DROP or
+//! ThreatFox address) and `network:ioc:*` (a ThreatFox or URLhaus domain or URL on the command
+//! line). The others (`network:drop`, `network:telegram`, `network:unsigned`, `network:beacon`,
+//! `network:upload`, `lan:*`) are behaviour, to be weighed.
 //!
 //! The first 7 days only learn: each app's networks, countries and ports, and its hourly upload.
 //! Apps are known by their signer (team), so an update does not look new. A flagged process that
@@ -79,6 +87,14 @@ const MESSENGERS_AND_BROWSERS: &[&str] = &[
 ];
 const MAIL_APPS: &[&str] = &["Mail", "Microsoft Outlook", "Thunderbird", "Spark", "Spark Desktop", "Airmail 5", "Mimestream", "Canary Mail", "Postbox"];
 const ODD_PORTS: &[u16] = &[4444, 1337, 6667, 6668, 6669, 31337];
+/// Backup and sync programs signed by Apple (by their process name; Apple's signature is checked).
+const APPLE_SYNC: &[&str] = &["backupd", "backupd-helper", "bird", "cloudd", "fileproviderd"];
+/// Backup and sync vendors by Team ID (Dropbox, Google, Microsoft) or by the organisation Apple
+/// verified for their Developer ID certificate (Backblaze, Arq, Carbon Copy Cloner).
+const SYNC_TEAMS: &[&str] = &["G7HH3F8CAK", "EQHXZ8M8AV", "UBF8T346G9"];
+const SYNC_SIGNERS: &[&str] = &["Developer ID Application: Backblaze", "Developer ID Application: Haystack Software", "Developer ID Application: Bombich Software"];
+/// Homebrew's install places: an ad-hoc signed program there was built and installed by Homebrew.
+const HOMEBREW: &[&str] = &["/opt/homebrew/", "/usr/local/Cellar/", "/usr/local/opt/"];
 
 // ---------------------------------------------------------------------------------------------
 // The digest: what is worth knowing but not worth an interruption. The sweep lists it.
@@ -289,6 +305,8 @@ struct Profile {
     nets: HashMap<u32, NetUse>,
     /// Changed since it was last written.
     dirty: bool,
+    /// A backup or sync program (by its signer), seen this run: no upload alert.
+    sync: bool,
 }
 
 #[derive(Debug, Default)]
@@ -372,6 +390,28 @@ struct ProcInfo {
     built_here: bool,
     /// The signer's team id, empty when none.
     team: String,
+    /// A backup or sync program, by its signer: its big uploads are its job.
+    sync: bool,
+    /// Ad-hoc signed and installed by Homebrew: vouched by its place and signature together.
+    homebrew: bool,
+    /// URLs and host names on its command line, to compare with abuse.ch's lists.
+    targets: Vec<String>,
+}
+
+/// URLs, and arguments that are a bare host name, on a command line.
+fn targets(command: &str) -> Vec<String> {
+    static URL: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
+    let Some(url) = URL.get_or_init(|| regex::Regex::new(r#"(?i)\b(?:https?|ftp)://[^\s'"<>|;]+"#).ok()) else { return Vec::new() };
+    let mut out: Vec<String> = url.find_iter(command).map(|m| m.as_str().to_owned()).collect();
+    for word in command.split_whitespace().map(|w| w.trim_matches(['\'', '"'])) {
+        let host = word.rsplit('@').next().unwrap_or(word).to_ascii_lowercase();
+        let tld = host.rsplit('.').next().unwrap_or("");
+        if host.contains('.') && tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic()) && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+            out.push(host);
+        }
+    }
+    out.truncate(32);
+    out
 }
 
 pub struct Watch {
@@ -458,7 +498,11 @@ impl Watch {
             || own.is_some_and(|own| exe.starts_with(&own));
         let quarantined = !exe.is_empty() && !system && crate::host::quarantined(std::path::Path::new(&exe));
         let team = signature.team_id.clone();
-        let info = ProcInfo { name, app, exe, command, key, unsigned, adhoc, quarantined, odd_place, built_here, team };
+        let sync = (signature.apple && APPLE_SYNC.contains(&name.as_str()))
+            || (signature.status == "signed" && (SYNC_TEAMS.contains(&team.as_str()) || SYNC_SIGNERS.iter().any(|s| signature.authority.starts_with(s))));
+        let homebrew = adhoc && HOMEBREW.iter().any(|p| exe.starts_with(p));
+        let targets = targets(&command);
+        let info = ProcInfo { name, app, exe, command, key, unsigned, adhoc, quarantined, odd_place, built_here, team, sync, homebrew, targets };
         self.procs.insert(pid, info.clone());
         info
     }
@@ -533,6 +577,7 @@ impl Watch {
                 profile.exe = info.exe.clone();
                 profile.dirty = true;
             }
+            profile.sync = info.sync;
             profile.signed = if cfg!(target_os = "linux") { "unknown" } else if info.adhoc { "adhoc" } else if info.unsigned { "unsigned" } else { "signed" }.into();
             profile.team = info.team.clone();
             // Bytes per network since the last sample.
@@ -600,6 +645,17 @@ impl Watch {
                 }
             }
 
+            // A ThreatFox or URLhaus domain or URL on the command line: hard evidence.
+            if let Some((target, hit)) = info.targets.iter().find_map(|t| if t.contains("://") { tables.url(t) } else { tables.domain(t) }.map(|hit| (t, hit))) {
+                found.push(candidate(
+                    format!("network:ioc:{}:{target}", info.key),
+                    "high",
+                    format!("{who} names {target} on its command line and is online; {} lists it as {}.", hit.list, if hit.what.is_empty() { "malware infrastructure".to_owned() } else { format!("malware infrastructure ({})", hit.what) }),
+                    *pid,
+                    &info.exe,
+                ));
+            }
+
             let mut seen_remote = HashSet::new();
             for flow in online {
                 let owner = tables.owner(flow.remote);
@@ -633,9 +689,13 @@ impl Watch {
                     }
                 }
 
-                if let Some(list) = tables.threat(flow.remote) {
-                    // Cloud addresses change hands, so a listed one there is noted, not alerted.
-                    if MAJOR.contains(&owner.asn) {
+                if let Some(hit) = tables.hit(flow.remote, Some(flow.remote_port)) {
+                    let list = hit.label();
+                    if !hit.hard {
+                        // Tor exits, Hagezi's aggregate, a ThreatFox address on another port: context.
+                        note(&info.app, "network", "low", format!("{} connected to {to}, which is on {list}. That list is context, not proof of malice.", info.app));
+                    } else if MAJOR.contains(&owner.asn) {
+                        // Cloud addresses change hands, so a listed one there is noted, not alerted.
                         note(&info.app, "network", "medium", format!("{} connected to {to}, a cloud address that is on {list}.", info.app));
                     } else {
                         found.push(candidate(
@@ -690,7 +750,7 @@ impl Watch {
                         let every = crate::util::duration_text(every);
                         // Signed software and what was built here check in on a timer all the time;
                         // a beacon alerts when nothing vouches for the program.
-                        let unvouched = (info.unsigned && !info.built_here) || info.quarantined || info.odd_place;
+                        let unvouched = (info.unsigned && !info.built_here && !info.homebrew) || info.quarantined || info.odd_place;
                         if unvouched {
                             found.push(candidate(
                                 format!("network:beacon:{}:{}", info.key, flow.remote),
@@ -710,7 +770,7 @@ impl Watch {
         // Upload far above the app's own normal.
         if !learning {
             for (key, profile) in &self.state.apps {
-                if profile.hours.len() < 48 || profile.hour != hour {
+                if profile.hours.len() < 48 || profile.hour != hour || profile.sync {
                     continue;
                 }
                 let threshold = upload_threshold(&profile.hours);

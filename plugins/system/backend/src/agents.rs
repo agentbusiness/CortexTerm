@@ -36,6 +36,7 @@ const SOURCE_SECRETS: &str = "MCP secrets";
 const SOURCE_PINS: &str = "MCP definitions";
 const SOURCE_HIDDEN: &str = "agent instructions";
 const SOURCE_SKILLS: &str = "agent skills";
+const SOURCE_HOOKS: &str = "agent hooks";
 
 /// The frame connection, for `terminal.scan` and `terminal.places` (set once the plugin connects).
 static CTX: OnceLock<Ctx> = OnceLock::new();
@@ -152,8 +153,17 @@ fn install_of(command: &str) -> Option<String> {
     command.contains("postinstall").then(|| "a postinstall script".to_owned())
 }
 
-/// A shell a person types into (no `-c`), or a terminal, editor or remote login.
-fn is_person(entry: &Entry) -> bool {
+/// Desktop apps a person works in, whose agents start tools for them: an agent app or an editor.
+const HOST_APPS: &[&str] = &[
+    "/Claude.app/", "/Codex.app/", "/ChatGPT.app/", "/Cursor.app/", "/Visual Studio Code.app/", "/Visual Studio Code - Insiders.app/",
+    "/VSCodium.app/", "/Windsurf.app/", "/Zed.app/", "/Antigravity.app/", "/Kiro.app/", "/Xcode.app/",
+];
+
+/// A shell a person types into (no `-c`), or a terminal, editor, agent app or remote login.
+pub(crate) fn is_person(entry: &Entry) -> bool {
+    if HOST_APPS.iter().any(|app| entry.exe.contains(app)) {
+        return true;
+    }
     let name = entry.proc.name.trim_start_matches('-').to_ascii_lowercase();
     if PERSON_APPS.iter().any(|app| name == *app || name.starts_with(app)) {
         return true;
@@ -238,7 +248,7 @@ pub fn checks(discovery: crate::filesystem::Shared) -> Part {
 /// One read of another plugin, from this blocking thread.
 fn ask(method: &str, params: Value, limit: Duration) -> Result<Value, String> {
     let ctx = CTX.get().ok_or("not connected to the frame")?.clone();
-    let handle = tokio::runtime::Handle::try_current().map_err(|_| "no async runtime".to_owned())?;
+    let handle = crate::util::runtime().ok_or_else(|| "no async runtime".to_owned())?;
     match handle.block_on(tokio::time::timeout(limit, ctx.call(method, params))) {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => Err(error.to_string()),
@@ -298,7 +308,7 @@ fn read_text(path: &Path, part: &mut Part) -> Option<String> {
 }
 
 /// JSON with comments and trailing commas (VS Code's settings) made plain.
-fn parse_jsonc(text: &str) -> Option<Value> {
+pub(crate) fn parse_jsonc(text: &str) -> Option<Value> {
     if let Ok(value) = serde_json::from_str(text) {
         return Some(value);
     }
@@ -424,21 +434,48 @@ fn is_secret(key: &str, value: &str) -> bool {
     }
     // The key's words (`GITHUB_PERSONAL_ACCESS_TOKEN`, `apiKey`, `--api-key`).
     let mut spaced = String::new();
-    for (i, c) in key.chars().enumerate() {
-        if c.is_ascii_uppercase() && i > 0 && key[..i].chars().last().is_some_and(|p| p.is_ascii_lowercase()) {
+    let mut previous = ' ';
+    for c in key.chars() {
+        if c.is_ascii_uppercase() && previous.is_ascii_lowercase() {
             spaced.push(' ');
         }
+        previous = c;
         spaced.push(if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { ' ' });
     }
     let words = ["token", "secret", "key", "apikey", "password", "passwd", "auth", "authorization", "bearer", "credential", "credentials", "pat"];
     let named = spaced.split_whitespace().any(|w| words.contains(&w));
     let literal = value.strip_prefix("Bearer ").unwrap_or(value);
-    let plain = literal.starts_with('/') || literal.starts_with('~') || literal.starts_with('.') || literal.starts_with("http") || literal.parse::<f64>().is_ok();
-    named && !plain && literal.len() >= 12 && !literal.contains(' ')
+    // A password is a secret whatever it looks like; a token or key looks generated.
+    let password = spaced.split_whitespace().any(|w| w == "password" || w == "passwd");
+    let one_word = !literal.contains(char::is_whitespace) && !literal.starts_with('/') && !literal.starts_with("http");
+    named && (looks_random(literal) || (password && one_word && literal.len() >= 8))
+}
+
+/// Whether a value has the shape of a generated secret: long, one word, not a path or address,
+/// not words joined by dashes (`oauth-personal`), and varied enough to be random.
+fn looks_random(value: &str) -> bool {
+    let plain = value.starts_with('/') || value.starts_with('~') || value.starts_with('.') || value.starts_with("http") || value.parse::<f64>().is_ok();
+    if plain || value.len() < 16 || value.contains(char::is_whitespace) {
+        return false;
+    }
+    let words = value.chars().all(|c| c.is_ascii_lowercase() || "-_.:".contains(c)) || value.chars().all(|c| c.is_ascii_uppercase() || "-_.:".contains(c));
+    if words {
+        return false;
+    }
+    let mut counts: HashMap<char, usize> = HashMap::new();
+    for c in value.chars() {
+        *counts.entry(c).or_default() += 1;
+    }
+    let n = value.chars().count() as f64;
+    let entropy: f64 = counts.values().map(|k| {
+        let p = *k as f64 / n;
+        -p * p.log2()
+    }).sum();
+    entropy >= 3.0
 }
 
 /// An argument with any secret in it masked.
-fn mask(arg: &str) -> String {
+pub(crate) fn mask(arg: &str) -> String {
     let masked = secret_re().replace_all(arg, "•••").into_owned();
     match masked.split_once('=') {
         Some((key, value)) if is_secret(key, value) => format!("{key}=•••"),
@@ -538,6 +575,7 @@ fn config_checks(part: &mut Part, repos: &[PathBuf], discovery: &crate::filesyst
         h.join(".claude/settings.local.json"),
         app_support.join("Claude/claude_desktop_config.json"),
         h.join(".cursor/mcp.json"),
+        h.join(".cursor/hooks.json"),
         h.join(".codeium/windsurf/mcp_config.json"),
         app_support.join("Code/User/mcp.json"),
         app_support.join("Code/User/settings.json"),
@@ -547,7 +585,7 @@ fn config_checks(part: &mut Part, repos: &[PathBuf], discovery: &crate::filesyst
     ];
     let mut project_files = Vec::new();
     for repo in repos {
-        for name in [".mcp.json", ".cursor/mcp.json", ".vscode/mcp.json", ".claude/settings.json", ".claude/settings.local.json", ".gemini/settings.json"] {
+        for name in [".mcp.json", ".cursor/mcp.json", ".cursor/hooks.json", ".vscode/mcp.json", ".claude/settings.json", ".claude/settings.local.json", ".gemini/settings.json"] {
             project_files.push(repo.join(name));
         }
     }
@@ -573,6 +611,7 @@ fn config_checks(part: &mut Part, repos: &[PathBuf], discovery: &crate::filesyst
         for (project, settings) in value.get("projects").and_then(Value::as_object).into_iter().flatten() {
             servers_in(settings.get("mcpServers"), &format!("{shown} ({})", tilde(Path::new(project))), &mut servers);
         }
+        hook_checks(part, &shown, &value);
         let mut bypass = Vec::new();
         bypass_settings(&value, &mut Vec::new(), &mut bypass);
         if !bypass.is_empty() {
@@ -617,8 +656,9 @@ fn config_checks(part: &mut Part, repos: &[PathBuf], discovery: &crate::filesyst
             slot.1.push(server.name.clone());
         }
         if let Some(package) = unpinned(command, &args) {
+            // The usual way MCP servers are installed; a risk to know about, not a sign of attack.
             part.add(
-                "medium",
+                "low",
                 "agent",
                 format!(
                     "The MCP server “{}” in {} runs {} {} without a fixed version, so every start may fetch new code from the registry. Pin a version (for example {}{}1.2.3).",
@@ -677,6 +717,85 @@ fn config_checks(part: &mut Part, repos: &[PathBuf], discovery: &crate::filesyst
         part.about("AgentConfig", config_of(&file));
     }
     servers
+}
+
+// --- Hooks: commands an agent runs by itself on its events (where 2025-26 worms persist).
+
+/// Every `command` under a config's `hooks` (Claude, Cursor, Gemini) and its status line.
+fn hook_commands(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, inner) in map {
+                match inner {
+                    Value::String(command) if key == "command" => out.push(command.clone()),
+                    _ => hook_commands(inner, out),
+                }
+            }
+        }
+        Value::Array(list) => list.iter().for_each(|inner| hook_commands(inner, out)),
+        _ => {}
+    }
+}
+
+/// What a command does that a hook should not: fetch, decode or run code given on its command
+/// line. A desktop notification is not one.
+pub(crate) fn fetches(command: &str) -> Option<&'static str> {
+    static RE: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
+    let rules = RE.get_or_init(|| {
+        [
+            (r"(?i)\b(curl|wget)\b", "downloads"),
+            (r"(?i)base64\s+(-d|-D|--decode)|openssl\s+(base64|enc)\s+-d|\bxxd\s+-r", "decodes hidden text"),
+            (r"(?i)\bbun\s+x\b|\bbunx\b|\bnpx\s+(-y|--yes)\b|\buvx\b", "fetches and runs a package"),
+            (r"(?i)\bnode\s+(-e|--eval|-p)\b|\bpython[0-9.]*\s+-c\b|\bperl\s+-e\b|\bruby\s+-e\b|\beval\b", "runs code given on its command line"),
+            (r"(?i)/dev/tcp/|\bnc\s+-|\bncat\b|\bsocat\b", "opens a raw connection"),
+            (r"(?i)osascript", "runs AppleScript"),
+        ]
+        .into_iter()
+        .filter_map(|(pattern, what)| Regex::new(pattern).ok().map(|re| (re, what)))
+        .collect()
+    });
+    let lower = command.to_lowercase();
+    let local = ["localhost", "127.0.0.1", "[::1]"].iter().any(|h| lower.contains(h)) && !lower.contains("| sh") && !lower.contains("| bash");
+    let notification = lower.contains("osascript") && (lower.contains("display notification") || lower.contains("display alert")) && !lower.contains("do shell script") && !lower.contains("hidden answer");
+    rules.iter().find(|(re, what)| re.is_match(command) && !(*what == "downloads" && local) && !(*what == "runs AppleScript" && notification)).map(|(_, what)| *what)
+}
+
+fn hook_checks(part: &mut Part, shown: &str, value: &Value) {
+    let mut commands = Vec::new();
+    for key in ["hooks", "statusLine"] {
+        if let Some(inner) = value.get(key) {
+            hook_commands(inner, &mut commands);
+        }
+    }
+    if commands.is_empty() {
+        return;
+    }
+    let (risky, plain): (Vec<&String>, Vec<&String>) = commands.iter().partition(|c| fetches(c).is_some());
+    for command in risky {
+        part.add(
+            "high",
+            "agent",
+            format!(
+                "{shown} has an agent hook that {} each time the agent runs it: {}. Worms that spread through developer machines persist this way; remove it unless you wrote it.",
+                fetches(command).unwrap_or("runs code"),
+                shorten(&mask(command), 160)
+            ),
+            None,
+            SOURCE_HOOKS,
+        );
+        part.about("AgentConfig", config_of(shown));
+    }
+    if !plain.is_empty() {
+        let list: Vec<String> = plain.iter().take(5).map(|c| shorten(&mask(c), 80)).collect();
+        part.add(
+            "info",
+            "agent",
+            format!("{shown} has {} that the agent runs by itself: {}.", plural(plain.len(), "hook command", "hook commands"), list.join("; ")),
+            None,
+            SOURCE_HOOKS,
+        );
+        part.about("AgentConfig", config_of(shown));
+    }
 }
 
 // --- 71. Changed MCP definitions.
@@ -840,13 +959,43 @@ struct Hidden {
     spelled: String,
 }
 
+fn invisible(c: char) -> bool {
+    matches!(c as u32, 0x200B..=0x200D | 0x2060 | 0xFEFF | 0x180E)
+}
+
+fn emoji(c: char) -> bool {
+    matches!(c as u32, 0x1F000..=0x1FAFF | 0x2600..=0x27BF | 0x2B00..=0x2BFF | 0xFE0F | 0x2190..=0x21FF | 0x2300..=0x23FF)
+}
+
+/// Hidden characters that hide something: tag characters (outside an emoji flag), direction
+/// overrides, terminal escapes, a zero-width character inside a word of plain letters, and runs
+/// of invisible characters. An emoji's joiner and a joiner between letters of other scripts are
+/// ordinary text.
 fn hidden_in(text: &str) -> Hidden {
     let mut found = Hidden::default();
-    for (i, c) in text.chars().enumerate() {
+    let chars: Vec<char> = text.chars().collect();
+    let mut flag = false;
+    for (i, &c) in chars.iter().enumerate() {
+        let prev = i.checked_sub(1).and_then(|j| chars.get(j)).copied();
+        let next = chars.get(i + 1).copied();
+        // A subdivision flag is U+1F3F4, tag characters, then U+E007F.
+        if c as u32 == 0x1F3F4 {
+            flag = true;
+        } else if !(0xE0000..=0xE007F).contains(&(c as u32)) {
+            flag = false;
+        }
         match c as u32 {
             0xFEFF if i == 0 => {}
-            0x200B..=0x200D | 0x2060 | 0xFEFF | 0x180E => found.zero_width += 1,
+            _ if invisible(c) => {
+                let run = prev.is_some_and(invisible) || next.is_some_and(invisible);
+                let in_word = prev.is_some_and(|p| p.is_ascii_alphanumeric()) && next.is_some_and(|n| n.is_ascii_alphanumeric());
+                let joiner = c as u32 == 0x200D && (prev.is_some_and(emoji) || next.is_some_and(emoji));
+                if (run || in_word) && !joiner {
+                    found.zero_width += 1;
+                }
+            }
             0x202A..=0x202E | 0x2066..=0x2069 => found.bidi += 1,
+            0xE0000..=0xE007F if flag => {}
             0xE0000..=0xE007F => {
                 found.tags += 1;
                 let ascii = (c as u32 - 0xE0000) as u8;
@@ -864,6 +1013,8 @@ fn hidden_in(text: &str) -> Hidden {
 fn hidden_text_checks(part: &mut Part, repos: &[PathBuf], discovery: &crate::filesystem::Discovery) {
     let mut files = instruction_files(repos);
     files.extend(discovery.instructions.iter().cloned());
+    // Packages' own files are not the person's agent instructions.
+    files.retain(|f| !f.components().any(|c| matches!(c.as_os_str().to_str(), Some("node_modules" | "vendor" | "dist" | ".venv" | "site-packages"))));
     files.sort();
     files.dedup();
     files.sort_by_key(|path| !path.starts_with(home()));
@@ -961,6 +1112,48 @@ fn local_scan(text: &str) -> Vec<(String, String, String)> {
         .collect()
 }
 
+/// Sites whose install scripts are piped into a shell in ordinary developer docs.
+const INSTALLERS_OK: &[&str] = &[
+    "bun.sh", "sh.rustup.rs", "rustup.rs", "astral.sh", "raw.githubusercontent.com/homebrew/", "brew.sh", "get.docker.com",
+    "deno.land", "deno.com", "install.python-poetry.org", "claude.ai/install", "get.pnpm.io", "volta.sh", "fnm.vercel.app",
+    "raw.githubusercontent.com/nvm-sh/", "starship.rs", "ollama.com", "opencode.ai", "cursor.com", "mise.run", "pyenv.run",
+    "get.sdkman.io", "tailscale.com", "nixos.org", "install.determinate.systems", "sh.vector.dev", "cli.github.com", "fly.io",
+    "vercel.com", "supabase.com", "get.helm.sh", "k3s.io", "dotnet.microsoft.com", "chatgpt.com", "openai.com", "anthropic.com",
+];
+
+/// The shapes of a malicious skill's "prerequisite" (the ClawHavoc campaign, 2026): a script
+/// from an unknown site piped into a shell, a binary downloaded and run, decoded text run.
+fn skill_payload(text: &str) -> Vec<(String, String, String)> {
+    static RE: OnceLock<[Regex; 4]> = OnceLock::new();
+    let [piped, binary, archive, decoded] = RE.get_or_init(|| {
+        [
+            Regex::new(r#"(?i)\b(?:curl|wget)\b[^\n|]*?(https?://[^\s'"|)]+)[^\n|]*\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b"#).expect("regex"),
+            Regex::new(r"(?i)\b(?:curl|wget)\b[^\n]*https?://\S+[^\n]*(?:&&|;)\s*(?:sudo\s+)?(?:chmod\s+\+?[0-7x]+|xattr\s+-[a-z]*[dc]|\./|open\s)").expect("regex"),
+            Regex::new(r"(?i)prerequisite[\s\S]{0,400}?https?://\S+\.(?:zip|dmg|pkg|bin|exe|command|app)\b|(?:zip|archive)\b[^\n]{0,80}\bpassword\b").expect("regex"),
+            Regex::new(r"(?i)base64\s+(?:-d|-D|--decode)[^\n]*\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b|\beval\s*[\(\x22']*\$\(\s*echo\s+\S+\s*\|\s*base64").expect("regex"),
+        ]
+    });
+    let mut found = Vec::new();
+    for caps in piped.captures_iter(text) {
+        let url = caps.get(1).map(|m| m.as_str().to_lowercase()).unwrap_or_default();
+        let host = url.split("://").nth(1).unwrap_or("");
+        if !INSTALLERS_OK.iter().any(|ok| host.starts_with(ok) || host.contains(&format!(".{ok}"))) {
+            found.push(("unknown-pipe-to-shell".to_owned(), "high".to_owned(), format!("Pipes a script from {} into a shell", shorten(&url, 80))));
+            break;
+        }
+    }
+    if binary.is_match(text) {
+        found.push(("download-and-run".into(), "high".into(), "Downloads a program and makes it run".into()));
+    }
+    if archive.is_match(text) {
+        found.push(("prerequisite-download".into(), "high".into(), "Asks for a \"prerequisite\" program downloaded from a link".into()));
+    }
+    if decoded.is_match(text) {
+        found.push(("decode-to-shell".into(), "high".into(), "Decodes hidden text and runs it as a command".into()));
+    }
+    found
+}
+
 fn skill_checks(part: &mut Part, discovery: &crate::filesystem::Discovery) {
     let mut files: Vec<PathBuf> = discovery.skills.iter().cloned().collect();
     files.sort_by_key(|path| !path.starts_with(home()));
@@ -981,10 +1174,13 @@ fn skill_checks(part: &mut Part, discovery: &crate::filesystem::Discovery) {
             unit.node("Skill", path.display().to_string());
             unit.edge(r("Skill", path.display().to_string()), "IN", folder);
         }
-        if shell.trim().is_empty() {
+        let payload = skill_payload(&text);
+        if shell.trim().is_empty() && payload.is_empty() {
             continue;
         }
-        let threats: Vec<(String, String, String)> = if guard {
+        let mut threats: Vec<(String, String, String)> = if shell.trim().is_empty() {
+            Vec::new()
+        } else if guard {
             match ask(terminal_methods::SCAN, json!({"text": shell}), Duration::from_secs(10)).and_then(|v| serde_json::from_value::<ScanResult>(v).map_err(|e| e.to_string())) {
                 Ok(result) => result.threats.into_iter().map(|t| (t.rule, t.severity, t.text)).collect(),
                 Err(error) => {
@@ -996,6 +1192,7 @@ fn skill_checks(part: &mut Part, discovery: &crate::filesystem::Discovery) {
         } else {
             local_scan(&shell)
         };
+        threats.extend(payload);
         // A skill is a document: install and build steps (run from a temp folder, curl into a
         // shell) are normal in developer docs. Only what an attack skill does to this Mac alerts.
         let attacks: Vec<_> = threats.iter().filter(|t| ATTACKS.contains(&t.0.as_str())).collect();
@@ -1032,8 +1229,8 @@ fn skill_checks(part: &mut Part, discovery: &crate::filesystem::Discovery) {
 
 /// What an attack skill makes its agent do to this Mac: steal passwords, keychains or secrets,
 /// hand over control, run a hidden payload, hide text from the person, or turn protection off.
-const ATTACKS: [&str; 16] = [
-    "fake-password-prompt", "password-check", "keychain-read", "keychain-dump", "keychain-unlock", "reverse-shell",
+const ATTACKS: [&str; 23] = [
+    "unknown-pipe-to-shell", "download-and-run", "prerequisite-download", "quarantine-removal", "fake-password-prompt", "password-check", "keychain-read", "keychain-dump", "keychain-unlock", "reverse-shell",
     "decode-to-shell", "base64-to-shell", "secrets-sent", "upload-exfil-host", "security-off", "hidden-text",
-    "zero-width", "direction-marks", "terminal-codes", "lookalike-domain",
+    "zero-width", "direction-marks", "terminal-codes", "lookalike-domain", "quarantine-then-run", "applescript-link", "privacy-settings-link",
 ];

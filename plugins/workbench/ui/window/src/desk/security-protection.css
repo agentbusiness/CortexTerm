@@ -74,7 +74,8 @@
 .ct-sec-legend .k1{color:var(--counter);}
 .ct-sec-legend .k2{color:var(--ink-2);}
 .ct-sec-legend .k3{color:var(--ink-3);}
-.ct-sec-legend .k0::before,.ct-sec-legend .k1::before,.ct-sec-legend .k2::before,.ct-sec-legend .k3::before{content:"";display:inline-block;width:14px;margin-right:6px;vertical-align:middle;border-top:2px solid currentColor;}
+.ct-sec-legend .kf{color:var(--ink-3);opacity:.6;}
+.ct-sec-legend .k0::before,.ct-sec-legend .k1::before,.ct-sec-legend .k2::before,.ct-sec-legend .k3::before,.ct-sec-legend .kf::before{content:"";display:inline-block;width:14px;margin-right:6px;vertical-align:middle;border-top:2px solid currentColor;}
 .ct-sec-legend .k2::before{border-top-style:dashed;}
 .ct-sec-legend .k3::before{border-top-style:dotted;}
 .ct-sec-chart svg{display:block;width:100%;height:120px;border-bottom:1px solid var(--rule-2);}
@@ -83,6 +84,7 @@
 .ct-sec-chart .k1{stroke:var(--counter);}
 .ct-sec-chart .k2{stroke:var(--ink-2);stroke-dasharray:6 5;}
 .ct-sec-chart .k3{stroke:var(--ink-3);stroke-dasharray:2 4;}
+.ct-sec-chart .kf{stroke:var(--ink-3);opacity:.6;}
 .ct-sec-chart .hit{fill:color-mix(in srgb,var(--counter) 22%,transparent);}
 .ct-sec-axis{display:flex;justify-content:space-between;padding-top:4px;}
 .ct-sec-body{display:flex;flex-direction:column;}
@@ -97,6 +99,16 @@
 .ct-sec-row.high:not(.on){border-color:var(--rubric);border-top-width:1px;}
 .ct-sec-row.medium .sev,.ct-sec-row.warn .sev,.ct-sec-findings .medium,.ct-sec-findings .warn{color:var(--counter);}
 .ct-sec-row.low .sev,.ct-sec-findings .low{color:var(--ink-2);}
+/* Filed as normal by triage: grey, after what needs the person. */
+.ct-sec-row.filed{opacity:.62;}
+.ct-sec-row.filed .sev{color:var(--ink-3);}
+.ct-sec-row.filed .ct-sec-hits{fill:var(--ink-3);}
+.ct-sec-triage{margin:10px 0;padding:8px 10px;border-left:2px solid var(--counter);}
+.ct-sec-triage.filed{border-left-color:var(--ink-3);}
+.ct-sec-triage h4{margin:0 0 4px;}
+.ct-sec-facts ul{margin:4px 0 0;padding-left:16px;font-family:var(--mono, ui-monospace, monospace);font-size:11px;color:var(--ink-2);}
+.ct-sec-facts li.basis{color:var(--ink);}
+.ct-sec-mode .ct-sec-segs{display:inline-flex;gap:2px;}
 .ct-sec-hits{width:56px;height:12px;fill:var(--counter);}
 .ct-sec-row.high .ct-sec-hits{fill:var(--rubric-lift);}
 .ct-sec-row-main{display:flex;flex-direction:column;gap:2px;min-width:0;}

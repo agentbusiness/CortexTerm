@@ -16,12 +16,61 @@ pub struct ProtectionConfig {
     pub deep_watch: bool,
     pub investigate: bool,
     pub imports: Vec<ProtectionImport>,
+    /// What the model's triage may do: `on` (it may file a finding as normal, which then shows grey
+    /// and does not notify), `shadow` (it judges, nothing is hidden) or `off`. Hard evidence is
+    /// never filed away, whatever this says.
+    pub triage: String,
 }
 
 impl Default for ProtectionConfig {
     fn default() -> Self {
-        Self { packet_watch: true, deep_watch: false, investigate: true, imports: Vec::new() }
+        Self { packet_watch: true, deep_watch: false, investigate: true, imports: Vec::new(), triage: "on".into() }
     }
+}
+
+/// The triage of one item (a sweep group, `group:<name>`, or a live incident by its key): code
+/// first, then the model's quick look, then an investigation. Only what survives is shown in
+/// colour and may notify; what is filed as normal shows grey with why, and the person can say it
+/// was wrong.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct Triage {
+    pub item: String,
+    /// pending | shown | expected | false_alarm
+    pub verdict: String,
+    /// code | model | investigation | person
+    pub by: String,
+    /// One plain sentence, rendered by code.
+    pub reason: String,
+    /// The facts code gathered, as `name: value` lines (what the model saw).
+    pub facts: Vec<String>,
+    /// The facts the verdict rests on (a subset of `facts`).
+    pub basis: Vec<String>,
+    /// The triage card used (`startup-item`, …).
+    pub card: String,
+    /// The same verdict holds for other items with the same card, check and signer.
+    pub similar: bool,
+    /// The item's worst severity when it was triaged; a worse one is triaged again.
+    pub severity: String,
+    /// Unix milliseconds.
+    pub at: u64,
+    /// Judged in shadow mode: recorded, nothing hidden.
+    pub shadow: bool,
+    /// When it notified (0: never).
+    pub notified_at: u64,
+}
+
+impl Triage {
+    /// Filed away as normal: grey, not counted, never notifies.
+    pub fn filtered(&self) -> bool {
+        matches!(self.verdict.as_str(), "expected" | "false_alarm") && !self.shadow
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TriageUndoParams {
+    /// The item: `group:<name>` or an incident's key.
+    pub item: String,
 }
 
 /// Explicitly selected local sensor file: `suricata` (EVE JSON), `zeek` (JSON conn log).
@@ -108,6 +157,9 @@ pub struct SecurityIncident {
     pub revision: u64,
     #[serde(default)]
     pub omitted_observations: u64,
+    /// The incident's triage, when it had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triage: Option<Triage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -209,6 +261,9 @@ pub mod methods {
     pub const FINDING_VERIFY: &str = "system.finding.verify";
     /// [`super::HistoryParams`] -> [`super::History`]: what came up over the last days, bucketed.
     pub const SECURITY_HISTORY: &str = "system.security.history";
+    /// [`super::TriageUndoParams`] -> `{ok}`: the person says a triage was wrong. The item shows
+    /// in colour again and stays shown; the model is told next time it looks at something like it.
+    pub const TRIAGE_UNDO: &str = "system.triage.undo";
     /// [`super::CheckParams`] -> [`super::SweepReport`]: run the sweep's checks for some areas
     /// only (`settings`, `updates`, `apps`, `packages`, `malware`, `persistence`, `privacy`,
     /// `intrusion`, `network`, `agents`, `ssh`, `secrets`, or `all`). It never replaces the stored
@@ -785,8 +840,12 @@ pub struct HistoryParams {
 pub struct History {
     pub since: u64,
     pub bucket_ms: u64,
-    /// Per bucket, oldest first: how many high, medium, low and info.
+    /// Per bucket, oldest first: how many high, medium, low and info (what triage filed as normal
+    /// is not in these).
     pub series: Vec<[u32; 4]>,
+    /// Per bucket: how many triage filed as normal.
+    #[serde(default)]
+    pub filtered: Vec<u32>,
     /// Per group (a finding's group, an incident or alert id): the buckets it had any in.
     pub hits: std::collections::BTreeMap<String, Vec<u32>>,
     /// What changed on the computer meanwhile (`macOS 26.1`, `3 apps updated`), oldest first.
@@ -852,6 +911,9 @@ pub struct SweepReport {
     /// The latest checks after a fix ran, newest first.
     #[serde(default)]
     pub fixes: Vec<FixCheck>,
+    /// Group -> its triage.
+    #[serde(default)]
+    pub triage: std::collections::BTreeMap<String, Triage>,
 }
 
 /// A finding checked again after a command ran to fix it.

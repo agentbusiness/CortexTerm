@@ -3,14 +3,14 @@
  * never HTML or commands; fixes go through the assistant, which checks again after they run. */
 import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import { Menu, ago, errorMessage, useRuntime } from '@cortex/sdk';
-import type { CveReport, Finding, History, SecurityClaim, SecurityIncident, SecurityObservation, SweepReport } from './api';
+import type { CveReport, Finding, History, SecurityClaim, SecurityIncident, SecurityObservation, SweepReport, Triage } from './api';
 import { quote } from './api';
 import { useMachineAlerts } from './machine-data';
 import { type Item, itemsOf, nameOf, priority, rank } from './security-items';
 import './security-protection.css';
 
 interface ProtectionImport { kind: 'suricata' | 'zeek'; path: string }
-interface ProtectionConfig { packet_watch: boolean; deep_watch: boolean; investigate: boolean; imports: ProtectionImport[] }
+interface ProtectionConfig { packet_watch: boolean; deep_watch: boolean; investigate: boolean; imports: ProtectionImport[]; triage: 'on' | 'shadow' | 'off' }
 interface ProtectionSensor { id: string; label: string; state: string; detail: string; last_at: number; dropped: number }
 interface SecurityException {
   id: string; incident_key: string; created_at: number; expires_at: number; reason: string;
@@ -65,6 +65,9 @@ const date = (at: number) => Number.isFinite(at) && at > 0 && at < 8_640_000_000
 const time = (at: number) => date(at)?.toLocaleString() ?? 'Not recorded';
 const iso = (at: number) => date(at)?.toISOString();
 const tone = (value: string) => ['high', 'warn', 'medium', 'low', 'info'].includes(value) ? value : 'info';
+/** Who triaged it, in the words of the pane. */
+const TRIAGED_BY: Record<string, string> = { code: 'BY CODE', model: "BY THE MODEL'S QUICK LOOK", investigation: 'AFTER AN INVESTIGATION', person: 'BY YOU' };
+const TRIAGE_MODES = [['on', 'ON', 'The model may file what it can show is normal; it shows grey.'], ['shadow', 'SHADOW', 'The model judges, nothing is hidden: compare before trusting it.'], ['off', 'OFF', 'Only code rates findings.']] as const;
 
 function stopTarget(incident: SecurityIncident): StopTarget | null {
   // All facts with a process identity must agree. A correlated incident can contain children;
@@ -323,10 +326,11 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
   const shown = items.filter((item) => (tab === 'open') === item.open);
   // The worst open issues not asked about yet, each as a question a click asks in the chat.
   const [asked, setAsked] = useState<Set<string>>(() => new Set());
-  const questions = items.filter((entry) => entry.open && !asked.has(entry.key)).slice(0, 3);
+  const questions = items.filter((entry) => entry.open && !entry.filtered && !asked.has(entry.key)).slice(0, 3);
   const item = items.find((entry) => entry.key === selected);
   const openCount = items.filter((entry) => entry.open).length;
-  const urgent = items.filter((entry) => entry.open && priority(entry.severity) === 'ACT NOW').length;
+  const urgent = items.filter((entry) => entry.open && !entry.filtered && priority(entry.severity) === 'ACT NOW').length;
+  const filedCount = items.filter((entry) => entry.open && entry.filtered).length;
 
   useEffect(() => {
     if (item?.incident) void loadIncident(item.incident.id);
@@ -354,6 +358,22 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
     } catch (cause) {
       if (mounted.current) setActionProblem(errorMessage(cause));
       return false;
+    } finally {
+      busyRef.current = false;
+      if (mounted.current) setBusy(null);
+    }
+  };
+
+  const undoTriage = async (item: string) => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy('triage'); setActionProblem(null);
+    try {
+      await client.call('system.triage.undo', { item });
+      if (!mounted.current) return;
+      void refresh(); void loadSlow();
+    } catch (cause) {
+      if (mounted.current) setActionProblem(errorMessage(cause));
     } finally {
       busyRef.current = false;
       if (mounted.current) setBusy(null);
@@ -433,7 +453,7 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
     <div className="ct-sec-chart-box">
       <div className="ct-sec-legend">
         <span className="ct-label">NEW FINDINGS BY PRIORITY</span>
-        <span className="ct-label k0">ACT NOW</span><span className="ct-label k1">SOON</span><span className="ct-label k2">WATCH</span><span className="ct-label k3">NOTED</span>
+        <span className="ct-label k0">ACT NOW</span><span className="ct-label k1">SOON</span><span className="ct-label k2">WATCH</span><span className="ct-label k3">NOTED</span><span className="ct-label kf">NORMAL</span>
         <span className="grow" />
         {[1, 7, 30].map((value) => <button key={value} type="button" className={`ct-seg${days === value ? ' on' : ''}`} onClick={() => setDays(value)}>{value === 1 ? '24 H' : `${value} D`}</button>)}
       </div>
@@ -445,16 +465,16 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
         <div className="ct-sec-tabs">
           <span className="ct-label ct-faint">GROUPED BY WHAT IT IS ABOUT</span>
           <span className="grow" />
-          <button type="button" className={`ct-seg${tab === 'open' ? ' on' : ''}`} onClick={() => { setTab('open'); setSelected(''); }}>OPEN · {openCount}</button>
+          <button type="button" className={`ct-seg${tab === 'open' ? ' on' : ''}`} title={filedCount ? `${filedCount} of them triage filed as normal; they are listed last, in grey` : undefined} onClick={() => { setTab('open'); setSelected(''); }}>OPEN · {openCount - filedCount}{filedCount > 0 ? ` + ${filedCount} NORMAL` : ''}</button>
           <button type="button" className={`ct-seg${tab === 'decided' ? ' on' : ''}`} onClick={() => { setTab('decided'); setSelected(''); }}>DECIDED · {items.length - openCount}</button>
         </div>
         {tab === 'decided' && (report?.fixes ?? []).filter((fix) => fix.gone).slice(0, 8).map((fix) => fixCard(fix))}
         {shown.length === 0 && <p className="ct-asec-note">{tab === 'open' ? 'Nothing open. The checks only know what they can see; no findings is not an all-clear.' : 'No decisions yet.'}</p>}
-        {shown.map((entry) => <Fragment key={entry.key}><button type="button" className={`ct-sec-row ${tone(entry.severity)}${entry.key === item?.key ? ' on' : ''}`} aria-pressed={entry.key === item?.key} onClick={() => select(entry.key === item?.key ? '' : entry.key)}>
-          <span className="ct-label sev">{entry.open ? priority(entry.severity) : verdictName(entry.decision?.verdict ?? 'dismissed')}</span>
+        {shown.map((entry) => <Fragment key={entry.key}><button type="button" className={`ct-sec-row ${entry.filtered ? 'filed' : tone(entry.severity)}${entry.key === item?.key ? ' on' : ''}`} aria-pressed={entry.key === item?.key} onClick={() => select(entry.key === item?.key ? '' : entry.key)}>
+          <span className="ct-label sev">{!entry.open ? verdictName(entry.decision?.verdict ?? 'dismissed') : entry.filtered ? 'NORMAL' : priority(entry.severity)}</span>
           <Hits hits={[...(history?.hits[entry.key] ?? []), ...(entry.incident ? history?.hits[entry.incident.id] ?? [] : [])]} buckets={history?.series.length ?? 0} />
           <span className="ct-sec-row-main"><span className="ct-sec-row-title" dir="auto">{entry.title}</span><span className="ct-sec-row-text" dir="auto">{entry.text}</span></span>
-          <span className="ct-sec-row-side"><span className="ct-label ct-faint">{entry.kind === 'sweep' ? plural(entry.count, 'finding') : entry.kind === 'incident' ? 'INCIDENT' : entry.alert?.kind.toUpperCase()}</span><time className="ct-label ct-faint" dateTime={iso(entry.last)}>{date(entry.last) ? ago(entry.last) : ''}</time></span>
+          <span className="ct-sec-row-side">{entry.open && entry.triage?.verdict === 'pending' && <span className="ct-label ct-blue">CHECKING</span>}<span className="ct-label ct-faint">{entry.kind === 'sweep' ? plural(entry.count, 'finding') : entry.kind === 'incident' ? 'INCIDENT' : entry.alert?.kind.toUpperCase()}</span><time className="ct-label ct-faint" dateTime={iso(entry.last)}>{date(entry.last) ? ago(entry.last) : ''}</time></span>
         </button>
         {item && entry.key === item.key && <section className="ct-sec-detail" tabIndex={-1} aria-label={item.title} onKeyDown={onDetailKey}>
           {deciding && item.kind === 'sweep' ? <DecideSheet item={item} before={precedent(report, item)} busy={!!busy} onCancel={() => setDeciding(false)} onDecide={(verdict, keys, forDays) => void decide(item.key, verdict, keys, forDays)} />
@@ -484,6 +504,7 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
         {openCheck === check.id && <ul className="ct-sec-each">{check.findings.slice(0, 50).map((finding) => <li key={finding.key} dir="auto">{finding.text}</li>)}
           {check.findings.length > 50 && <li className="ct-faint">and {check.findings.length - 50} more. Ask about them, or decide about the whole group.</li>}</ul>}
       </li>)}</ol>
+      {entry.open && entry.triage && triageView(entry, entry.triage)}
       {raised && <p className="ct-asec-note ct-warn">Raised by the assistant's second look: this looks like {raised}. The checks rated it one level lower.</p>}
       {tried && <p className="ct-asec-note ct-warn">Tried <code>{tried}</code>: a fresh check still finds it. The assistant won't offer it again.</p>}
       {(report?.fixes ?? []).filter((fix) => fix.group === entry.key).slice(0, 3).map((fix) => fixCard(fix))}
@@ -497,6 +518,21 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
         {entry.incident && <button type="button" className="detent sm" disabled={configurationDisabled || !status?.config.investigate || ['running', 'queued'].includes(investigation?.state ?? '')} onClick={() => void act(entry.incident!.id, 'investigate')}>I · INVESTIGATE</button>}
       </div>
     </>;
+  }
+
+  /** What triage made of an item: why it is grey or in colour, the facts it looked at, and a way
+   * to say it was wrong. */
+  function triageView(entry: Item, triage: Triage) {
+    const item = entry.kind === 'sweep' ? `group:${entry.key}` : entry.incident?.key ?? '';
+    if (triage.verdict === 'pending') return <div className="ct-sec-triage"><h4 className="ct-label ct-blue">TRIAGE · CHECKING</h4><p className="ct-asec-note" role="status">Code and the local model are looking at it; it notifies only if it needs you.</p></div>;
+    const filed = entry.filtered;
+    return <div className={`ct-sec-triage${filed ? ' filed' : ''}`}>
+      <h4 className="ct-label ct-blue">{filed ? 'FILED AS NORMAL' : triage.shadow ? 'TRIAGE · SHADOW' : 'TRIAGE · NEEDS YOUR LOOK'} · {TRIAGED_BY[triage.by] ?? triage.by.toUpperCase()}{triage.at ? ` · ${ago(triage.at).toUpperCase()}` : ''}</h4>
+      <p className={filed ? 'ct-asec-note' : 'ct-asec-note ct-warn'} dir="auto">{triage.reason}{triage.shadow && (triage.verdict === 'expected' || triage.verdict === 'false_alarm') ? ' Shadow mode: it stays shown.' : ''}</p>
+      {triage.facts.length > 0 && <details className="ct-sec-facts"><summary className="ct-label">WHAT IT LOOKED AT · {triage.facts.length}</summary>
+        <ul>{triage.facts.slice(0, 24).map((fact, index) => <li key={index} className={triage.basis.includes(fact) ? 'basis' : ''} dir="auto">{fact}</li>)}</ul></details>}
+      {filed && item && <div className="ct-protection-actions"><button type="button" className="detent sm warn" disabled={!!busy} title="It shows in colour again and stays shown; the model is told next time it looks at something like it" onClick={() => void undoTriage(item)}>W · THIS WAS WRONG</button></div>}
+    </div>;
   }
 
   /** What a check after a fix found. */
@@ -649,6 +685,7 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
       <div className="ct-sec-detail-head"><h3 dir="auto">{incident.title}</h3><span className="ct-label ct-faint">{incident.state === 'dismissed' ? 'DISMISSED' : excepted ? 'MUTED 1 H' : priority(incident.severity)} · {plural(evidence.length, 'observation')}</span></div>
       <p className="ct-protection-meta">First {time(incident.first_at)} · last {time(incident.last_at)}</p>
       {detailProblem[incident.id] && <p className="ct-asec-note ct-warn" role="status">The full incident could not be read: {detailProblem[incident.id]}. <button type="button" className="detent sm" onClick={() => void loadIncident(incident.id)}>RETRY</button></p>}
+      {incident.state !== 'dismissed' && entry.triage && triageView(entry, entry.triage)}
       {caseView(incident, evidence)}
       <div className="ct-protection-investigation">
         <h4 className="ct-label ct-blue">THE MODEL'S READ{investigation ? ` · ${investigation.state.toUpperCase()}` : ''}</h4>
@@ -710,7 +747,11 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
       </li>)}</ul>
       {toggle('packet_watch', 'Watch for network scans', 'Packet metadata, when macOS allows capture.')}
       {toggle('deep_watch', 'Read deep activity events', 'Needs the native sensor: turning this on installs it once.')}
-      {toggle('investigate', 'Investigate incidents with local AI', 'Read-only checks. The model never decides or acts.')}
+      {toggle('investigate', 'Investigate with local AI', 'Read-only checks for what the quick look cannot settle. The model never acts.')}
+      <div className="ct-sec-switch ct-sec-mode">
+        <span className="ct-sec-segs" role="group" aria-label="Triage with local AI">{TRIAGE_MODES.map(([mode, label]) => <button key={mode} type="button" className={`ct-seg${(config.triage ?? 'on') === mode ? ' on' : ''}`} aria-pressed={(config.triage ?? 'on') === mode} disabled={configurationDisabled} onClick={() => void configure({ triage: mode })}>{label}</button>)}</span>
+        <span>Triage with local AI<small>{TRIAGE_MODES.find(([mode]) => mode === (config.triage ?? 'on'))?.[2]} Hard evidence is never filed away.</small></span>
+      </div>
       {status!.packet_capture_help && <p className="ct-asec-note" dir="auto">{status!.packet_capture_help}</p>}
       <details className="ct-protection-setup">
         <summary>Deep activity capture</summary>
@@ -776,17 +817,21 @@ function Chart({ history, problem, highlight, label }: { history: History | null
   if (!history && problem) return <div className="ct-sec-chart"><p className="ct-asec-note ct-warn">The chart could not be read: {problem}</p></div>;
   if (!history || history.series.length === 0) return <div className="ct-sec-chart"><p className="ct-asec-note">{history ? 'Nothing recorded yet.' : 'Loading…'}</p></div>;
   const n = history.series.length;
-  const max = Math.max(1, ...history.series.flat());
-  const points = (level: number) => history.series.map((row, x) => `${((x + 0.5) * 1000) / n},${(118 - ((row[level] ?? 0) / max) * 110).toFixed(1)}`).join(' ');
+  const filtered = history.filtered ?? [];
+  const max = Math.max(1, ...history.series.flat(), ...filtered);
+  const line = (values: number[]) => values.map((value, x) => `${((x + 0.5) * 1000) / n},${(118 - (value / max) * 110).toFixed(1)}`).join(' ');
+  const points = (level: number) => line(history.series.map((row) => row[level] ?? 0));
   const totals = [0, 1, 2, 3].map((level) => history.series.reduce((sum, row) => sum + (row[level] ?? 0), 0));
+  const filedTotal = filtered.reduce((sum, value) => sum + value, 0);
   const day = (at: number) => new Date(at).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric' }).toUpperCase();
   const when = (at: number) => new Date(at).toLocaleString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' });
   const span = history.bucket_ms * n;
   const x = (at: number) => Math.min(1000, Math.max(0, ((at - history.since) / span) * 1000));
   const markers = history.markers ?? [];
   return <div className="ct-sec-chart">
-    <svg viewBox="0 0 1000 120" preserveAspectRatio="none" role="img" aria-label={`Since ${new Date(history.since).toLocaleString()}: ${totals[0]} act now, ${totals[1]} soon, ${totals[2]} watch, ${totals[3]} noted${label && highlight.length ? `; ${label} shaded` : ''}`}>
+    <svg viewBox="0 0 1000 120" preserveAspectRatio="none" role="img" aria-label={`Since ${new Date(history.since).toLocaleString()}: ${totals[0]} act now, ${totals[1]} soon, ${totals[2]} watch, ${totals[3]} noted, ${filedTotal} filed as normal${label && highlight.length ? `; ${label} shaded` : ''}`}>
       {highlight.map((bucket) => <rect key={bucket} className="hit" x={(bucket * 1000) / n} y={0} width={1000 / n} height={120} />)}
+      {filtered.length === n && <polyline className="kf" points={line(filtered)} />}
       {[3, 2, 1, 0].map((level) => <polyline key={level} className={`k${level}`} points={points(level)} />)}
       {markers.map((marker) => <line key={`${marker.at}${marker.text}`} className="mark" x1={x(marker.at)} x2={x(marker.at)} y1={0} y2={120} />)}
     </svg>

@@ -87,8 +87,9 @@ fn ids_text(ids: &[String]) -> String {
     text
 }
 
+/// A light group of checks on a background thread of its own, side by side with the others.
 async fn blocking(f: impl FnOnce() -> Part + Send + 'static) -> Part {
-    crate::util::background(f).await.unwrap_or_default()
+    crate::util::background_light(f).await.unwrap_or_default()
 }
 
 /// The parts of the sweep a check can ask for by name.
@@ -206,8 +207,8 @@ impl Area {
             "intrusion" => Intrusion,
             "agent" => Agents,
             _ => match finding.source.as_str() {
-                "brew vulns" | "brew outdated" | "osv" => Packages,
-                "SOFA" | "app versions" | "vendor versions" | "electron" | "endoflife.date" => Updates,
+                "brew vulns" | "brew outdated" | "osv" | "osv-malicious" => Packages,
+                "SOFA" | "exploited-cve" | "app versions" | "vendor versions" | "electron" | "endoflife.date" => Updates,
                 _ => Apps,
             },
         }
@@ -244,7 +245,8 @@ pub async fn run_areas(areas: &[Area], within: Option<Duration>, last: &SweepRep
     group(Settings, Box::pin(blocking(posture::checks)));
     group(Network, Box::pin(netsec::checks()));
     let disk = discovery.clone();
-    group(Malware, Box::pin(blocking(move || malware::checks(disk))));
+    // The YARA walk of the whole disk is the heavy one: after any other disk walk, not beside it.
+    group(Malware, Box::pin(async move { crate::util::background(move || malware::checks(disk)).await.unwrap_or_default() }));
     let disk = discovery.clone();
     group(Persistence, Box::pin(async move { merged(tokio::join!(blocking(move || persist::checks(disk)), blocking(launch_checks))) }));
     group(Privacy, Box::pin(blocking(privacy::checks)));
@@ -447,20 +449,22 @@ fn brew_vulns(part: &mut Part, report: &Value) {
             continue;
         }
         let ids: Vec<String> = vulns.iter().filter_map(|v| v.get("id").and_then(Value::as_str).map(str::to_owned)).collect();
-        let worst = vulns
-            .iter()
-            .map(|v| severity_of(v.get("severity").and_then(Value::as_str).unwrap_or("")))
-            .min_by_key(|s| rank(s))
-            .unwrap_or("medium");
+        // Rated by whether it is exploited or likely to be (KEV, EPSS, CISA's SSVC), not by CVSS;
+        // without the network, by the worst CVSS label.
+        let (worst, why) = prioritised(&ids).unwrap_or_else(|| {
+            let worst = vulns.iter().map(|v| severity_of(v.get("severity").and_then(Value::as_str).unwrap_or(""))).min_by_key(|s| rank(s)).unwrap_or("medium");
+            (worst, String::new())
+        });
         let fixed = vulns.iter().any(|v| v.get("fixed_versions").and_then(Value::as_array).is_some_and(|a| !a.is_empty()));
         part.add(
             worst,
             "vuln",
             format!(
-                "{formula} {version} has {} ({}){}.",
+                "{formula} {version} has {} ({}){}{}.",
                 plural(ids.len(), "known vulnerability", "known vulnerabilities"),
                 ids_text(&ids),
-                if fixed { "; a fixed version is available" } else { "; no fixed release yet" }
+                if fixed { "; a fixed version is available" } else { "; no fixed release yet" },
+                if why.is_empty() { String::new() } else { format!("; {why}") }
             ),
             fixed.then(|| format!("brew upgrade {formula}")),
             "brew vulns",
@@ -578,35 +582,24 @@ async fn osv(packages: &[Package]) -> Result<Part, String> {
         if ids.is_empty() {
             continue;
         }
-        let mut worst = "medium";
-        let mut rated = false;
-        for id in ids.iter().take(5) {
-            if details_left == 0 {
-                break;
-            }
+        // Rated by whether it is exploited or likely to be, not by CVSS.
+        let (worst, why) = if details_left > 0 {
             details_left -= 1;
-            let Ok(response) = client.get(format!("https://api.osv.dev/v1/vulns/{id}")).send().await else { continue };
-            let Ok(vuln) = json_of(response).await else { continue };
-            let label =
-                vuln["database_specific"]["severity"].as_str().or_else(|| vuln["affected"][0]["ecosystem_specific"]["severity"].as_str());
-            if let Some(label) = label {
-                let severity = severity_of(label);
-                if !rated || rank(severity) < rank(worst) {
-                    worst = severity;
-                    rated = true;
-                }
-            }
-        }
+            crate::cve::prioritise(&client, &ids).await
+        } else {
+            ("low", String::new())
+        };
         part.add(
             worst,
             "vuln",
             format!(
-                "The global {} tool {} {} has {} ({}).",
+                "The global {} tool {} {} has {} ({}){}.",
                 package.manager,
                 package.name,
                 package.version,
                 plural(ids.len(), "known vulnerability", "known vulnerabilities"),
-                ids_text(&ids)
+                ids_text(&ids),
+                if why.is_empty() { String::new() } else { format!("; {why}") }
             ),
             Some(package.fix.clone()),
             "osv",
@@ -614,6 +607,13 @@ async fn osv(packages: &[Package]) -> Result<Part, String> {
         part.about("Package", format!("{}:{}", package.ecosystem, package.name));
     }
     Ok(part)
+}
+
+/// The priority of a formula's advisories (from a blocking thread), or `None` when it cannot be read.
+fn prioritised(ids: &[String]) -> Option<(&'static str, String)> {
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(20)).build().ok()?;
+    let ids = ids.to_vec();
+    graph::block(async move { crate::cve::prioritise(&client, &ids).await })
 }
 
 async fn json_of(response: reqwest::Response) -> Result<Value, String> {
@@ -748,6 +748,20 @@ fn launch_checks() -> Part {
     }
     part.checked.push("launch agents and daemons".into());
     for item in launch::all() {
+        if let Some(why) = item.danger() {
+            part.add("high", "persistence", format!("The {} {} in {}: {why}.", item.what(), item.label, item.folder()), None, "launch agents");
+            continue;
+        }
+        if item.homebrew() && !item.quarantined && item.signature != "missing" {
+            part.add(
+                "info",
+                "persistence",
+                format!("The {} {} in {} is a Homebrew service: it starts {}, built by Homebrew on this Mac ({}).", item.what(), item.label, item.folder(), item.program, item.verdict().trim_start_matches("which ")),
+                None,
+                "launch agents",
+            );
+            continue;
+        }
         let severity = match (item.unsigned(), item.quarantined) {
             _ if item.program.is_empty() => continue,
             (true, true) => "high",

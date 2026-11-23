@@ -10,14 +10,45 @@ pub fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
-/// One background job at a time, so a sweep uses about one core however many checks it has.
+/// One heavy background job at a time (a whole-disk walk), so a sweep's disk walkers share about
+/// one core however many of them there are.
 static BACKGROUND: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Run `f` on a thread of its own at background priority, after any other background job, so a
-/// long check stays out of the way: on a Mac the background QoS class (efficiency cores,
-/// throttled disk reads), on Linux the lowest nice. None when the thread could not start or `f`
-/// panicked.
+/// The async runtime, kept from the first async caller, so a plain thread (a sweep check, a
+/// watcher) can still wait on a call to the frame or to memory.
+static RUNTIME: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
+
+/// Keep the current runtime's handle for [`runtime`]. Called from async code; once is enough.
+pub fn keep_runtime() {
+    if RUNTIME.get().is_none()
+        && let Ok(handle) = tokio::runtime::Handle::try_current()
+    {
+        let _ = RUNTIME.set(handle);
+    }
+}
+
+/// The async runtime: the current one, else the kept one. None before any async code ran.
+pub fn runtime() -> Option<tokio::runtime::Handle> {
+    tokio::runtime::Handle::try_current().ok().or_else(|| RUNTIME.get().cloned())
+}
+
+/// Run `f` on a thread of its own at background priority, after any other heavy background job,
+/// so a long walk of the disk stays out of the way: on a Mac the background QoS class
+/// (efficiency cores, throttled disk reads), on Linux the lowest nice. None when the thread could
+/// not start or `f` panicked.
 pub async fn background<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    on_thread(true, f).await
+}
+
+/// [`background`] for a light job (a few commands and files): the same low priority, but side by
+/// side with other jobs instead of after them.
+pub async fn background_light<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    on_thread(false, f).await
+}
+
+async fn on_thread<T: Send + 'static>(heavy: bool, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    keep_runtime();
+    let handle = runtime();
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name("background".into())
@@ -30,7 +61,9 @@ pub async fn background<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'stati
             unsafe {
                 libc::nice(19);
             }
-            let _turn = BACKGROUND.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // The runtime is this thread's too, so the job can wait on async calls.
+            let _runtime = handle.as_ref().map(|h| h.enter());
+            let _turn = heavy.then(|| BACKGROUND.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
             let _ = tx.send(f());
         })
         .ok()?;

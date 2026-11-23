@@ -104,13 +104,17 @@ rule CortexTerm_Nx_s1ngularity
 rule CortexTerm_ClickFix_Dropper
 {
     meta:
-        description = "A small script that downloads a program, strips its quarantine flag and runs it (the ClickFix pattern)"
+        description = "A small script that downloads a program, strips its quarantine flag and runs it, and also asks for the login password, checks it with dscl or runs base64-decoded code (the ClickFix pattern; ordinary install scripts do the first three only)"
         family = "ClickFix"
-        severity = "medium"
+        severity = "high"
     strings:
         $curl = /curl\s+(-[a-zA-Z]+\s+)*https?:\/\//
         $xattr = /xattr\s+(-[a-z]+\s+)*(-c|-d\s+com\.apple\.quarantine)/
         $chmod = "chmod +x"
+        $s1 = "hidden answer" nocase
+        $s2 = "-authonly"
+        $s3 = /base64\s+(-d|-D|--decode)[^\n]{0,40}\|\s*(ba|z)?sh/
+        $s4 = /osascript\s+-e\s+[^\n]{0,80}display dialog/ nocase
     condition:
-        filesize < 200KB and $curl and $xattr and $chmod
+        filesize < 200KB and $curl and $xattr and $chmod and any of ($s*)
 }

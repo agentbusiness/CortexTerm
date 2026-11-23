@@ -257,7 +257,7 @@ impl Store {
                 Some(config) => store.config = config,
                 None => {
                     store.repair_required = true;
-                    store.config = ProtectionConfig { packet_watch: false, deep_watch: false, investigate: false, imports: Vec::new() };
+                    store.config = ProtectionConfig { packet_watch: false, deep_watch: false, investigate: false, imports: Vec::new(), triage: "off".into() };
                     health(
                         "protection-state",
                         "Saved protection settings",
@@ -318,6 +318,7 @@ impl Store {
                 omitted_observations: graph::number(&row[8]),
                 observations: events,
                 id,
+                triage: None,
             });
         }
         let mut kept = VecDeque::new();
@@ -678,10 +679,12 @@ impl Store {
         // observed source/destination only, never the person controlling it. A step of a chain
         // can come later: within a day, the file one observation touched is the program another
         // ran (downloaded, then started; started, then made to start at login).
+        // A sweep group is one incident for as long as it is kept: each sweep adds to it, so a
+        // group that did not change does not look new.
         let index = self
             .incidents
             .iter()
-            .rposition(|i| i.key == key && i.last_at.abs_diff(event.at) < 1_800_000)
+            .rposition(|i| i.key == key && (key.starts_with("group:") || i.last_at.abs_diff(event.at) < 1_800_000))
             .or_else(|| {
                 self.incidents.iter().rposition(|i| {
                     !i.key.starts_with("group:")
@@ -778,34 +781,9 @@ impl Store {
             incident.state = "open".into();
             self.notified.remove(&incident.id);
         }
+        // Triage queues an investigation when it needs one; the person can ask for one.
         if new_evidence {
             incident.revision = incident.revision.saturating_add(1);
-            if self.config.investigate
-                && rank(&incident.severity) >= 2
-                && incident.state == "open"
-                && incident
-                    .investigation
-                    .as_ref()
-                    .is_none_or(|i| !matches!(i.state.as_str(), "running" | "queued"))
-            {
-                let last_check = incident
-                    .investigation
-                    .as_ref()
-                    .map(|i| i.checked_at)
-                    .unwrap_or(0);
-                // Keep the new work queued even if the quiet-period budget has not elapsed;
-                // otherwise one isolated new finding could remain uninvestigated forever.
-                incident.investigation = Some(SecurityInvestigation {
-                    state: "queued".into(),
-                    checked_at: if rank(&incident.severity) > previous_rank {
-                        0
-                    } else {
-                        last_check
-                    },
-                    ..Default::default()
-                });
-                investigated(incident);
-            }
         }
         if created {
             note(&incident.id, &incident.observations);
@@ -1007,6 +985,14 @@ impl Store {
         investigated(incident);
     }
 
+    /// Triage's investigation, kept on the incident while it still describes it.
+    pub fn keep_investigation(&mut self, id: &str, revision: u64, result: SecurityInvestigation) {
+        if let Some(incident) = self.incidents.iter_mut().find(|i| i.id == id && i.revision == revision) {
+            incident.investigation = Some(result);
+            investigated(incident);
+        }
+    }
+
     pub fn status(&mut self) -> ProtectionStatus {
         let now = now_ms();
         self.prune(now);
@@ -1137,8 +1123,24 @@ fn rate_chain(incident: &mut SecurityIncident) {
     } else if all.iter().any(certain) {
         incident.severity = "high".into();
     } else {
-        incident.severity = normal_severity(if worst >= 1 { "low" } else { "info" }).into();
+        // One step keeps the watcher's rating; triage decides whether it needs the person.
+        incident.severity = normal_severity(match worst { 3 => "high", 2 => "medium", 1 => "low", _ => "info" }).into();
     }
+}
+
+/// Why an incident is hard evidence (never judged by the model), when it is: an observation that
+/// is an attack on its own, or two steps of an attack by a program nothing vouches for.
+pub fn hard_reason(incident: &SecurityIncident) -> Option<String> {
+    let all = &incident.observations;
+    // A malware match rated high. (A stealer's drop, Telegram or an unsigned program online are
+    // strong signs, not proof: triage looks at them. Listed servers are hard, in `triage`.)
+    if all.iter().any(|e| e.kind == "malware" && rank(&e.severity) == 3) {
+        return Some("A malware rule or a known-bad file matched.".into());
+    }
+    let steps: std::collections::BTreeSet<usize> = all.iter().filter_map(|e| step(e, all)).collect();
+    (steps.len() >= 2 && !incident.key.starts_with("group:") && !vouched(all)).then(|| {
+        format!("Linked steps of an attack: {}.", steps.iter().map(|i| STEPS[*i]).collect::<Vec<_>>().join(" → "))
+    })
 }
 
 pub fn rank(value: &str) -> u8 {

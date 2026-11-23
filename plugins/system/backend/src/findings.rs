@@ -5,8 +5,8 @@
 //! - `(:SweepFinding {key: kind:hash, kind, severity, text, fix, source, group, tried, raised, state*})-[:ABOUT]->`
 //!   the node it is about (an app, a package, a setting, a start item …), `-[:ON]->(:Machine)` when
 //!   that is not known;
-//! - `raised` is what the model's second look says the finding looks like (it shows one level
-//!   higher until the finding is gone);
+//! - `raised` is what an earlier version's second look said the finding looks like (it shows one
+//!   level higher until the finding is gone); triage replaced that look;
 //! - `state` is temporal: `open` while sweeps find it, `gone` once one (or a check after a fix) does
 //!   not; `ignored` is an earlier version's "don't worry", still honoured as `expected`;
 //! - `(:SweepDecision {key: decision:hash of group, verdict, group, keys, severity, at, until})-[:ON]->(:Machine)`,
@@ -187,6 +187,12 @@ impl Store {
         report
     }
 
+    /// The person's decisions in force.
+    pub fn decisions(&self) -> impl Iterator<Item = &Decision> {
+        let now = now_ms();
+        self.decisions.iter().filter(move |d| d.until == 0 || d.until > now)
+    }
+
     /// Decide about a group (or take the decision back with an empty verdict). The decision
     /// covers the group's findings up to the worst one it has now, or only `keys`.
     pub fn decide(&mut self, group: &str, verdict: &str, keys: Vec<String>, days: u32) -> Result<(), String> {
@@ -264,21 +270,6 @@ impl Store {
         self.tried.clear();
         self.raised.clear();
         self.last = SweepReport::default();
-    }
-
-    /// The model's second look raised these findings (report key, what it looks like).
-    pub fn raise(&mut self, raised: Vec<(String, String)>) {
-        let mut batch = Batch::new();
-        for (wire, why) in raised {
-            let Some((kind, text)) = wire.split_once(':') else { continue };
-            let key = node_key(kind, text);
-            // Only a finding a sweep stored (with its edge) takes the mark: a node alone is refused.
-            if self.states.contains_key(&key) {
-                batch.unit().node("SweepFinding", key).p("raised", why.clone());
-            }
-            self.raised.insert(wire, why);
-        }
-        graph::put(batch);
     }
 
     /// A fix ran: the findings a fresh check no longer finds are gone; the rest keep the command

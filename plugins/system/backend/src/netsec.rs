@@ -586,10 +586,26 @@ fn dns_capture(part: &mut Part, interface: &str) {
         return;
     };
     part.checked.push("DNS queries (5 s capture)".into());
+    let tables = feeds::tables();
+    if !tables.has_indicators() {
+        part.skipped.push("DNS queries against abuse.ch ThreatFox: no abuse.ch list is loaded (it needs the abuse.ch key); this is not a clean result".into());
+    }
     let mut odd = BTreeSet::new();
+    let mut listed = BTreeSet::new();
     for line in text.lines() {
         let Some(name) = line.split(" A? ").nth(1).or_else(|| line.split(" AAAA? ").nth(1)).and_then(|r| r.split_whitespace().next()) else { continue };
         let name = name.trim_end_matches('.');
+        if let Some(hit) = tables.domain(name)
+            && listed.insert(name.to_owned())
+        {
+            part.add(
+                "high",
+                "network",
+                format!("This Mac looked up {name}, which {} lists as malware infrastructure ({}). Find the program that asked for it (the network watcher names programs online).", hit.list, hit.label()),
+                None,
+                hit.source,
+            );
+        }
         let label = name.split('.').next().unwrap_or("");
         if generated(label) {
             odd.insert(name.to_owned());

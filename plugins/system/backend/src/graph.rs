@@ -437,9 +437,10 @@ pub async fn stream_read(topic: &str, since_ms: u64) -> Result<Vec<StreamEntry>,
     Ok(out)
 }
 
-/// Run a read from a blocking thread (a sweep check, a watcher's tick).
+/// Run a read from a blocking thread (a sweep check, a watcher's tick). None before any async
+/// code kept the runtime (see [`crate::util::runtime`]).
 pub fn block<T>(work: impl Future<Output = T>) -> Option<T> {
-    let handle = tokio::runtime::Handle::try_current().ok()?;
+    let handle = crate::util::runtime()?;
     Some(handle.block_on(work))
 }
 
@@ -491,6 +492,7 @@ pub fn set_ready() {
 /// Start the writer and wait for this Mac's root node (memory may start after this plugin).
 /// Called once, when the frame connection is known.
 pub async fn connect(ctx: Ctx) {
+    crate::util::keep_runtime();
     if CTX.set(ctx.clone()).is_err() {
         return;
     }
