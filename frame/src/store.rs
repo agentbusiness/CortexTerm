@@ -130,6 +130,11 @@ async fn write(link: &MemoryLink, method: &str, params: Value) {
     loop {
         match link.call(method, params.clone()).await {
             Ok(_) => return,
+            // Refused, not lost: the same write would be refused again and hold back every one after it.
+            Err(error) if error.code == codes::INVALID_PARAMS => {
+                tracing::error!(method, %error.message, "store write refused; dropping it");
+                return;
+            }
             Err(error) => {
                 tracing::error!(method, %error.message, retry_ms = retry.as_millis(), "store write not acknowledged; retaining it and retrying in order");
                 tokio::time::sleep(retry).await;

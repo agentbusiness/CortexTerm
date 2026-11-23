@@ -70,6 +70,8 @@ async function homeProject(client: Client): Promise<{ id: string; root: string }
 
 type SideView = 'machine' | 'alerts' | 'traces' | 'ssh' | 'schedules' | 'files' | 'cleanup' | 'log' | 'investigate';
 interface SideDetails { run?: string; pid?: number; trace?: string }
+/** This computer's key in `ct.side.details`: memory settings refuse a member without a name. */
+const LOCAL_DETAILS = 'local';
 
 const NAV = { def: 220, min: 160, max: 420, fold: 110 };
 const SIDE = { def: 420, min: 320, max: 760, fold: 220 };
@@ -313,11 +315,11 @@ export function Desk() {
   const { needing: openAlerts } = useMachineAlerts(null);
   const sideAlerts = useMachineAlerts(sideNode);
   const sideAlertCount = sideAlerts.needing;
-  const details = sideDetails[sideNode ?? ''] ?? {};
+  const details = sideDetails[sideNode || LOCAL_DETAILS] ?? {};
   const sideRun = details.run ?? '', sidePid = details.pid ?? 0, sideTrace = details.trace ?? '';
-  const setSideRun = useCallback((run: string) => setSideDetails((current) => ({ ...current, [sideNode ?? '']: { ...current[sideNode ?? ''], run } })), [sideNode, setSideDetails]);
-  const setSidePid = useCallback((pid: number) => setSideDetails((current) => ({ ...current, [sideNode ?? '']: { ...current[sideNode ?? ''], pid } })), [sideNode, setSideDetails]);
-  const setSideTrace = useCallback((trace: string) => setSideDetails((current) => ({ ...current, [sideNode ?? '']: { ...current[sideNode ?? ''], trace } })), [sideNode, setSideDetails]);
+  const setSideRun = useCallback((run: string) => setSideDetails((current) => ({ ...current, [sideNode || LOCAL_DETAILS]: { ...current[sideNode || LOCAL_DETAILS], run } })), [sideNode, setSideDetails]);
+  const setSidePid = useCallback((pid: number) => setSideDetails((current) => ({ ...current, [sideNode || LOCAL_DETAILS]: { ...current[sideNode || LOCAL_DETAILS], pid } })), [sideNode, setSideDetails]);
+  const setSideTrace = useCallback((trace: string) => setSideDetails((current) => ({ ...current, [sideNode || LOCAL_DETAILS]: { ...current[sideNode || LOCAL_DETAILS], trace } })), [sideNode, setSideDetails]);
   const sideView = (requestedSideView === 'log' && !sideRun || requestedSideView === 'investigate' && !sidePid || requestedSideView === 'files' && (!sideNode || !filesAvailable) || requestedSideView === 'cleanup' && !cleanupAvailable) ? 'machine' : requestedSideView;
 
   function focusedCwd() {
@@ -509,7 +511,7 @@ export function Desk() {
     openRun: (run) => {
       const node = nodeOfTerm(run.term_id);
       selectSideNode(node ?? '');
-      setSideDetails((current) => ({ ...current, [node ?? '']: { ...current[node ?? ''], run: run.id } }));
+      setSideDetails((current) => ({ ...current, [node || LOCAL_DETAILS]: { ...current[node || LOCAL_DETAILS], run: run.id } }));
       setSideView('log'); columns.openSide();
     },
     fix: (_pane, run) => void onAsk(`\`${run.command}\` failed with exit code ${run.exit_code}. What went wrong and how do I fix it?`, 'fix', run.id),
