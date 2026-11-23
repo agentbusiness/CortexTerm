@@ -68,8 +68,8 @@ only regenerable, idle finds; keep and not-now are always allowed; everything el
 Every scan, find, decision and clean is in the terminal's graph (docs/GRAPH-MODEL.md, "Disk
 cleanup"): `CleanupScan`, `Reclaimable` (with `bytes` and `status` histories) linked to its
 `CleanupRecipe`, its folder, its project, the `Program`s using it and its duplicate `LargeFile`s;
-`CleanupDecision` (verdict history) about it; `CleanupAction` for each clean, and the
-`cleanup.actions` stream. Nothing is written to files.
+`CleanupDecision` (verdict history) about it; `CleanupAction` for each clean. Nothing is
+written to files.
 
 ## Scanning
 

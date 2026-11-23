@@ -836,20 +836,29 @@ function ComputerShells({ computer, home, shown, stage, onOpen, onShow, onClose,
   useLive();
   const { client } = useRuntime();
   const [shells, setShells] = useState<TermInfo[]>([]);
+  // Read once, then again only when that computer says a shell ended or a shell not in the list
+  // spoke (its `terminal.exit` / `terminal.state` events), never on a timer.
   useEffect(() => {
     if (!computer.reachable) return;
     let stopped = false;
+    const known = new Set<string>();
     const read = () => client.call<{ terminals: TermInfo[] }>('terminal.list', {})
       .then((list) => {
         if (stopped) return;
         const alive = (list?.terminals ?? []).filter((term) => term.alive);
         for (const term of alive) live.ensure(term.term_id, computer.node);
+        known.clear();
+        for (const term of alive) known.add(term.term_id);
         setShells(alive);
       })
       .catch(() => undefined);
     void read();
-    const timer = setInterval(read, 5000);
-    return () => { stopped = true; clearInterval(timer); };
+    const offExit = client.on('terminal.exit', () => void read());
+    const offState = client.on('terminal.state', (_topic, data) => {
+      const id = (data as { term_id?: string } | null)?.term_id;
+      if (id && !known.has(id)) void read();
+    });
+    return () => { stopped = true; offExit(); offState(); };
   }, [client, computer.reachable, computer.node]);
   const attached = new Set(shown.flatMap((pane) => pane.termId ? [pane.termId] : []));
   const panes: PaneRec[] = [...shown, ...(computer.reachable ? shells : [])

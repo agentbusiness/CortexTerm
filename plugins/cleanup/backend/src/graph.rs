@@ -10,7 +10,6 @@
 //! (:LargeFile {key: path})-[:COPY_IN]->(:Reclaimable)    each copy of a duplicate set
 //! (:CleanupDecision {key: item key, verdict, by, reason, at_ms, until_ms})-[:ABOUT]->(:Reclaimable)
 //! (:CleanupAction {key, at_ms, by, how, freed, ok, detail})-[:CLEANED]->(:Reclaimable)  -[:ON]->(:Machine)
-//! stream `cleanup.actions`   {at, id, path, by, how, freed, ok}
 //! ```
 //!
 //! A find not seen again is retired (`gone`); a cleaned one is retired as `cleaned`. Writes are
@@ -18,7 +17,7 @@
 
 use cc_protocol::Ctx;
 pub use cc_protocol::contracts::memory::GraphRef;
-use cc_protocol::contracts::memory::{GraphEdge, GraphNode, GraphPutParams, GraphRetireParams, StreamAppendParams, methods};
+use cc_protocol::contracts::memory::{GraphEdge, GraphNode, GraphPutParams, GraphRetireParams, methods};
 use serde_json::{Map, Value, json};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -98,13 +97,6 @@ pub fn retire(refs: Vec<GraphRef>, reason: &str) {
     if let Some(outbox) = OUTBOX.get() {
         let params = GraphRetireParams { refs, reason: Some(reason.into()), at_ms: None };
         let _ = outbox.send((methods::GRAPH_RETIRE, serde_json::to_value(params).unwrap_or(Value::Null)));
-    }
-}
-
-pub fn append(topic: &str, records: Vec<Value>) {
-    if let Some(outbox) = OUTBOX.get() {
-        let params = StreamAppendParams { topic: topic.into(), records, retention_days: Some(365) };
-        let _ = outbox.send((methods::STREAM_APPEND, serde_json::to_value(params).unwrap_or(Value::Null)));
     }
 }
 

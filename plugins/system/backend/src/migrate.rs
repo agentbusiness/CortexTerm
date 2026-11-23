@@ -81,7 +81,6 @@ pub async fn run() -> Moved {
     let path = dir.join("alerts.json");
     if let Some(old) = read::<OldAlerts>(&path) {
         let now = now_ms();
-        let mut records = Vec::new();
         for stored in &old.alerts {
             let a = &stored.alert;
             let mut batch = Batch::new();
@@ -104,7 +103,6 @@ pub async fn run() -> Moved {
                 .po("quiet_until", quiet);
             unit.edge(r("Alert", a.id.clone()), "OF", r("AlertKind", a.kind.clone()));
             graph::put(batch);
-            records.push(crate::alerts::stream_record(a, &stored.key));
         }
         for kind in &old.ignored_kinds {
             let mut batch = Batch::new();
@@ -113,7 +111,6 @@ pub async fn run() -> Moved {
             unit.edge(r("AlertKind", kind.clone()), "ON", machine.clone());
             graph::put(batch);
         }
-        graph::append("alerts", records, 365);
         count("alerts", old.alerts.len(), path, &mut moved);
     }
 

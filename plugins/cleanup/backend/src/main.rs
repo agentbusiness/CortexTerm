@@ -245,7 +245,6 @@ async fn apply(this: Arc<Cleanup>, ctx: Ctx, params: ApplyParams) -> Result<Appl
                 batch.edge(&action, "ON", &machine, json!({}));
             }
             graph::put(batch);
-            graph::append("cleanup.actions", vec![json!({ "at": at, "id": item.id, "path": item.path, "by": by, "how": item.how, "freed": freed, "ok": ok })]);
             if ok {
                 graph::retire(vec![graph::r("Reclaimable", item.id.clone())], "cleaned");
             }

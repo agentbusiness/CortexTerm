@@ -4,8 +4,7 @@
 //!
 //! - `(:Alert {key: id, kind, severity, text, at, subject, pid, port, path, actions, dismissed,
 //!   quiet_until})-[:OF]->(:AlertKind {key: kind, ignored*})-[:ON]->(:Machine)`, and
-//!   `-[:ABOUT]->` what it is about when that is a node (a start item, an advisory);
-//! - the stream `alerts`: every alert, in order, as it fired.
+//!   `-[:ABOUT]->` what it is about when that is a node (a start item, an advisory).
 //!
 //! The last week is loaded once at start; until then candidates wait in RAM and are offered again.
 
@@ -13,13 +12,11 @@ use crate::graph::{self, Batch, Props, r};
 use crate::util::now_ms;
 use cc_protocol::contracts::memory::GraphRef;
 use cc_protocol::contracts::system::{Alert, AlertList};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::collections::HashMap;
 
 const HOUR: u64 = 3_600_000;
 const WEEK: u64 = 7 * 24 * HOUR;
-/// The `alerts` stream keeps a year.
-const STREAM_DAYS: u32 = 365;
 
 /// What a watcher wants to say; `key` is the kind and subject it is deduplicated on.
 pub struct Candidate {
@@ -130,7 +127,6 @@ impl AlertStore {
         alert.dismissed = false;
         self.last.insert(key.clone(), now);
         self.write(&alert, &key, None, about);
-        graph::append("alerts", vec![json!({"id": alert.id, "kind": alert.kind, "severity": alert.severity, "text": alert.text, "subject": key, "at": alert.at, "pid": alert.pid, "port": alert.port, "path": alert.path})], STREAM_DAYS);
         self.alerts.push(Stored { alert: alert.clone(), key });
         self.trim();
         Some(alert)
@@ -222,9 +218,4 @@ impl AlertStore {
         self.trim();
         Ok(())
     }
-}
-
-/// An alert's record for the `alerts` stream, from the old file's form (`migrate`).
-pub fn stream_record(alert: &Alert, key: &str) -> Value {
-    json!({"id": alert.id, "kind": alert.kind, "severity": alert.severity, "text": alert.text, "subject": key, "at": alert.at, "pid": alert.pid, "port": alert.port, "path": alert.path})
 }
