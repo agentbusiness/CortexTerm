@@ -45,8 +45,8 @@ const DAY: u64 = 86_400_000;
 /// A model's verdict is looked at again after this long.
 const MODEL_DAYS: u64 = 30;
 /// Raised when triage learns to see more (new facts, new rules): the model's "shown" verdicts
-/// made under older rules are judged again. 2: upload alerts name their program.
-const RULES: u64 = 2;
+/// made under older rules are judged again. 2: upload alerts name their program. 3: and who sent where.
+const RULES: u64 = 3;
 /// Model time per quick look. Short calls at background priority, not idle-only: an idle-only
 /// call waits behind every other use of the model and, on a busy or shared model, never starts.
 const QUICK_LIMIT: Duration = Duration::from_secs(45);
@@ -1114,6 +1114,15 @@ pub struct Outcome {
 pub async fn judge(ctx: &Ctx, subject: Subject, snapshot: std::sync::Arc<Snapshot>, precedents: Vec<Precedent>, shadow: bool, investigate: bool, similar_to: impl Fn(&str) -> Option<Triage>) -> Result<Outcome, String> {
     let now = now_ms();
     let kept = precedents.clone();
+    // An upload alert from before it carried its program: find the program by its name now (the
+    // network watch knows it once it has loaded).
+    let mut subject = subject;
+    if subject.paths.is_empty()
+        && let Some((name, _)) = subject.what.split_once(" has uploaded ")
+        && let Some(path) = crate::netwatch::program_path(name)
+    {
+        subject.paths.push(path);
+    }
     let (facts, signer) = {
         let subject = subject.clone();
         let snapshot = snapshot.clone();

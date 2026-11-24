@@ -201,23 +201,24 @@ pub fn watch(snapshot: &Snapshot, seen: &mut HashSet<(u32, u64)>) -> Vec<Candida
         }
         let installer = chain.iter().find_map(|e| install_of(&e.proc.command));
         let person = chain.iter().any(|e| is_person(e));
+        // Who started it: pid, program and command line (secrets masked).
+        let described = |e: &Entry| format!("{} (pid {}, {}) `{}`", e.proc.name, e.proc.pid, if e.exe.is_empty() { "unknown path" } else { e.exe.as_str() }, shorten(&mask(&e.proc.command), 100));
+        let launcher = chain.iter().find(|e| install_of(&e.proc.command).is_some()).or(chain.first()).map(|e| described(e)).unwrap_or_else(|| "an unknown program".into());
+        let ran = format!(" Its command: `{}`.", shorten(&mask(&command), 160));
         let (severity, text) = match (&installer, person) {
             (Some(installer), _) => (
                 "high",
                 format!(
-                    "{tool} (pid {}) started with {flag}, launched by {installer}, not by you. A malicious package used AI tools exactly this way (the s1ngularity attack, 2025) to search the disk for secrets.",
+                    "{tool} (pid {}) started with {flag}, launched by {installer}, not by you: {launcher}.{ran} A malicious package used AI tools exactly this way in 2025 (the s1ngularity attack) to search the disk for secrets.",
                     p.pid
                 ),
             ),
-            (None, false) => {
-                let by = chain.first().map(|e| e.proc.name.clone()).unwrap_or_else(|| "an unknown program".into());
-                ("warn", format!("{tool} (pid {}) started with {flag} by {by}, with no terminal of yours above it. Check that you set this up.", p.pid))
-            }
+            (None, false) => ("warn", format!("{tool} (pid {}) started with {flag} by {launcher}, with no terminal of yours above it.{ran} Check that you set this up.", p.pid)),
             (None, true) => continue,
         };
         found.push(Candidate {
             key: format!("agent:{}:{}", p.pid, p.started),
-            alert: Alert { kind: "agent".into(), severity: severity.into(), text, pid: Some(p.pid), actions: vec!["kill".into(), "show".into()], ..Default::default() },
+            alert: Alert { kind: "agent".into(), severity: severity.into(), text, pid: Some(p.pid), path: (!entry.exe.is_empty()).then(|| entry.exe.clone()), actions: vec!["kill".into(), "show".into()], ..Default::default() },
         });
     }
     found
@@ -1055,6 +1056,7 @@ fn hidden_text_checks(part: &mut Part, repos: &[PathBuf], discovery: &crate::fil
             )),
             SOURCE_HIDDEN,
         );
+        part.about("Binary", path.display().to_string());
     }
 }
 

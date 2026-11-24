@@ -506,6 +506,7 @@ fn snapshot(part: &mut Part, discovery: &crate::filesystem::Discovery) -> BTreeM
                     None,
                     "editor tasks",
                 );
+                part.about("Binary", tasks.display().to_string());
             }
         }
     }
@@ -604,6 +605,11 @@ fn btm(part: &mut Part) {
             break;
         }
         let kind = get("Type").split(" (").next().unwrap_or("");
-        part.add(severity, "persistence", format!("The login item {name} ({kind}) {why}: {program}."), None, "btm");
+        let team = get("Team Identifier");
+        let developer = if team.is_empty() { String::new() } else { format!(" Developer team: {team}.") };
+        part.add(severity, "persistence", format!("The login item {name} ({kind}) {why}: {program}.{developer}"), None, "btm");
+        if program.starts_with('/') {
+            part.about("Binary", program.to_owned());
+        }
     }
 }

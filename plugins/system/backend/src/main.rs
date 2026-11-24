@@ -349,7 +349,7 @@ impl Shared {
         self.offer(
             Candidate {
                 key: format!("triage:{}:{}", protection::digest(&subject.item), subject.severity),
-                alert: Alert { kind: "security-incident".into(), severity: subject.severity.clone(), text, at: util::now_ms(), actions: vec!["show".into()], ..Default::default() },
+                alert: Alert { kind: "security-incident".into(), severity: subject.severity.clone(), text, at: util::now_ms(), path: subject.paths.first().cloned(), actions: vec!["show".into()], ..Default::default() },
             },
             true,
         );
@@ -1244,7 +1244,7 @@ async fn watch_launch_folders(shared: Arc<Shared>) {
             } else {
                 "info"
             };
-            let program = if item.program.is_empty() { "no program we can find".to_owned() } else { item.program.clone() };
+            let program = if item.program.is_empty() { "no program we can find".to_owned() } else if item.args.is_empty() { item.program.clone() } else { format!("{} {}", item.program, item.arguments()) };
             let verdict = match (&danger, item.program.is_empty()) {
                 (Some(why), _) => format!(": {why}"),
                 (None, true) => String::new(),

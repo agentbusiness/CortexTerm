@@ -1413,12 +1413,13 @@ fn editor_extensions(part: &mut Part, found: &mut Vec<EditorExt>) {
                         "high",
                         "app",
                         format!(
-                            "The {editor} extension {id} {version} hides a run of {hidden} invisible characters in its code ({}), the trick GlassWorm used to smuggle in malware. Remove it.",
+                            "The {editor} extension {id} {version} hides a run of {hidden} invisible characters in its code ({}), a known trick to smuggle in malware (the GlassWorm campaign). Remove it.",
                             tilde(&file)
                         ),
                         Some(format!("{cli} --uninstall-extension {id}")),
                         "editor extensions",
                     );
+                    part.about("Binary", file.display().to_string());
                     break;
                 }
             }

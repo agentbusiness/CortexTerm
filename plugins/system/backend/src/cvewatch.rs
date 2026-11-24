@@ -162,7 +162,17 @@ fn alert(report: &CveReport, priority: &str) -> Option<Candidate> {
     };
     Some(Candidate {
         key: format!("cve:{}", report.id),
-        alert: Alert { kind: "cve".into(), severity: severity.into(), text: report.verdict_text.clone(), actions: vec!["show".into()], ..Default::default() },
+        alert: Alert {
+            kind: "cve".into(),
+            severity: severity.into(),
+            // The verdict, then what the flaw is in plain words.
+            text: {
+                let about = if report.title.trim().is_empty() { &report.summary } else { &report.title };
+                if about.trim().is_empty() { report.verdict_text.clone() } else { format!("{} The flaw: {}", report.verdict_text, crate::util::shorten(about.trim(), 200)) }
+            },
+            actions: vec!["show".into()],
+            ..Default::default()
+        },
     })
 }
 

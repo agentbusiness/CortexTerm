@@ -318,9 +318,13 @@ fn profiles(part: &mut Part) {
                 if managed { "low" } else { "high" },
                 "posture",
                 format!(
-                    "Installed configuration profiles set {}{}. Check that you know who installed them (System Settings > General > Device Management).",
+                    "Installed configuration profiles set {}{}. Profiles: {}. Check that you know who installed them (System Settings > General > Device Management).",
                     found.join(", "),
-                    if managed { "" } else { " on a Mac that no organisation manages" }
+                    if managed { "" } else { " on a Mac that no organisation manages" },
+                    {
+                        let ids: Vec<&str> = text.lines().filter_map(|l| l.split("attribute: profileIdentifier:").nth(1)).map(str::trim).take(6).collect();
+                        if ids.is_empty() { "names not shown".to_owned() } else { ids.join(", ") }
+                    }
                 ),
                 None,
                 "profiles",
@@ -488,7 +492,11 @@ fn network_settings(part: &mut Part) {
                 part.add(
                     "medium",
                     "posture",
-                    format!("/etc/hosts redirects {} for update or security sites; malware does this to block updates.", plural(blocked.len(), "name", "names")),
+                    format!(
+                        "/etc/hosts redirects {} for update or security sites; malware does this to block updates: {}.",
+                        plural(blocked.len(), "name", "names"),
+                        blocked.iter().take(8).map(|l| crate::util::shorten(l, 100)).collect::<Vec<_>>().join("; ")
+                    ),
                     Some("sudo nano /etc/hosts".into()),
                     "hosts",
                 );

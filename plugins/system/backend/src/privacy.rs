@@ -148,7 +148,7 @@ fn keyboard_taps(part: &mut Part) {
         } else if KNOWN_TAPPERS.iter().any(|k| exe.contains(k)) {
             ("info", format!("{} (a known shortcut app)", tilde(path)))
         } else if sig.unsigned() {
-            ("high", format!("{}, which is {}", tilde(path), if sig.status == "adhoc" { "only ad-hoc signed" } else { "not signed" }))
+            ("high", format!("{}, which is {}", tilde(path), if sig.status == "adhoc" { "signed by nobody (ad-hoc)" } else { "not signed" }))
         } else if sig.team_id.is_empty() {
             ("medium", format!("{}, whose signer could not be told", tilde(path)))
         } else {
@@ -162,6 +162,9 @@ fn keyboard_taps(part: &mut Part) {
             None,
             "event taps",
         );
+        if !exe.is_empty() {
+            part.about("Binary", exe.clone());
+        }
     }
 }
 
@@ -390,6 +393,7 @@ fn permissions(part: &mut Part) {
                 None,
                 "tcc",
             );
+            part.about("Binary", path.display().to_string());
             continue;
         }
         let sig = codesign::check(&path);
@@ -397,7 +401,7 @@ fn permissions(part: &mut Part) {
             continue;
         }
         let state = match sig.status.as_str() {
-            "adhoc" => "only ad-hoc signed",
+            "adhoc" => "signed by nobody (ad-hoc)",
             "unsigned" => "not signed",
             _ => "of unknown signature",
         };
@@ -406,9 +410,11 @@ fn permissions(part: &mut Part) {
         if local_build(&path) {
             let severity = if severity == "high" { "medium" } else { "low" };
             part.add(severity, "privacy", format!("{} has permission to {what} and is {state}; it is a build made on this Mac in a project folder.", tilde(&path)), None, "tcc");
+            part.about("Binary", path.display().to_string());
             continue;
         }
         part.add(severity, "privacy", format!("{} has permission to {what} and is {state}.", tilde(&path)), None, "tcc");
+        part.about("Binary", path.display().to_string());
     }
 }
 

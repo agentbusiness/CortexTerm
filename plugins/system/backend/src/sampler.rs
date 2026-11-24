@@ -431,7 +431,7 @@ impl Sampler {
                         alert: Alert {
                             kind: "cpu".into(),
                             severity: "warn".into(),
-                            text: format!("{} (pid {}) has kept a CPU core above 90% busy for {} minutes.", p.name, p.pid, minutes),
+                            text: format!("{} (pid {}) has kept a CPU core above 90% busy for {} minutes. Command: `{}`.", p.name, p.pid, minutes, crate::util::shorten(&crate::agents::mask(&p.command), 120)),
                             pid: Some(p.pid),
                             path: (!entry.exe.is_empty()).then(|| entry.exe.clone()),
                             actions: vec!["show".into(), "kill".into()],
@@ -463,11 +463,12 @@ impl Sampler {
                             kind: "memory".into(),
                             severity: "warn".into(),
                             text: format!(
-                                "{} (pid {}) has grown by {:.0} MB in the last {:.0} minutes and keeps climbing, so it may be leaking memory.",
+                                "{} (pid {}) has grown by {:.0} MB in the last {:.0} minutes and keeps climbing, so it may be leaking memory. Command: `{}`.",
                                 p.name,
                                 p.pid,
                                 grown / MB,
-                                minutes
+                                minutes,
+                                crate::util::shorten(&crate::agents::mask(&p.command), 120)
                             ),
                             pid: Some(p.pid),
                             path: (!entry.exe.is_empty()).then(|| entry.exe.clone()),
@@ -578,10 +579,15 @@ impl Sampler {
                     alert: Alert {
                         kind: "port".into(),
                         severity: severity.into(),
-                        text: format!(
-                            "{} (pid {}) started listening on port {} on every network interface, so other machines on your network can reach it.",
-                            port.process, port.pid, port.port
-                        ),
+                        text: {
+                            let entry = self.snapshot.entries.iter().find(|e| e.proc.pid == port.pid);
+                            let command = entry.map(|e| crate::util::shorten(&crate::agents::mask(&e.proc.command), 120)).unwrap_or_default();
+                            let parent = entry.and_then(|e| self.snapshot.entries.iter().find(|p| p.proc.pid == e.proc.ppid)).map(|p| format!(", started by {} (pid {})", p.proc.name, p.proc.pid)).unwrap_or_default();
+                            format!(
+                                "{} (pid {}{parent}) started listening on port {} on every network interface, so other machines on your network can reach it. Command: `{command}`.",
+                                port.process, port.pid, port.port
+                            )
+                        },
                         pid: Some(port.pid),
                         port: Some(port.port),
                         path: exe_of.get(&port.pid).filter(|e| !e.is_empty()).cloned(),

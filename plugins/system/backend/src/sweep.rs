@@ -857,18 +857,27 @@ fn launch_checks() -> Part {
     }
     part.checked.push("launch agents and daemons".into());
     for item in launch::all() {
+        // What it runs, with its arguments: "/bin/bash -c 'curl … | sh'" is the story, not "/bin/bash".
+        let runs = if item.args.is_empty() { String::new() } else { format!(" It runs: {} {}.", item.program, item.arguments()) };
+        let about = |part: &mut Part| {
+            if item.program.starts_with('/') {
+                part.about("Binary", item.program.clone());
+            }
+        };
         if let Some(why) = item.danger() {
-            part.add("high", "persistence", format!("The {} {} in {}: {why}.", item.what(), item.label, item.folder()), None, "launch agents");
+            part.add("high", "persistence", format!("The {} {} in {}: {why}.{runs}", item.what(), item.label, item.folder()), None, "launch agents");
+            about(&mut part);
             continue;
         }
         if item.homebrew() && !item.quarantined && item.signature != "missing" {
             part.add(
                 "info",
                 "persistence",
-                format!("The {} {} in {} is a Homebrew service: it starts {}, built by Homebrew on this Mac ({}).", item.what(), item.label, item.folder(), item.program, item.verdict().trim_start_matches("which ")),
+                format!("The {} {} in {} is a Homebrew service: it starts {}, built by Homebrew on this Mac ({}).{runs}", item.what(), item.label, item.folder(), item.program, item.verdict().trim_start_matches("which ")),
                 None,
                 "launch agents",
             );
+            about(&mut part);
             continue;
         }
         let severity = match (item.unsigned(), item.quarantined) {
@@ -882,10 +891,11 @@ fn launch_checks() -> Part {
         part.add(
             severity,
             "persistence",
-            format!("The {} {} in {} starts {}, {}.", item.what(), item.label, item.folder(), item.program, item.verdict()),
+            format!("The {} {} in {} starts {}, {}.{runs}", item.what(), item.label, item.folder(), item.program, item.verdict()),
             None,
             "launch agents",
         );
+        about(&mut part);
     }
     part
 }

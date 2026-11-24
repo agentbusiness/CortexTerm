@@ -30,9 +30,16 @@ pub struct Item {
     pub apple: bool,
     /// What its `EnvironmentVariables` put in `DYLD_INSERT_LIBRARIES` (empty when nothing).
     pub inserts: String,
+    /// The arguments after the program (`ProgramArguments[1..]`).
+    pub args: Vec<String>,
 }
 
 impl Item {
+    /// The arguments it passes, shortened ("" when none).
+    pub fn arguments(&self) -> String {
+        crate::util::shorten(&self.args.join(" "), 160)
+    }
+
     /// "launch agent" or "launch daemon".
     pub fn what(&self) -> &'static str {
         if self.plist.display().to_string().contains("LaunchDaemons") { "launch daemon" } else { "launch agent" }
@@ -63,7 +70,7 @@ impl Item {
             return Some(format!("its label {} claims to be Apple's but {} is not signed by Apple", self.label, self.program));
         }
         if !self.inserts.is_empty() {
-            return Some(format!("it sets DYLD_INSERT_LIBRARIES={}, which injects code into the program it starts", self.inserts));
+            return Some(format!("it forces extra code ({}) into the program it starts, {} (DYLD_INSERT_LIBRARIES)", self.inserts, self.program));
         }
         let library = home().join("Library").display().to_string();
         let odd = ["/tmp/", "/private/tmp/", "/private/var/tmp/", "/Users/Shared/"].iter().any(|p| self.program.starts_with(p))
@@ -79,13 +86,13 @@ impl Item {
         let mut text = match self.signature.as_str() {
             "missing" => "which does not exist".to_owned(),
             "unsigned" => "which is not signed".to_owned(),
-            "adhoc" => "which is only ad-hoc signed".to_owned(),
+            "adhoc" => "which is signed by nobody (ad-hoc)".to_owned(),
             "signed" if !self.team.is_empty() => format!("which is signed (team {})", self.team),
             "signed" => "which is signed".to_owned(),
             _ => "whose signature could not be checked".to_owned(),
         };
         if self.quarantined {
-            text.push_str(" and is still quarantined as downloaded and never opened");
+            text.push_str(" and is still marked as downloaded from the internet and never opened");
         }
         text
     }
@@ -127,7 +134,12 @@ pub fn inspect(plist: &Path) -> Option<Item> {
         .and_then(|v| v.as_string())
         .unwrap_or("")
         .to_owned();
-    Some(Item { plist: plist.to_path_buf(), label, program, signature, team, quarantined, apple, inserts })
+    let args = dict
+        .get("ProgramArguments")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().skip(1).filter_map(|v| v.as_string()).map(str::to_owned).collect())
+        .unwrap_or_default();
+    Some(Item { plist: plist.to_path_buf(), label, program, signature, team, quarantined, apple, inserts, args })
 }
 
 /// Every plist in the launch folders.

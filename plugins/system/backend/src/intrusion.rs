@@ -147,7 +147,9 @@ fn digest(part: &mut Part, rows: &[LogRow]) {
         if seen.len() > 40 {
             break;
         }
-        part.add(severity, "intrusion", text, None, "system log");
+        // Which process wrote the log line.
+        let by = if row.process.is_empty() { String::new() } else { format!(" (logged by {}, pid {})", row.process, row.pid) };
+        part.add(severity, "intrusion", format!("{text}{by}"), None, "system log");
     }
     let failed_ssh = rows.iter().filter(|r| r.query == "ssh" && !r.message.contains("Accepted")).count();
     if failed_ssh > 0 {

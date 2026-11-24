@@ -330,7 +330,8 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
   const item = items.find((entry) => entry.key === selected);
   const openCount = items.filter((entry) => entry.open).length;
   const urgent = items.filter((entry) => entry.open && !entry.filtered && priority(entry.severity) === 'ACT NOW').length;
-  const filedCount = items.filter((entry) => entry.open && entry.filtered).length;
+  // Filed as normal by triage: resolved, listed under DECIDED in grey.
+  const filedCount = items.filter((entry) => !entry.open && entry.filtered).length;
 
   useEffect(() => {
     if (item?.incident) void loadIncident(item.incident.id);
@@ -466,13 +467,13 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
         <div className="ct-sec-tabs">
           <span className="ct-label ct-faint">GROUPED BY WHAT IT IS ABOUT</span>
           <span className="grow" />
-          <button type="button" className={`ct-seg${tab === 'open' ? ' on' : ''}`} title={filedCount ? `${filedCount} of them triage filed as normal; they are listed last, in grey` : undefined} onClick={() => { setTab('open'); setSelected(''); }}>OPEN · {openCount - filedCount}{filedCount > 0 ? ` + ${filedCount} NORMAL` : ''}</button>
-          <button type="button" className={`ct-seg${tab === 'decided' ? ' on' : ''}`} onClick={() => { setTab('decided'); setSelected(''); }}>DECIDED · {items.length - openCount}</button>
+          <button type="button" className={`ct-seg${tab === 'open' ? ' on' : ''}`} onClick={() => { setTab('open'); setSelected(''); }}>OPEN · {openCount}</button>
+          <button type="button" className={`ct-seg${tab === 'decided' ? ' on' : ''}`} onClick={() => { setTab('decided'); setSelected(''); }} title={filedCount ? `${filedCount} of them the model resolved as normal` : undefined}>DECIDED · {items.length - openCount}{filedCount > 0 ? ` (${filedCount} BY THE MODEL)` : ''}</button>
         </div>
         {tab === 'decided' && (report?.fixes ?? []).filter((fix) => fix.gone).slice(0, 8).map((fix) => fixCard(fix))}
         {shown.length === 0 && <p className="ct-asec-note">{tab === 'open' ? 'Nothing open. The checks only know what they can see; no findings is not an all-clear.' : 'No decisions yet.'}</p>}
         {shown.map((entry) => <Fragment key={entry.key}><button type="button" className={`ct-sec-row ${entry.filtered ? 'filed' : tone(entry.severity)}${entry.key === item?.key ? ' on' : ''}`} aria-pressed={entry.key === item?.key} onClick={() => select(entry.key === item?.key ? '' : entry.key)}>
-          <span className="ct-label sev">{!entry.open ? verdictName(entry.decision?.verdict ?? 'dismissed') : entry.filtered ? 'NORMAL' : priority(entry.severity)}</span>
+          <span className="ct-label sev">{entry.filtered ? 'NORMAL' : !entry.open ? verdictName(entry.decision?.verdict ?? 'dismissed') : priority(entry.severity)}</span>
           <Hits hits={[...(history?.hits[entry.key] ?? []), ...(entry.incident ? history?.hits[entry.incident.id] ?? [] : [])]} buckets={history?.series.length ?? 0} />
           <span className="ct-sec-row-main"><span className="ct-sec-row-title" dir="auto">{entry.title}</span><span className="ct-sec-row-text" dir="auto">{entry.text}</span></span>
           <span className="ct-sec-row-side">{entry.open && entry.triage?.verdict === 'pending' && <span className="ct-label ct-blue">CHECKING</span>}<span className="ct-label ct-faint">{entry.kind === 'sweep' ? plural(entry.count, 'finding') : entry.kind === 'incident' ? 'INCIDENT' : entry.alert?.kind.toUpperCase()}</span><time className="ct-label ct-faint" dateTime={iso(entry.last)}>{date(entry.last) ? ago(entry.last) : ''}</time></span>

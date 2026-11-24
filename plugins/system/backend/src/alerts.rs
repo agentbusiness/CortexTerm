@@ -64,6 +64,7 @@ impl AlertStore {
                 pid: row[6].as_u64().map(|p| p as u32),
                 port: row[7].as_u64().map(|p| p as u16),
                 path: row[8].as_str().map(str::to_owned),
+                remote: None,
                 actions: graph::texts(&row[9]),
                 dismissed: row[10].as_bool().unwrap_or(false),
             };

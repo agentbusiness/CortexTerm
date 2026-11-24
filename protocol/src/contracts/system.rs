@@ -699,6 +699,9 @@ pub struct Alert {
     pub port: Option<u16>,
     #[serde(default)]
     pub path: Option<String>,
+    /// The other end of a network alert: an IP address (its port in `port`).
+    #[serde(default)]
+    pub remote: Option<String>,
     /// Suggested actions, e.g. `["kill", "show"]`.
     #[serde(default)]
     pub actions: Vec<String>,

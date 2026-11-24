@@ -277,12 +277,18 @@ impl Tail {
                         _ => "low",
                     }
                     .into(),
-                    summary: format!(
-                        "The selected Suricata sensor reported rule {sid} on traffic from {source} to {dest}; this is a sensor finding, not proof of successful intrusion."
-                    ),
+                    summary: {
+                        let what = crate::util::shorten(value["alert"]["signature"].as_str().unwrap_or("an unnamed rule"), 160);
+                        let category = value["alert"]["category"].as_str().map(|c| format!(" ({})", crate::util::shorten(c, 80))).unwrap_or_default();
+                        format!("The Suricata network sensor saw \"{what}\"{category} on traffic from {source} to {dest} (rule {sid}). A sensor finding, not proof of a successful intrusion.")
+                    },
                     rule: format!("suricata:{sid}"),
                     subject: format!("network:{source}:{dest}:{sid}"),
-                    remote: Some(source),
+                    // The other side: the address that is not on a local network, else the source.
+                    remote: Some(match (source.parse::<IpAddr>().map(crate::netwatch::public), dest.parse::<IpAddr>().map(crate::netwatch::public)) {
+                        (Ok(false), Ok(true)) => dest.clone(),
+                        _ => source.clone(),
+                    }),
                     port: value["dest_port"]
                         .as_u64()
                         .and_then(|n| u16::try_from(n).ok()),
@@ -467,6 +473,12 @@ pub(super) fn endpoint_observation(value: &Value) -> Option<SecurityObservation>
         }
         _ => return None,
     };
+    // Name the program and the file, then what the rule says.
+    let summary = {
+        let name = executable.rsplit('/').next().unwrap_or(&executable);
+        let file = observed_path.as_deref().map(|f| format!(", file {f}")).unwrap_or_default();
+        format!("{name} (pid {pid}, {executable}){file}: {summary}")
+    };
     Some(SecurityObservation {
         at,
         pid: Some(pid),
@@ -479,7 +491,7 @@ pub(super) fn endpoint_observation(value: &Value) -> Option<SecurityObservation>
         kind: kind.into(),
         severity: severity.into(),
         rule: rule.into(),
-        summary: summary.into(),
+        summary,
         source: "endpoint".into(),
         subject: format!("process:{pid}:{started}"),
         count: if kind == "bulk_file_change" {

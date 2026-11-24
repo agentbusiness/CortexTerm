@@ -196,8 +196,10 @@ pub fn from_alert(key: &str, alert: &Alert, snapshot: &Snapshot) -> SecurityObse
         pid: entry.map(|e| e.proc.pid),
         process_started: entry.map(|e| e.proc.started),
         parent_pid: entry.map(|e| e.proc.ppid),
-        executable: entry.map(|e| e.exe.clone()),
+        // The process may be gone by now; the alert's own program path still names it.
+        executable: entry.map(|e| e.exe.clone()).or_else(|| alert.path.clone().filter(|_| alert.pid.is_some())),
         path: alert.path.clone(),
+        remote: alert.remote.clone(),
         port: alert.port,
         count: 1,
         ..Default::default()

@@ -48,7 +48,7 @@ export function itemsOf(report: SweepReport | null, incidents: SecurityIncident[
     const triage = report?.triage?.[group];
     items.push({
       key: group, kind: 'sweep', title, where: title === group ? '' : group, text: listed[0]!.text,
-      severity: listed[0]!.severity, open: open.length > 0, last: incident?.last_at ?? report?.at ?? 0, count: listed.length,
+      severity: listed[0]!.severity, open: open.length > 0 && !filedAway(triage), last: incident?.last_at ?? report?.at ?? 0, count: listed.length,
       findings: listed, incident, decision: report?.decisions?.find((decision) => decision.group === group),
       triage, filtered: open.length > 0 && filedAway(triage),
     });
@@ -56,7 +56,7 @@ export function itemsOf(report: SweepReport | null, incidents: SecurityIncident[
   for (const incident of incidents) {
     if (incident.key.startsWith('group:')) continue;
     const triage = incident.triage ?? undefined;
-    items.push({ key: incident.id, kind: 'incident', title: incident.title, where: '', text: `${new Intl.NumberFormat().format(incident.observations.length)} linked observation${incident.observations.length === 1 ? '' : 's'}`, severity: incident.severity, open: incident.state !== 'dismissed', last: incident.last_at, count: incident.observations.length, findings: [], incident, triage, filtered: incident.state !== 'dismissed' && filedAway(triage) });
+    items.push({ key: incident.id, kind: 'incident', title: incident.title, where: '', text: `${new Intl.NumberFormat().format(incident.observations.length)} linked observation${incident.observations.length === 1 ? '' : 's'}`, severity: incident.severity, open: incident.state !== 'dismissed' && !filedAway(triage), last: incident.last_at, count: incident.observations.length, findings: [], incident, triage, filtered: incident.state !== 'dismissed' && filedAway(triage) });
   }
   // A security alert is also its incident (same title): listed once, as the incident.
   const titles = new Set(incidents.map((incident) => incident.title));

@@ -307,6 +307,10 @@ struct Profile {
     dirty: bool,
     /// A backup or sync program (by its signer), seen this run: no upload alert.
     sync: bool,
+    /// This hour: who sent (pid, sentence with command line and parent), at most 4.
+    hour_who: Vec<(u32, String)>,
+    /// This hour: bytes sent per destination network ("Amazon (US)").
+    hour_to: HashMap<String, u64>,
 }
 
 #[derive(Debug, Default)]
@@ -570,10 +574,22 @@ impl Watch {
             let info = self.info(*pid, name, &by_pid);
             let run = self.run_of(*pid, &parents);
             let who = who(&info, *pid, run.as_deref());
+            // What every alert about this process says after its sentence: the program, its
+            // command line and what started it.
+            let trail = {
+                let entry = by_pid.get(pid);
+                let parent = entry.and_then(|e| by_pid.get(&e.proc.ppid)).map(|p| format!("{} (pid {}, `{}`)", p.proc.name, p.proc.pid, shorten(&p.proc.command, 100))).unwrap_or_else(|| "unknown".into());
+                let exe = if info.exe.is_empty() { "unknown".to_owned() } else { crate::util::tilde(std::path::Path::new(&info.exe)) };
+                format!(" Program: {exe}. Command: `{}`. Started by: {parent}.", shorten(&info.command, 160))
+            };
             let profile = self.state.apps.entry(info.key.clone()).or_insert_with(|| Profile { name: info.app.clone(), hour, ..Default::default() });
             roll(profile, hour, &info.key);
             profile.hour_bytes += uploaded;
             profile.name = info.app.clone();
+            // Who sent it: the command line and what started it, for triage and the person.
+            if uploaded > 0 && !profile.hour_who.iter().any(|(p, _)| p == pid) && profile.hour_who.len() < 4 {
+                profile.hour_who.push((*pid, format!("{who}.{trail}")));
+            }
             if !info.exe.is_empty() && profile.exe != info.exe {
                 profile.exe = info.exe.clone();
                 profile.dirty = true;
@@ -591,6 +607,8 @@ impl Watch {
                 }
                 let usage = profile.nets.entry(owner.asn).or_insert_with(|| NetUse { owner: owner.name.clone(), country: owner.country.clone(), ..Default::default() });
                 if f.counted {
+                    let label = if owner.country.is_empty() { owner.name.clone() } else { format!("{} ({})", owner.name, owner.country) };
+                    *profile.hour_to.entry(label).or_default() += f.bytes_out.saturating_sub(out_before);
                     usage.bytes_out += f.bytes_out.saturating_sub(out_before);
                     usage.bytes_in += f.bytes_in.saturating_sub(in_before);
                 }
@@ -623,7 +641,7 @@ impl Watch {
                 let strong = info.odd_place && (info.unsigned || info.quarantined);
                 let plain = info.unsigned && !info.adhoc && !info.built_here && !learning;
                 if strong || plain {
-                    found.push(candidate(format!("network:unsigned:{}", info.exe), if strong { "high" } else { "warn" }, text, *pid, &info.exe));
+                    found.push(candidate(format!("network:unsigned:{}", info.exe), if strong { "high" } else { "warn" }, text, &trail, *pid, &info.exe, Some(first)));
                 } else {
                     // The digest names the program, not the pid, so a restart does not repeat it.
                     let path = crate::util::tilde(std::path::Path::new(&info.exe));
@@ -636,24 +654,30 @@ impl Watch {
             if !exempt {
                 let command = info.command.to_ascii_lowercase();
                 if let Some(drop) = DROPS.iter().find(|d| command.contains(*d)) {
+                    let first = online[0];
                     found.push(candidate(
                         format!("network:drop:{}:{drop}", info.key),
                         "high",
-                        format!("{who} names {drop} on its command line and is online; that is where stolen data is often sent."),
+                        format!("{who} names {drop} on its command line and is online, connected to {} on port {}, {}; that is where stolen data is often sent.", first.remote, first.remote_port, tables.owner(first.remote).label()),
+                        &trail,
                         *pid,
                         &info.exe,
+                        Some(first),
                     ));
                 }
             }
 
             // A ThreatFox or URLhaus domain or URL on the command line: hard evidence.
             if let Some((target, hit)) = info.targets.iter().find_map(|t| if t.contains("://") { tables.url(t) } else { tables.domain(t) }.map(|hit| (t, hit))) {
+                let first = online[0];
                 found.push(candidate(
                     format!("network:ioc:{}:{target}", info.key),
                     "high",
-                    format!("{who} names {target} on its command line and is online; {} lists it as {}.", hit.list, if hit.what.is_empty() { "malware infrastructure".to_owned() } else { format!("malware infrastructure ({})", hit.what) }),
+                    format!("{who} names {target} on its command line and is online (connected to {} on port {}, {}); {} lists it as {}.", first.remote, first.remote_port, tables.owner(first.remote).label(), hit.list, if hit.what.is_empty() { "malware infrastructure".to_owned() } else { format!("malware infrastructure ({})", hit.what) }),
+                    &trail,
                     *pid,
                     &info.exe,
+                    Some(first),
                 ));
             }
 
@@ -669,7 +693,7 @@ impl Watch {
                         if let Some(entry) = by_pid.get(pid) {
                             crate::protection::observe(cc_protocol::contracts::system::SecurityObservation {
                                 at: now, source: "connection watcher".into(), kind: "outbound".into(), severity: "info".into(),
-                                summary: format!("{} sent {delta} bytes to {} on port {} between two samples of the same process and flow. Payload, purpose and connection initiation were not observed.", info.app, flow.remote, flow.remote_port),
+                                summary: format!("{} sent {delta} bytes to {} on port {} ({}) between two samples of the same process and flow. Payload, purpose and connection initiation were not observed.", info.app, flow.remote, flow.remote_port, owner.label()),
                                 rule: "network.sent_bytes".into(), subject: format!("process:{}:{}", pid, entry.proc.started),
                                 pid: Some(*pid), process_started: Some(entry.proc.started), parent_pid: Some(entry.proc.ppid), executable: Some(info.exe.clone()), remote: Some(flow.remote.to_string()), port: Some(flow.remote_port), count: 1, ..Default::default()
                             });
@@ -682,7 +706,8 @@ impl Watch {
                     if let Some(entry) = by_pid.get(pid).filter(|e| e.proc.started > 0 && !info.exe.is_empty()) {
                         crate::protection::observe(cc_protocol::contracts::system::SecurityObservation {
                             at: now, source: "connection watcher".into(), kind: "connection".into(), severity: "info".into(),
-                            summary: format!("{} has a {} connection with {} on port {}. Observed byte counters: {} received, {} sent; connection initiation and payload are not observed.", info.app, flow.proto, flow.remote, flow.remote_port, flow.bytes_in, flow.bytes_out),
+                            summary: format!("{} has a {} connection with {} on port {} ({}). Observed byte counters: {} received, {} sent; connection initiation and payload are not observed.", info.app, flow.proto, flow.remote, flow.remote_port, owner.label(), flow.bytes_in, flow.bytes_out),
+                            rule: "network.connection".into(),
                             subject: format!("process:{}:{}", pid, entry.proc.started), pid: Some(*pid), process_started: Some(entry.proc.started),
                             parent_pid: Some(entry.proc.ppid), executable: Some(info.exe.clone()), remote: Some(flow.remote.to_string()), port: Some(flow.remote_port), count: 1, ..Default::default()
                         });
@@ -697,14 +722,16 @@ impl Watch {
                         note(&info.app, "network", "low", format!("{} connected to {to}, which is on {list}. That list is context, not proof of malice.", info.app));
                     } else if MAJOR.contains(&owner.asn) {
                         // Cloud addresses change hands, so a listed one there is noted, not alerted.
-                        note(&info.app, "network", "medium", format!("{} connected to {to}, a cloud address that is on {list}.", info.app));
+                        note(&info.app, "network", "medium", format!("{} (pid {pid}) connected to {to}, a cloud address that is on {list}.{trail}", info.app));
                     } else {
                         found.push(candidate(
                             format!("network:threat:{}:{}", info.key, flow.remote),
                             "high",
-                            format!("{who} connected to {to}, an address on {list}."),
+                            format!("{who} connected to {to}, an address on {list}. It sent {} KB on this connection.", flow.bytes_out / 1024),
+                            &trail,
                             *pid,
                             &info.exe,
+                            Some(flow),
                         ));
                     }
                 }
@@ -712,16 +739,18 @@ impl Watch {
                     found.push(candidate(
                         format!("network:telegram:{}", info.key),
                         "high",
-                        format!("{who} is talking to Telegram's servers ({to}). It is not Telegram, and stealers send what they take there."),
+                        format!("{who} is talking to Telegram's servers ({to}) and sent {} KB. It is not Telegram, and stealers send what they take there.", flow.bytes_out / 1024),
+                        &trail,
                         *pid,
                         &info.exe,
+                        Some(flow),
                     ));
                 }
                 if ODD_PORTS.contains(&flow.remote_port) {
-                    note(&info.app, "network", "medium", format!("{} connected out to port {} at {}, a port used by backdoors and IRC bots.", info.app, flow.remote_port, owner.label()));
+                    note(&info.app, "network", "medium", format!("{} (pid {pid}) connected out to {} on port {}, {}, a port used by backdoors and chat-controlled bots.{trail}", info.app, flow.remote, flow.remote_port, owner.label()));
                 }
                 if [25, 465, 587].contains(&flow.remote_port) && !MAIL_APPS.contains(&info.app.as_str()) && !info.key.starts_with("apple:") {
-                    note(&info.app, "network", "medium", format!("{} sent mail directly (port {}) to {}; it is not a mail app.", info.app, flow.remote_port, owner.label()));
+                    note(&info.app, "network", "medium", format!("{} (pid {pid}) sent mail directly to {} on port {}, {}; it is not a mail app.{trail}", info.app, flow.remote, flow.remote_port, owner.label()));
                 }
 
                 // Firsts: learnt quietly the first week, then noted in the digest.
@@ -756,9 +785,11 @@ impl Watch {
                             found.push(candidate(
                                 format!("network:beacon:{}:{}", info.key, flow.remote),
                                 "warn",
-                                format!("{who} opens a new connection to {to} like clockwork, about every {every} (regularity {:.0}%); malware calls home this way.", score * 100.0),
+                                format!("{who} opens a new connection to {to} on a steady timer, about every {every} ({:.0}% regular); malware calls home this way.", score * 100.0),
+                                &trail,
                                 *pid,
                                 &info.exe,
+                                Some(flow),
                             ));
                         } else {
                             note(&info.app, "network", "info", format!("{} checks in with {} about every {every}, a timer like most signed software has.", info.app, owner.label()));
@@ -777,6 +808,10 @@ impl Watch {
                 let threshold = upload_threshold(&profile.hours);
                 if profile.hour_bytes > threshold {
                     remember_program(&profile.name, &profile.exe);
+                    let mut to: Vec<(&String, &u64)> = profile.hour_to.iter().filter(|(_, b)| **b >= MB).collect();
+                    to.sort_by(|a, b| b.1.cmp(a.1));
+                    let to: Vec<String> = to.iter().take(4).map(|(net, bytes)| format!("{net} {} MB", **bytes / MB)).collect();
+                    let who: Vec<&str> = profile.hour_who.iter().take(2).map(|(_, w)| w.as_str()).collect();
                     found.push(Candidate {
                         key: format!("network:upload:{key}:{hour}"),
                         alert: Alert {
@@ -784,11 +819,14 @@ impl Watch {
                             severity: "high".into(),
                             // The program, so triage can read its signer, place and age.
                             path: (!profile.exe.is_empty()).then(|| profile.exe.clone()),
+                            pid: profile.hour_who.last().map(|(pid, _)| *pid),
                             text: format!(
-                                "{} has uploaded {} MB to the internet this hour, far above its usual (the line is {} MB an hour). Data may be leaving this Mac.",
+                                "{} has uploaded {} MB to the internet this hour, far above its usual (the line is {} MB an hour). Sent by: {}. To: {}.",
                                 profile.name,
                                 profile.hour_bytes / MB,
-                                threshold / MB
+                                threshold / MB,
+                                if who.is_empty() { "not recorded".to_owned() } else { who.join("; ") },
+                                if to.is_empty() { "not recorded".to_owned() } else { to.join(", ") }
                             ),
                             actions: vec!["show".into()],
                             ..Default::default()
@@ -892,15 +930,18 @@ fn who(info: &ProcInfo, pid: u32, run: Option<&str>) -> String {
     }
 }
 
-fn candidate(key: String, severity: &str, text: String, pid: u32, exe: &str) -> Candidate {
+/// A network alert: its sentence, then the process's trail; the destination in its own fields.
+fn candidate(key: String, severity: &str, text: String, trail: &str, pid: u32, exe: &str, to: Option<&Flow>) -> Candidate {
     Candidate {
         key,
         alert: Alert {
             kind: "network".into(),
             severity: severity.into(),
-            text,
+            text: format!("{text}{trail}"),
             pid: Some(pid),
             path: (!exe.is_empty()).then(|| exe.to_owned()),
+            remote: to.map(|f| f.remote.to_string()),
+            port: to.map(|f| f.remote_port),
             actions: vec!["show".into(), "kill".into()],
             ..Default::default()
         },
@@ -928,6 +969,8 @@ fn roll(profile: &mut Profile, hour: u64, trust: &str) {
     }
     profile.hour = hour;
     profile.hour_bytes = 0;
+    profile.hour_who.clear();
+    profile.hour_to.clear();
 }
 
 fn median(values: &mut [u64]) -> u64 {
