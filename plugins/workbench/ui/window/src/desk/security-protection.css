@@ -109,7 +109,8 @@
 .ct-sec-facts ul{margin:4px 0 0;padding-left:16px;font-family:var(--mono, ui-monospace, monospace);font-size:11px;color:var(--ink-2);}
 .ct-sec-do{display:flex;flex-direction:column;gap:6px;margin:8px 0;}
 .ct-sec-do code{font:12px/1.5 var(--font-mono);color:var(--ink);background:var(--rubric-wash);padding:6px 8px;border-left:2px solid var(--rubric);white-space:pre-wrap;word-break:break-all;}
-.ct-sec-mode .ct-sec-segs{display:inline-flex;gap:2px;}
+.ct-sec-mode{padding-left:46px;}
+.ct-sec-mode .ct-sec-segs{display:flex;gap:2px;margin-top:6px;}
 .ct-sec-hits{width:56px;height:12px;fill:var(--counter);}
 .ct-sec-row.high .ct-sec-hits{fill:var(--rubric-lift);}
 .ct-sec-row-main{display:flex;flex-direction:column;gap:2px;min-width:0;}

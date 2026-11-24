@@ -1025,7 +1025,7 @@ impl Store {
             exceptions: self.exceptions.clone(),
             deep_install_command: None,
             deep_service: false,
-            packet_capture_help: "Packet monitoring needs access to macOS BPF capture devices. CT never requests sudo automatically. If unavailable, connection watching still runs; scan detection does not. Capture observes selected interface metadata, without packet payload retention.".into(),
+            packet_capture_help: "Reads packet headers, never their contents. macOS lets CT read them only after you grant access; until then connections are still watched, scans are not.".into(),
             visibility: "This Mac and explicitly configured local sensor logs. Other devices' unicast traffic and probes stopped at your router are not automatically visible. Packet loss, sleep, VPNs and missing permissions can leave gaps; no findings is not an all-clear.".into(),
         }
     }

@@ -766,14 +766,14 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
         </div>}
         <p className="ct-protection-meta">{date(sensor.last_at) ? <time dateTime={iso(sensor.last_at)} title={time(sensor.last_at)}>Last seen {ago(sensor.last_at)}</time> : 'Nothing seen yet'}{sensor.dropped > 0 && <span className="ct-warn"> · {count(sensor.dropped)} events lost</span>}</p>
       </li>)}</ul>
-      {toggle('packet_watch', 'Watch for network scans', 'Packet metadata, when macOS allows capture.')}
+      {toggle('packet_watch', 'Watch for network scans', status!.packet_capture_help)}
       {toggle('deep_watch', 'Read deep activity events', 'Needs the native sensor: turning this on installs it once.')}
       {toggle('investigate', 'Investigate with local AI', 'Read-only checks for what the quick look cannot settle. The model never acts.')}
       <div className="ct-sec-switch ct-sec-mode">
-        <span className="ct-sec-segs" role="group" aria-label="Triage with local AI">{TRIAGE_MODES.map(([mode, label]) => <button key={mode} type="button" className={`ct-seg${(config.triage ?? 'on') === mode ? ' on' : ''}`} aria-pressed={(config.triage ?? 'on') === mode} disabled={configurationDisabled} onClick={() => void configure({ triage: mode })}>{label}</button>)}</span>
-        <span>Triage with local AI<small>{TRIAGE_MODES.find(([mode]) => mode === (config.triage ?? 'on'))?.[2]} Hard evidence is never filed away.</small></span>
+        <span>Triage with local AI<small>{TRIAGE_MODES.find(([mode]) => mode === (config.triage ?? 'on'))?.[2]} Hard evidence is never filed away.</small>
+          <span className="ct-sec-segs" role="group" aria-label="Triage with local AI">{TRIAGE_MODES.map(([mode, label]) => <button key={mode} type="button" className={`ct-seg${(config.triage ?? 'on') === mode ? ' on' : ''}`} aria-pressed={(config.triage ?? 'on') === mode} disabled={configurationDisabled} onClick={() => void configure({ triage: mode })}>{label}</button>)}</span>
+        </span>
       </div>
-      {status!.packet_capture_help && <p className="ct-asec-note" dir="auto">{status!.packet_capture_help}</p>}
       <details className="ct-protection-setup">
         <summary>Deep activity capture</summary>
         {status!.deep_service ? <p className="ct-asec-note">The sensor service is installed. It starts when the Mac starts, and CT reads its events while deep activity events are on. Nothing to run.</p>
