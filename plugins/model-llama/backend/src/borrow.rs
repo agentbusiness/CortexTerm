@@ -22,8 +22,8 @@ pub struct Lender {
     pub plugin: String,
 }
 
-/// A reachable member's model to serve here, for a machine without a usable GPU: a `coding` one
-/// before an `office` one, and another app's on this machine before another computer's.
+/// A reachable member's office model to serve here, for a machine without a usable GPU, another
+/// app's on this machine before another computer's.
 pub async fn look(ctx: &Ctx) -> Option<Lender> {
     let peers = tokio::time::timeout(Duration::from_secs(3), ctx.call("mesh.peers", json!({}))).await.ok()?.ok()?;
     let peers: PeersResult = serde_json::from_value(peers).ok()?;
@@ -34,20 +34,18 @@ pub async fn look(ctx: &Ctx) -> Option<Lender> {
         .filter_map(|peer| {
             let card = peer.card?;
             let software = card.software;
-            // The member's best model for this app: `coding`, then `office`, then `smalloffice`.
+            // CortexTerm runs on an office model only: `office`, then `smalloffice`; never `coding`.
             let ranked = |model: &cc_protocol::contracts::mesh::ModelCard| {
-                if model.tags.iter().any(|tag| tag == tags::CODING) {
+                if model.tags.iter().any(|tag| tag == tags::OFFICE) {
                     Some(0)
-                } else if model.tags.iter().any(|tag| tag == tags::OFFICE) {
-                    Some(1)
                 } else if model.tags.iter().any(|tag| tag == tags::SMALL_OFFICE) {
-                    Some(2)
+                    Some(1)
                 } else {
                     None
                 }
             };
             let (rank, model) = card.models.into_iter().filter_map(|model| ranked(&model).map(|rank| (rank, model))).min_by_key(|(rank, _)| *rank)?;
-            let rank = if peer.member.local { rank } else { rank + 3 };
+            let rank = if peer.member.local { rank } else { rank + 2 };
             Some((rank, Lender { node: peer.member.node, name: peer.member.name, software, model_id: model.model_id, plugin: model.plugin }))
         })
         .collect();

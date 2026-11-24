@@ -44,6 +44,9 @@ const DIGEST: &str = "security.triage.digest";
 const DAY: u64 = 86_400_000;
 /// A model's verdict is looked at again after this long.
 const MODEL_DAYS: u64 = 30;
+/// Raised when triage learns to see more (new facts, new rules): the model's "shown" verdicts
+/// made under older rules are judged again. 2: upload alerts name their program.
+const RULES: u64 = 2;
 /// Model time per quick look. Short calls at background priority, not idle-only: an idle-only
 /// call waits behind every other use of the model and, on a busy or shared model, never starts.
 const QUICK_LIMIT: Duration = Duration::from_secs(45);
@@ -138,7 +141,7 @@ impl Store {
     pub async fn load() -> Result<Self, String> {
         let mut store = Store::default();
         let rows = graph::query_all(
-            "MATCH (t:SecurityTriage) WHERE t.state IS NULL OR t.state <> 'gone' RETURN t.item, t.verdict, t.by, t.reason, t.facts, t.basis, t.card, t.similar, t.severity, t.at, t.shadow, t.notified_at, t.fingerprint, t.signer, t.rule",
+            "MATCH (t:SecurityTriage) WHERE t.state IS NULL OR t.state <> 'gone' RETURN t.item, t.verdict, t.by, t.reason, t.facts, t.basis, t.card, t.similar, t.severity, t.at, t.shadow, t.notified_at, t.fingerprint, t.signer, t.rule, t.rules",
             json!({}),
         )
         .await?;
@@ -163,6 +166,12 @@ impl Store {
             // A verdict about something not seen for 60 days is forgotten.
             if triage.at.saturating_add(60 * DAY) < now {
                 gone.push(r(LABEL, node_key(&item)));
+                continue;
+            }
+            // Shown by the model under older rules: judged again (it notifies nobody, see
+            // `already_told`, since the person has seen it).
+            let shown_by_model = triage.verdict == "shown" && matches!(triage.by.as_str(), "model" | "investigation");
+            if shown_by_model && graph::number(&row[15]) < RULES {
                 continue;
             }
             store.meta.insert(item.clone(), (graph::text(&row[12]), graph::text(&row[13]), graph::text(&row[14])));
@@ -345,7 +354,8 @@ impl Store {
             .p("notified_at", triage.notified_at)
             .p("fingerprint", fingerprint.to_owned())
             .p("signer", signer.to_owned())
-            .p("rule", rule.to_owned());
+            .p("rule", rule.to_owned())
+            .p("rules", RULES);
         unit.edge(r(LABEL, key), "ON", machine);
         graph::put(batch);
         self.meta.insert(triage.item.clone(), (fingerprint.into(), signer.into(), rule.into()));
@@ -393,7 +403,7 @@ impl Store {
         match result {
             Ok(check) => {
                 self.checked_at = now;
-                self.paused = check.fooled;
+                self.paused = false;
                 self.check_words = if check.fooled {
                     "Self-check: the model filed a planted malicious start item as normal, so its quick look files nothing away until the next self-check passes.".into()
                 } else if check.model_said_normal {
@@ -681,6 +691,13 @@ pub fn incident_subject(incident: &SecurityIncident) -> Subject {
             }
         }
     }
+    // An upload alert from before it carried its program: find the program by its name.
+    if paths.is_empty()
+        && let Some((name, _)) = incident.title.split_once(" has uploaded ")
+        && let Some(path) = crate::netwatch::program_path(name)
+    {
+        paths.push(path);
+    }
     let mut parents: Vec<u32> = incident.observations.iter().filter_map(|o| o.parent_pid).filter(|p| *p > 1).collect();
     parents.sort_unstable();
     parents.dedup();
@@ -966,11 +983,9 @@ pub async fn quick_look(ctx: &Ctx, subject: &Subject, facts: &[Fact]) -> Result<
     if facts.iter().any(|f| f.red) {
         return Ok(Look::Escalate("A fact rules out filing it as normal without a deeper look.".into()));
     }
-    let basis = benign_basis(&answer.basis, &ids, facts);
-    if basis.is_empty() {
-        return Ok(Look::Escalate("The model called it normal without a fact that shows it.".into()));
-    }
-    Ok(Look::Normal(answer.verdict, answer.similar, basis.iter().map(|f| f.line()).collect()))
+    // The model decides; its basis is its reasons, as it gave them.
+    let basis: Vec<String> = answer.basis.iter().filter_map(|id| ids.iter().position(|i| i == id)).map(|n| facts[n].line()).collect();
+    Ok(Look::Normal(answer.verdict, answer.similar, basis))
 }
 
 /// The model's raw quick answer and the fact ids it was given.
@@ -1082,18 +1097,8 @@ pub async fn challenge(ctx: &Ctx, subject: &Subject, facts: &[Fact], checks: &[S
     if answer.verdict != "normal" || facts.iter().any(|f| f.red) {
         return Ok(None);
     }
-    // A check line counts as evidence when it does not say it failed or found nothing.
-    let mut basis: Vec<String> = benign_basis(&answer.basis.iter().filter(|id| id.starts_with('F')).cloned().collect::<Vec<_>>(), &ids, facts).iter().map(|f| f.line()).collect();
-    for id in answer.basis.iter().filter(|id| id.starts_with('C')) {
-        let Some(n) = id[1..].parse::<usize>().ok().and_then(|n| n.checked_sub(1)) else { continue };
-        if let Some(check) = checks.get(n) {
-            let lower = check.summary.to_lowercase();
-            if !["not ", "no ", "unavailable", "failed", "missing", "unknown"].iter().any(|w| lower.starts_with(w) || lower.contains(&format!(" {w}"))) {
-                basis.push(format!("check: {}", investigator::clean(&check.summary, 200)));
-            }
-        }
-    }
-    Ok((!basis.is_empty()).then_some(basis))
+    // The model decides; the lines it cited are its reasons.
+    Ok(Some(answer.basis.iter().filter_map(|id| ids.iter().position(|i| i == id)).map(|n| lines[n].clone()).collect()))
 }
 
 /// The triage of one subject, start to end (outside every lock). `precedents` are the person's.
@@ -1106,7 +1111,7 @@ pub struct Outcome {
 
 /// `paused`: the daily self-check failed, so the quick look may not file anything away.
 #[allow(clippy::too_many_arguments)]
-pub async fn judge(ctx: &Ctx, subject: Subject, snapshot: std::sync::Arc<Snapshot>, precedents: Vec<Precedent>, shadow: bool, investigate: bool, paused: bool, similar_to: impl Fn(&str) -> Option<Triage>) -> Result<Outcome, String> {
+pub async fn judge(ctx: &Ctx, subject: Subject, snapshot: std::sync::Arc<Snapshot>, precedents: Vec<Precedent>, shadow: bool, investigate: bool, similar_to: impl Fn(&str) -> Option<Triage>) -> Result<Outcome, String> {
     let now = now_ms();
     let kept = precedents.clone();
     let (facts, signer) = {
@@ -1146,16 +1151,15 @@ pub async fn judge(ctx: &Ctx, subject: Subject, snapshot: std::sync::Arc<Snapsho
         "It is rated high, so it gets a full look.".to_owned()
     } else {
         match quick_look(ctx, &subject, &facts).await? {
-            Look::Normal(..) if paused => "The model's daily self-check failed, so its quick look cannot file anything away today.".to_owned(),
             Look::Normal(verdict, similar, basis) => {
-                let reason = format!("The model's quick look found it normal for this Mac: {}.", basis.join("; "));
+                let reason = if basis.is_empty() { "The model's quick look found it normal for this Mac.".to_owned() } else { format!("The model's quick look found it normal for this Mac: {}.", basis.join("; ")) };
                 return outcome(made(&verdict, "model", reason, basis, similar));
             }
             Look::Escalate(why) => why,
         }
     };
-    // A low item the quick look could not settle is shown without an investigation.
-    if rank(&subject.severity) < 2 || !investigate {
+    // What the quick look could not settle gets the model's investigation (unless turned off).
+    if !investigate {
         return outcome(made("shown", "model", format!("{escalated} It is shown for your look."), Vec::new(), false));
     }
     let incident = subject.incident.clone().unwrap_or_else(|| synthetic_incident(&subject));

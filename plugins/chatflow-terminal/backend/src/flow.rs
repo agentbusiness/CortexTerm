@@ -444,7 +444,7 @@ impl Flow {
             Ok(counted) => counted.tokens,
             Err(_) => 0,
         };
-        let params = json!({"kind": "model", "tags": [tags::CODING, tags::OFFICE, tags::SMALL_OFFICE], "session_id": session, "foreground": true, "wait": true, "tokens": tokens});
+        let params = json!({"kind": "model", "tags": [tags::OFFICE, tags::SMALL_OFFICE], "session_id": session, "foreground": true, "wait": true, "tokens": tokens});
         let Ok(mut call) = ctx.call_stream(mesh_methods::CLAIM, params) else { return Ok(()) };
         loop {
             tokio::select! {
@@ -471,7 +471,7 @@ impl Flow {
     /// another computer, `via` names it). All of it is what the claim and the cards declare.
     async fn note_used(&self, placement: Option<Placement>) {
         let Ok(ctx) = self.ctx() else { return };
-        let ranked = |model_tags: &[String]| [tags::CODING, tags::OFFICE, tags::SMALL_OFFICE].iter().find(|tag| model_tags.iter().any(|have| have == *tag)).map(|tag| (*tag).to_owned()).unwrap_or_default();
+        let ranked = |model_tags: &[String]| [tags::OFFICE, tags::SMALL_OFFICE].iter().find(|tag| model_tags.iter().any(|have| have == *tag)).map(|tag| (*tag).to_owned()).unwrap_or_default();
         let used = match placement.as_ref().and_then(|placement| placement.node.clone().map(|node| (node, placement))) {
             Some((node, placement)) => {
                 let peers = ctx.call(mesh_methods::PEERS, json!({})).await.and_then(parse_params::<PeersResult>).map(|result| result.peers).unwrap_or_default();

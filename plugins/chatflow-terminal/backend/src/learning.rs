@@ -1016,7 +1016,7 @@ pub async fn background(flow: &Flow, purpose: &str, messages: Vec<ChatMessage>, 
         Err(_) => 0,
     };
     let claimed = async {
-        let mut claim = ctx.call_stream(mesh::CLAIM, json!({"kind": "model", "tags": [tags::CODING, tags::OFFICE, tags::SMALL_OFFICE], "session_id": key, "foreground": false, "wait": true, "tokens": tokens}))?;
+        let mut claim = ctx.call_stream(mesh::CLAIM, json!({"kind": "model", "tags": [tags::OFFICE, tags::SMALL_OFFICE], "session_id": key, "foreground": false, "wait": true, "tokens": tokens}))?;
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => { claim.cancel(); return Err(RpcError::cancelled()); },

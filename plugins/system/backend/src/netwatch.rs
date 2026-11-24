@@ -335,6 +335,7 @@ async fn load_state() -> Result<State, String> {
         let profile = state.apps.entry(trust).or_default();
         profile.name = graph::text(&row[1]);
         profile.exe = graph::text(&row[2]);
+        remember_program(&profile.name, &profile.exe);
         profile.signed = graph::text(&row[3]);
         profile.team = graph::text(&row[4]);
         let asn: u32 = graph::text(&row[5]).parse().unwrap_or(0);
@@ -775,11 +776,14 @@ impl Watch {
                 }
                 let threshold = upload_threshold(&profile.hours);
                 if profile.hour_bytes > threshold {
+                    remember_program(&profile.name, &profile.exe);
                     found.push(Candidate {
                         key: format!("network:upload:{key}:{hour}"),
                         alert: Alert {
                             kind: "network".into(),
                             severity: "high".into(),
+                            // The program, so triage can read its signer, place and age.
+                            path: (!profile.exe.is_empty()).then(|| profile.exe.clone()),
                             text: format!(
                                 "{} has uploaded {} MB to the internet this hour, far above its usual (the line is {} MB an hour). Data may be leaving this Mac.",
                                 profile.name,
@@ -1034,4 +1038,22 @@ pub async fn run(
             fire(candidate);
         }
     }
+}
+
+/// Program name -> its path, for alerts that name a program but carried no path (older ones).
+static PROGRAMS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> = std::sync::OnceLock::new();
+
+fn remember_program(name: &str, exe: &str) {
+    if name.is_empty() || exe.is_empty() {
+        return;
+    }
+    let mut map = PROGRAMS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() < 4096 || map.contains_key(name) {
+        map.insert(name.to_owned(), exe.to_owned());
+    }
+}
+
+/// The path of the program shown as `name` in network alerts, when known.
+pub fn program_path(name: &str) -> Option<String> {
+    PROGRAMS.get()?.lock().unwrap_or_else(|e| e.into_inner()).get(name).cloned()
 }
