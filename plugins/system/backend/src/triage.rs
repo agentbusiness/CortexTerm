@@ -108,6 +108,8 @@ pub struct Precedent {
 
 #[derive(Default)]
 pub struct Store {
+    /// Items filed by one of the person's decisions, since the app started.
+    learned: usize,
     items: HashMap<String, Triage>,
     /// Item -> the fingerprint, signer and rule of its triage (not on the wire).
     meta: HashMap<String, (String, String, String)>,
@@ -210,7 +212,10 @@ impl Store {
             self.pending.remove(&subject.item);
             return self.notify_once(&subject.item);
         }
-        if let Some(triage) = self.current(&subject) {
+        // "Shown as the check rated it" (the model could not look, or triage was off) is a
+        // fallback, not a verdict: once triage is on, it is judged again.
+        let fallback = mode != "off" && self.items.get(&subject.item).is_some_and(|t| t.by == "code" && t.verdict == "shown");
+        if let Some(triage) = self.current(&subject).filter(|_| !fallback) {
             if triage.filtered() || triage.verdict == "pending" {
                 return Gate::Quiet;
             }
@@ -221,7 +226,8 @@ impl Store {
             self.save(triage, &subject.fingerprint, "", &subject.rule);
             return if rank(&subject.severity) >= 3 { self.notify_once(&subject.item) } else { Gate::Quiet };
         }
-        let pending = Triage { verdict: "pending".into(), by: "code".into(), reason: "Waiting for its triage.".into(), ..self.base(&subject, now) };
+        let notified_at = self.notified(&subject);
+        let pending = Triage { verdict: "pending".into(), by: "code".into(), reason: "Waiting for its triage.".into(), notified_at, ..self.base(&subject, now) };
         self.items.insert(subject.item.clone(), pending);
         // Already waiting: keep its place and retry time unless it changed meanwhile.
         let (since, retry_at, failures) = match self.pending.get(&subject.item) {
@@ -231,6 +237,51 @@ impl Store {
         };
         self.pending.insert(subject.item.clone(), Pending { subject, since, retry_at, failures });
         Gate::Hold
+    }
+
+    /// What triage knows of an item for learning: (card, rule, signer).
+    pub fn about(&self, item: &str) -> Option<(String, String, String)> {
+        let triage = self.items.get(item)?;
+        let (_, signer, rule) = self.meta.get(item)?;
+        Some((triage.card.clone(), rule.clone(), signer.clone()))
+    }
+
+    /// The person decided about an item like these: every other item with the same card, check
+    /// and signer is forgotten, so the next pass judges it again with the decision in hand. After
+    /// "it is fine" the ones still shown go again; after "this was wrong" the ones filed as normal
+    /// do. The person's own verdicts stay. Returns how many go again.
+    pub fn learn(&mut self, card: &str, rule: &str, signer: &str, benign: bool) -> usize {
+        if !learnable(signer) || rule.is_empty() {
+            return 0;
+        }
+        let again: Vec<String> = self
+            .items
+            .iter()
+            .filter(|(item, t)| {
+                t.by != "person" && t.verdict != "pending" && t.card == card && t.filtered() != benign
+                    && self.meta.get(*item).is_some_and(|(_, s, r)| s == signer && r == rule)
+            })
+            .map(|(item, _)| item.clone())
+            .collect();
+        for item in &again {
+            self.items.remove(item);
+            self.meta.remove(item);
+            graph::retire(vec![r(LABEL, node_key(item))], "judged again after a decision");
+        }
+        again.len()
+    }
+
+    /// The person has seen this item already: its verdict notifies nobody.
+    pub fn already_told(&mut self, item: &str) {
+        if let Some(triage) = self.items.get_mut(item).filter(|t| t.notified_at == 0) {
+            triage.notified_at = now_ms();
+        }
+    }
+
+    /// When the person was told about this item as it is now (0: not yet).
+    fn notified(&self, subject: &Subject) -> u64 {
+        let same = self.meta.get(&subject.item).is_some_and(|(fingerprint, _, _)| *fingerprint == subject.fingerprint);
+        if same { self.items.get(&subject.item).map_or(0, |t| t.notified_at) } else { 0 }
     }
 
     /// The item's triage, when it still holds for what the item is now.
@@ -244,12 +295,13 @@ impl Store {
         (same && not_worse && fresh).then_some(triage)
     }
 
-    /// Notify about an item that is shown: hard evidence, survived the investigation at medium or
-    /// worse, or high.
+    /// Notify only about what needs the person: hard evidence (always, through `gate`) and a high
+    /// item the model could not explain. A medium item that stays suspicious is orange in the
+    /// list and pings nobody.
     fn worth_notifying(triage: &Triage) -> bool {
         // In shadow mode a verdict hides nothing: it is treated as shown.
         let shown = triage.verdict == "shown" || triage.shadow;
-        shown && (rank(&triage.severity) >= 3 || triage.by == "investigation" && rank(&triage.severity) >= 2)
+        shown && rank(&triage.severity) >= 3
     }
 
     fn notify_once(&mut self, item: &str) -> Gate {
@@ -319,8 +371,8 @@ impl Store {
         let waiting = self.pending.len();
         let state = if self.failures > 0 && self.judged == 0 && waiting > 0 { "degraded" } else { "active" };
         let mut words = format!(
-            "{} checked since the app started ({} filed as normal), {} waiting.",
-            self.judged, self.filed, waiting
+            "{} checked since the app started ({} filed as normal, {} of them from your decisions), {} waiting.",
+            self.judged, self.filed, self.learned, waiting
         );
         if self.last_at > 0 {
             words.push_str(&format!(" Last verdict {} min ago.", now_ms().saturating_sub(self.last_at) / 60_000));
@@ -386,17 +438,21 @@ impl Store {
     }
 
     /// A triage is done: keep it; Notify when it is shown and worth it.
-    pub fn finish(&mut self, subject: &Subject, triage: Triage, signer: &str) -> Gate {
+    pub fn finish(&mut self, subject: &Subject, mut triage: Triage, signer: &str) -> Gate {
         // Changed while it was judged: judge again.
         if self.pending.get(&subject.item).is_some_and(|p| p.subject.fingerprint != subject.fingerprint) {
             return Gate::Quiet;
         }
         self.pending.remove(&subject.item);
+        triage.notified_at = self.items.get(&subject.item).map_or(0, |t| t.notified_at);
         let verdict = triage.verdict.clone();
         self.judged += 1;
         self.last_at = now_ms();
         if triage.filtered() {
             self.filed += 1;
+        }
+        if triage.by == "learned" {
+            self.learned += 1;
         }
         tracing::warn!("triage: {} ({}, {}) -> {} by {}: {}", subject.name, subject.card, triage.severity, verdict, triage.by, crate::util::shorten(&triage.reason, 160));
         graph::append(
@@ -702,7 +758,7 @@ fn path_class(path: &str) -> &'static str {
 /// Words that give orders to whoever reads them: a finding's own text should never contain them.
 fn gives_orders(text: &str) -> bool {
     let lower = text.to_lowercase();
-    ["ignore previous", "ignore all", "ignore the", "you are ", "system prompt", "as an ai", "mark as safe", "mark this as", "classify this", "verdict", "is safe and", "do not report", "approve this", "assistant:", "expected\"", "false_alarm"].iter().any(|w| lower.contains(w))
+    ["ignore previous", "ignore all", "ignore the", "you are ", "system prompt", "as an ai", "mark as safe", "mark this as", "classify this", "verdict", "is safe and", "do not report", "approve this", "assistant:", "expected\"", "false_alarm", "reviewer", "answer expected", "answer normal", "it is expected here"].iter().any(|w| lower.contains(w))
 }
 
 /// Gather the facts (blocking: reads signatures and file metadata).
@@ -723,7 +779,8 @@ pub fn facts(subject: &Subject, snapshot: &Snapshot, precedents: &[Precedent]) -
         let sig = crate::codesign::check(Path::new(path));
         let notarized = crate::codesign::notarized(Path::new(path));
         let class = path_class(path);
-        let odd_place = matches!(class, "temp" | "downloads" | "shared" | "home_hidden");
+        let hidden = class != "toolchain" && path.split('/').any(|part| part.len() > 1 && part.starts_with('.'));
+        let odd_place = hidden || matches!(class, "temp" | "downloads" | "shared" | "home_hidden");
         let (value, benign) = if sig.apple {
             ("apple".to_owned(), true)
         } else if sig.status == "signed" && !sig.team_id.is_empty() {
@@ -794,6 +851,24 @@ fn day(at: u64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// A signer precise enough to learn from: Apple or a developer's team ID, never "unsigned".
+fn learnable(signer: &str) -> bool {
+    !signer.is_empty() && !matches!(signer, "none" | "unknown" | "unsigned" | "invalid" | "adhoc" | "ad-hoc")
+}
+
+/// The person's newest decision about an item like this (same card, check and signer), when it
+/// says it is fine, no later "this was wrong" says otherwise, and no fact rules it out.
+fn decided<'a>(subject: &Subject, signer: &str, facts: &[Fact], precedents: &'a [Precedent]) -> Option<&'a Precedent> {
+    if !learnable(signer) || subject.rule.is_empty() || facts.iter().any(|f| f.red) {
+        return None;
+    }
+    let newest = precedents
+        .iter()
+        .filter(|p| p.card == subject.card && p.rule == subject.rule && p.signer == signer)
+        .max_by_key(|p| p.at)?;
+    newest.benign.then_some(newest)
 }
 
 /// Code alone files it as normal: a program card, no worse than medium, and Apple's program, or a
@@ -867,6 +942,10 @@ fn benign_basis<'a>(basis: &[String], ids: &[String], facts: &'a [Fact]) -> Vec<
         if facts[n].benign {
             out.push(&facts[n]);
         }
+    }
+    // Age alone never shows it is normal: malware sits still for weeks too.
+    if out.iter().all(|f| f.name == "seen_days") {
+        return Vec::new();
     }
     out
 }
@@ -1029,6 +1108,7 @@ pub struct Outcome {
 #[allow(clippy::too_many_arguments)]
 pub async fn judge(ctx: &Ctx, subject: Subject, snapshot: std::sync::Arc<Snapshot>, precedents: Vec<Precedent>, shadow: bool, investigate: bool, paused: bool, similar_to: impl Fn(&str) -> Option<Triage>) -> Result<Outcome, String> {
     let now = now_ms();
+    let kept = precedents.clone();
     let (facts, signer) = {
         let subject = subject.clone();
         let snapshot = snapshot.clone();
@@ -1052,6 +1132,10 @@ pub async fn judge(ctx: &Ctx, subject: Subject, snapshot: std::sync::Arc<Snapsho
     let outcome = |triage| Ok(Outcome { triage, signer: signer.clone(), investigation: None });
     if let Some(reason) = trusted_by_code(&subject, &facts) {
         return outcome(made("expected", "code", reason, Vec::new(), false));
+    }
+    // The person's own decision about the same kind of item settles it, before any model.
+    if let Some(p) = decided(&subject, &signer, &facts, &kept) {
+        return outcome(made("expected", "learned", format!("You {} on {}; this is the same check by the same signer.", p.text.trim_start_matches("you "), day(p.at)), Vec::new(), false));
     }
     if let Some(earlier) = similar_to(&signer).filter(|_| !facts.iter().any(|f| f.red)) {
         let reason = format!("Like an item the model filed as normal on {} (same check and signer) [{}].", day(earlier.at), earlier.item);

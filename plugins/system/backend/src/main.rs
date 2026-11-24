@@ -286,7 +286,8 @@ impl Shared {
         let Some(ctx) = self.ctx.get().cloned() else { return true };
         ctx.publish(topics::ALERT, serde_json::to_value(&alert).unwrap_or(Value::Null));
         if notify {
-            let kind = if alert.kind == "security-incident" { notify::kinds::BLOCKED } else { notify::kinds::INFO };
+            // Only what needs the person: a failed schedule, a disk about to be full, a security item.
+            let kind = if alert.kind == "schedule" { notify::kinds::FAILED } else { notify::kinds::BLOCKED };
             Self::notify(&ctx, kind, title_of(&alert), alert.text.clone(), format!("system:{key}"), json!({"open": "system.alert", "id": alert.id}));
         }
         true
@@ -389,11 +390,12 @@ impl Shared {
             }
         }).collect();
         self.record_protection(observations);
-        self.triage_groups(report);
+        self.triage_groups(report, false);
     }
 
-    /// Every open sweep group rated low or worse goes to triage.
-    fn triage_groups(&self, report: &SweepReport) {
+    /// Every open sweep group rated low or worse goes to triage. `quiet`: they were shown already
+    /// (after a restart), so none notifies for it.
+    fn triage_groups(&self, report: &SweepReport, quiet: bool) {
         let mut groups: std::collections::BTreeMap<&str, Vec<&cc_protocol::contracts::system::Finding>> = Default::default();
         for f in report.findings.iter().filter(|f| !f.ignored && protection::rank(&f.severity) >= 1) {
             groups.entry(f.group.as_str()).or_default().push(f);
@@ -402,7 +404,14 @@ impl Shared {
             let item = protection::group_subject(group);
             let incident = lock(&self.protection).incidents().find(|i| i.key == item).cloned();
             if let Some(subject) = triage::group_subject(group, &findings, incident) {
-                self.gate(subject);
+                if quiet {
+                    let mode = lock(&self.protection).config.triage.clone();
+                    let mut store = lock(&self.triage);
+                    let _ = store.gate(subject.clone(), &mode);
+                    store.already_told(&subject.item);
+                } else {
+                    self.gate(subject);
+                }
             }
         }
     }
@@ -424,15 +433,56 @@ impl Shared {
                 out.push(triage::Precedent {
                     card: triage::card_of(&worst.kind, &worst.source, &worst.text).into(),
                     rule: worst.source.clone(),
-                    signer: String::new(),
+                    // Filled in below from the group's triage (outside the findings lock).
+                    signer: protection::group_subject(&decision.group),
                     text: format!("you decided {words} for {}", util::shorten(name, 60)),
                     benign: matches!(decision.verdict.as_str(), "expected" | "false_alarm"),
                     at: decision.at,
                 });
             }
         }
-        out.extend(lock(&self.triage).wrong().iter().cloned());
+        // A live incident the person dismissed: they said it is fine.
+        let dismissed: Vec<(String, String, u64)> = lock(&self.protection).incidents().filter(|i| i.state == "dismissed" && !i.key.starts_with("group:")).map(|i| (i.key.clone(), i.title.clone(), i.last_at)).collect();
+        {
+            let store = lock(&self.triage);
+            for p in out.iter_mut() {
+                p.signer = store.about(&p.signer).map(|(_, _, signer)| signer).unwrap_or_default();
+            }
+            for (key, title, at) in dismissed {
+                if let Some((card, rule, signer)) = store.about(&key) {
+                    out.push(triage::Precedent { card, rule, signer, text: format!("you dismissed \"{}\"", util::shorten(&title, 60)), benign: true, at });
+                }
+            }
+            out.extend(store.wrong().iter().cloned());
+        }
         out
+    }
+
+    /// Every open incident and sweep group to triage, quietly: what is still undecided joins the
+    /// queue (worst first, then oldest); a verdict only colours the list.
+    fn backlog(&self) {
+        let last = lock(&self.findings).last.clone();
+        let report = self.marked(last);
+        self.triage_groups(&report, true);
+        let mode = lock(&self.protection).config.triage.clone();
+        let open: Vec<_> = lock(&self.protection).incidents().filter(|i| i.state == "open" && !i.key.starts_with("group:")).cloned().collect();
+        let mut store = lock(&self.triage);
+        for incident in &open {
+            let _ = store.gate(triage::incident_subject(incident), &mode);
+            store.already_told(&incident.key);
+        }
+    }
+
+    /// The person decided about `item`: every open item like it is judged again with that
+    /// decision in hand (after "fine", the matching ones turn grey; after "wrong", they show).
+    fn learn_from(&self, item: &str, benign: bool) {
+        let about = lock(&self.triage).about(item);
+        let Some((card, rule, signer)) = about else { return };
+        let again = lock(&self.triage).learn(&card, &rule, &signer, benign);
+        if again > 0 {
+            tracing::warn!("triage: learning from your decision about {item}: {again} similar item(s) judged again");
+        }
+        self.backlog();
     }
 
     /// One triage, start to end; it notifies when triage says so.
@@ -543,6 +593,9 @@ impl Shared {
             if !params.verdict.is_empty() {
                 lock(&self.protection).dismiss(&protection::group_subject(&params.group));
             }
+            if matches!(params.verdict.as_str(), "expected" | "false_alarm") {
+                self.learn_from(&protection::group_subject(&params.group), true);
+            }
         }
         let report = lock(&self.findings).last.clone();
         Ok(self.marked(report))
@@ -640,10 +693,9 @@ impl Shared {
         for candidate in early {
             self.fire(candidate);
         }
-        // What the last sweep found and triage never settled is triaged now.
-        let last = lock(&self.findings).last.clone();
-        let report = self.marked(last);
-        self.triage_groups(&report);
+        // Every open incident and sweep group, also those from before triage existed, joins the
+        // queue.
+        self.backlog();
     }
 
     async fn load_all(&self) -> Result<String, String> {
@@ -1292,6 +1344,7 @@ async fn dispatch(shared: Arc<Shared>, method: &str, params: Value) -> Result<Va
                 lock(&shared.protection).incidents().find(|i| i.key == item).map(|i| i.title.clone()).unwrap_or_else(|| item.clone())
             });
             lock(&shared.triage).undo(&item, &util::shorten(&name, 80)).map_err(RpcError::invalid_params)?;
+            shared.learn_from(&item, false);
             Ok(json!({"ok": true}))
         }
         methods::PROTECTION_CONFIGURE => {
@@ -1335,6 +1388,12 @@ async fn dispatch(shared: Arc<Shared>, method: &str, params: Value) -> Result<Va
                 lock(&shared.protection).record(event, &shared.snapshot());
             } else {
                 lock(&shared.protection).action(&action).map_err(RpcError::invalid_params)?;
+                if action.action == "dismiss" {
+                    let key = lock(&shared.protection).incident(&action.id).map(|i| i.key);
+                    if let Some(key) = key {
+                        shared.learn_from(&key, true);
+                    }
+                }
             }
             if !graph::flush(Duration::from_secs(5)).await || memory_before != (graph::refused(), graph::dropped()) {
                 return Err(RpcError::new("unavailable", "The action completed in this session, but local memory has not acknowledged the update yet."));

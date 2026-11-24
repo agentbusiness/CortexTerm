@@ -66,7 +66,7 @@ const time = (at: number) => date(at)?.toLocaleString() ?? 'Not recorded';
 const iso = (at: number) => date(at)?.toISOString();
 const tone = (value: string) => ['high', 'warn', 'medium', 'low', 'info'].includes(value) ? value : 'info';
 /** Who triaged it, in the words of the pane. */
-const TRIAGED_BY: Record<string, string> = { code: 'BY CODE', model: "BY THE MODEL'S QUICK LOOK", investigation: 'AFTER AN INVESTIGATION', person: 'BY YOU' };
+const TRIAGED_BY: Record<string, string> = { code: 'BY CODE', model: "BY THE MODEL'S QUICK LOOK", investigation: 'AFTER AN INVESTIGATION', person: 'BY YOU', learned: 'LEARNED FROM YOUR DECISION' };
 const TRIAGE_MODES = [['on', 'ON', 'The model may file what it can show is normal; it shows grey.'], ['shadow', 'SHADOW', 'The model judges, nothing is hidden: compare before trusting it.'], ['off', 'OFF', 'Only code rates findings.']] as const;
 
 function stopTarget(incident: SecurityIncident): StopTarget | null {

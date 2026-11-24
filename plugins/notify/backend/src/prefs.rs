@@ -20,19 +20,19 @@ pub struct KindInfo {
 
 /// Every switchable kind, in the order the settings panel lists them.
 pub const KINDS: &[KindInfo] = &[
-    KindInfo { kind: kinds::DONE, label: "Run finished", description: "A conversation turn or an agent run finished.", default: true },
+    KindInfo { kind: kinds::DONE, label: "Run finished", description: "A conversation turn or an agent run finished.", default: false },
     KindInfo { kind: kinds::FAILED, label: "Run failed", description: "A run stopped with an error, with the reason.", default: true },
     KindInfo { kind: kinds::APPROVAL, label: "Approval needed", description: "A command (ask mode) waits for your approval.", default: true },
     KindInfo { kind: kinds::BLOCKED, label: "Agent blocked", description: "An agent cannot continue without you.", default: true },
-    KindInfo { kind: kinds::VERIFIED, label: "Contract verified", description: "A task's contract checks passed.", default: true },
+    KindInfo { kind: kinds::VERIFIED, label: "Contract verified", description: "A task's contract checks passed.", default: false },
     KindInfo { kind: kinds::VERIFY_FAILED, label: "Contract failed", description: "A task's contract checks failed, with the failing checks.", default: true },
     KindInfo { kind: kinds::CONFLICT, label: "Merge conflict", description: "Merging an agent's work conflicted and went back to it.", default: true },
-    KindInfo { kind: kinds::JOB, label: "Long job ended", description: "A background job that ran a while finished or failed.", default: true },
+    KindInfo { kind: kinds::JOB, label: "Long job ended", description: "A background job that ran a while finished or failed.", default: false },
     KindInfo { kind: kinds::SWAP_FAILED, label: "Plugin swap failed", description: "A hot-swap failed or was rolled back.", default: true },
-    KindInfo { kind: kinds::REPORT, label: "Report ready", description: "A report announced its result.", default: true },
-    KindInfo { kind: kinds::SPAWNED, label: "Agent started", description: "An agent was started on a task.", default: true },
-    KindInfo { kind: kinds::CANCELLED, label: "Run cancelled", description: "A run was cancelled or an agent was stopped.", default: true },
-    KindInfo { kind: kinds::INFO, label: "Other notices", description: "Anything else a plugin posts.", default: true },
+    KindInfo { kind: kinds::REPORT, label: "Report ready", description: "A report announced its result.", default: false },
+    KindInfo { kind: kinds::SPAWNED, label: "Agent started", description: "An agent was started on a task.", default: false },
+    KindInfo { kind: kinds::CANCELLED, label: "Run cancelled", description: "A run was cancelled or an agent was stopped.", default: false },
+    KindInfo { kind: kinds::INFO, label: "Other notices", description: "Anything else a plugin posts.", default: false },
 ];
 
 pub const DEFAULT_LONG_JOB_MS: u64 = 30_000;
