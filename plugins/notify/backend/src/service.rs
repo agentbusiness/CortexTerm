@@ -1157,8 +1157,9 @@ impl Notifier {
 
         let started = Instant::now();
         let mut scratch = History::default();
+        // A kind that is on by default, so the default preferences let it through.
         let mut sample = Notification {
-            kind: kinds::DONE.into(),
+            kind: kinds::FAILED.into(),
             title: "probe".into(),
             body: "one".into(),
             key: Some("probe-key".into()),
@@ -1173,7 +1174,7 @@ impl Notifier {
         let second = scratch.record(sample.clone(), "probe", 2_000, 60_000);
         let dedup_ok = matches!(first, Recorded::New(_)) && matches!(&second, Recorded::Updated { posted, .. } if posted.updates == 1) && scratch.len() == 1;
         let mut off = Prefs::default();
-        off.kinds.insert(kinds::DONE.into(), false);
+        off.kinds.insert(kinds::FAILED.into(), false);
         let gate_ok = self.suppression(&sample, &off).is_some() && self.suppression(&sample, &Prefs::default()).is_some() == self.looking_at("probe-session");
         checks.push(ProbeCheck {
             name: "dedup_and_gate".into(),
