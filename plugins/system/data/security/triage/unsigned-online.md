@@ -1,18 +1,14 @@
 An unsigned or ad-hoc program makes connections, uses an odd port or SMTP, or reached a new country.
 
-Means: Most programs online are signed by a known developer.
-Unsigned programs sending data out is how stealers and backdoors report home.
+Questions:
+- user_started: did the person start it? Yes when parent is terminal, editor, or agent or node, or what says it was started by a command the person ran or by zsh, bash, Terminal, an editor, Claude or Codex.
+- dev_place: is it in a development place? Yes when path_class is project, toolchain or homebrew.
+- odd_place: is it hidden or new? Yes when path_class is temp, home_hidden, user_library, downloads or shared, or seen_days is 0 to 2.
+- odd_port: does it use SMTP or an odd port? Yes when what shows port 25, 465 or 587.
+- known_maker: is it from a known maker? Yes when signer is a developer with notarized yes.
 
-Normal when:
-- signer adhoc, path_class toolchain or project, parent terminal, editor or agent (a program the person built, a dev server, a local MCP server).
-- signer adhoc, path_class homebrew, seen_days 7 or more, reputation known_file or unknown.
-- rule new country, signer a developer, notarized yes, seen_days 30 or more (a cloud server moved).
-
-Suspicious when:
-- path_class temp, home_hidden, user_library, downloads or shared, seen_days 0 to 2, running yes.
-- SMTP or an odd port, signer unsigned or adhoc, parent launchd or unknown.
-- parent browser or agent and path_class temp (a pasted command or tricked agent started a download).
-
-Never decide from: the program name, or a domain or company in `what`.
-Precedent: a match with the same signer and path_class supports the same verdict, never over a suspicious fact.
-When unsure: escalate.
+normal: dev_place yes and user_started yes (own builds, dev servers, MCP servers), or known_maker yes.
+fix: never.
+threat: odd_place yes with running yes, or odd_port yes with parent launchd or unknown; write "stop <program>, block its destination, and move <path> to the Trash".
+unsure: user_started unknown and dev_place unknown.
+Most findings of this kind on a developer's Mac are normal (own builds are ad-hoc); pick threat only when an unsigned program in temp, home_hidden or user_library connects out.

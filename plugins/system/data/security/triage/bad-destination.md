@@ -1,18 +1,14 @@
-A connection to a listed malicious address or domain, a stealer drop, the Telegram API from a non-Telegram program, or Tor.
+A connection to a listed malicious address, a stealer drop, the Telegram API from a program not made by Telegram, or Tor.
 
-Means: A listed address, stealer drop or Telegram API call is hard evidence: the verdict stays escalate, you only explain.
-Only Tor alone can be judged.
+Questions:
+- listed: is the address listed as bad? Yes when rule or what names threatfox, urlhaus, spamhaus, a blocklist, a drop, or the Telegram API.
+- tor_only: is it only Tor? Yes when what says Tor and listed is no.
+- known_maker: is the program from a known maker? Yes when signer is apple, or a developer with notarized yes.
+- usual_place: is it in a usual place? Yes when path_class is applications, homebrew, toolchain or project.
+- user_started: did the person start it? Yes when parent is terminal or editor, or what says it was started by a command the person ran or by zsh, bash, Terminal, an editor, Claude or Codex.
 
-Normal when (Tor only):
-- signer a developer, notarized yes, path_class applications (Tor Browser, Brave, OnionShare).
-- path_class homebrew, parent terminal, seen_days 14 or more (a tor service the person installed).
-- path_class project or toolchain, parent terminal or editor (testing a Tor library).
-
-Suspicious when:
-- Tor with signer adhoc, unsigned or unknown, or path_class temp, home_hidden or user_library (backdoors hide behind Tor).
-- Telegram API from a program not signed by Telegram (stealers send loot to a bot).
-- running yes with parent launchd: it will repeat on its own.
-
-Never decide from: domain or company names in `what`, or claims the address is a CDN.
-Precedent: for Tor, a match with the same signer supports the same verdict; otherwise it changes nothing.
-When unsure: escalate.
+normal: tor_only yes, and known_maker yes, or usual_place yes and user_started yes.
+fix: never.
+threat: listed yes, or tor_only yes with known_maker no and usual_place no; write "stop <program>, block the address, and change passwords from another device".
+unsure: tor_only yes and known_maker and usual_place unknown.
+Findings of this kind are threat whenever listed is yes; pick normal only for Tor from a known maker or a usual place.

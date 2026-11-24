@@ -317,9 +317,9 @@ export interface SweepReport {
  * investigation. Filed as normal (expected, false_alarm, not shadow) shows grey and never notifies. */
 export interface Triage {
   item: string;
-  /** pending | shown | expected | false_alarm */
+  /** pending | shown (a threat or unexplained) | fix (upkeep, with `action`) | expected | false_alarm */
   verdict: string;
-  /** code | model | investigation | person */
+  /** code | learned | model | investigation | person */
   by: string;
   reason: string;
   facts: string[];
@@ -330,6 +330,8 @@ export interface Triage {
   at: number;
   shadow: boolean;
   notified_at: number;
+  /** For fix and a shown threat: the first step or command the model proposes. */
+  action?: string;
 }
 
 export const filedAway = (triage?: Triage | null) => !!triage && !triage.shadow && (triage.verdict === 'expected' || triage.verdict === 'false_alarm');

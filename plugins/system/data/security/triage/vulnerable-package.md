@@ -1,18 +1,13 @@
 A package, app or Docker image has a known vulnerability, or a package is listed as malicious.
 
-Means: A malicious package (MAL- id) or exploited CVE is hard evidence: it stays escalate and you only explain.
-Other CVEs are upkeep you can judge.
+Questions:
+- malicious: is it listed as malicious? Yes when rule or what has a MAL- id or says malicious.
+- exploited: is the hole known to be used? Yes when rule or what says exploited.
+- dev_only: is it only for development? Yes when path_class is project or toolchain and what says a development or test dependency.
+- has_fix: is a fixed version named? Yes when what names a fixed version.
 
-Normal when:
-- path_class project or toolchain, severity low or medium, `what` says a development or test dependency only.
-- a Docker image CVE and running no.
-- severity low or info, path_class project, seen_days 30 or more (an old lockfile not touched lately).
-
-Suspicious when:
-- a MAL- id or exploited CVE: always escalate; say if running yes, and that tokens need changing if an install script ran.
-- seen_days 0, path_class project or toolchain, after an npm, PyPI or extension install (worms, lookalikes).
-- severity high and running yes, or a browser, VPN or remote access app.
-
-Never decide from: a familiar package or maintainer name; lookalikes copy them.
-Precedent: a match supports the same verdict only for ordinary CVEs at the same or lower severity, never over a suspicious fact.
-When unsure: escalate.
+normal: dev_only yes with severity low or info and has_fix no.
+fix: malicious no and exploited no; write the upgrade, e.g. "brew upgrade poppler", "npm install <pkg>@<fixed> in <project>", "pip install -U <pkg>", "docker pull <image>", or "update <app>".
+threat: malicious yes or exploited yes; write "uninstall <package> and rotate tokens if its install script ran".
+unsure: never.
+Most findings of this kind on a developer's Mac are fix; pick threat only when the finding says MAL-, malicious or exploited. A familiar package name never decides.

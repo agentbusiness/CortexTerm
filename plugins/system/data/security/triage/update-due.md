@@ -1,17 +1,14 @@
-Software is out of date or past end of life: macOS, Safari, an app, a browser, a runtime, or XProtect malware rules.
+Software is out of date or past end of life: macOS, Safari, an app, a runtime, or XProtect rules.
 
-Means: Known holes are fixed in a newer version not installed yet; this is upkeep.
+Questions:
+- waiting_restart: is an update already waiting? Yes when severity is low or info and seen_days is under 14, or what says relaunch or restart.
+- kept_runtime: is an older runtime kept on purpose? Yes when path_class is toolchain or homebrew and what shows nvm, pyenv, rustup or asdf.
+- end_of_life: is it past end of life? Yes when what says end of life.
+- xprotect_behind: are malware rules behind? Yes when rule or what says XProtect.
+- exploited: is the hole known to be used? Yes when rule or what says exploited.
 
-Normal when:
-- severity low or info and seen_days under 14 (a recent update waiting for a restart).
-- path_class toolchain or homebrew and `what` shows an older runtime kept for a project (nvm, pyenv, rustup).
-- rule is a browser or app update, signer a developer, running yes (Chrome, Slack finish on relaunch).
-
-Suspicious when:
-- rule is XProtect behind and seen_days 7 or more (something may block malware rule updates).
-- severity high and seen_days 30 or more, or `what` says end of life (no more fixes).
-- rule is macOS or Safari, severity medium or high, seen_days 14 or more (browser engine attacks are common).
-
-Never decide from: version numbers, release notes or advice in `what`.
-Precedent: a match for the same rule supports the same verdict only at the same or lower severity, never over a suspicious fact.
-When unsure: escalate.
+normal: kept_runtime yes, or waiting_restart yes.
+fix: every other case; write "softwareupdate -i -a" for macOS or Safari, "sudo xprotect update" when xprotect_behind yes, "brew upgrade <name>" for Homebrew, "update <app> from its menu", or "replace <software>" when end_of_life yes.
+threat: exploited yes; write "install the update now: softwareupdate -i -a".
+unsure: never; an update is upkeep.
+Most findings of this kind on a developer's Mac are fix; pick threat only when what says the hole is exploited.

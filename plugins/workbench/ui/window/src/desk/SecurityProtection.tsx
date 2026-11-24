@@ -398,6 +398,8 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
     finally { if (mounted.current) setSweeping(false); }
   };
 
+  /** The model's proposed step, handed to the assistant, which runs it through the risk check. */
+  const doAction = (entry: Item, triage: Triage) => onAsk(`For the security issue "${entry.incident?.title ?? entry.alert?.text ?? entry.title}", do this: ${triage.action}. Explain what it changes, run it, then check that the issue is gone.`, 'fix');
   const ask = (entry: Item, intent: 'ask' | 'fix') => {
     setAsked((done) => new Set(done).add(entry.key));
     if (entry.kind === 'sweep') {
@@ -414,6 +416,7 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
     if (!item || deciding || event.metaKey || event.ctrlKey || event.altKey || (event.target as HTMLElement).closest('input,textarea,select')) return;
     const key = event.key.toLowerCase();
     if (key === 'a') ask(item, 'ask');
+    else if (key === 'x' && item.triage?.action && !item.filtered) doAction(item, item.triage);
     else if (key === 'f' && item.kind === 'sweep') ask(item, 'fix');
     else if (key === 'd' && item.kind === 'sweep') setDeciding(true);
     else if (key === 'i' && item.incident && status?.config.investigate) void act(item.incident.id, 'investigate');
@@ -473,7 +476,7 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
         {tab === 'decided' && (report?.fixes ?? []).filter((fix) => fix.gone).slice(0, 8).map((fix) => fixCard(fix))}
         {shown.length === 0 && <p className="ct-asec-note">{tab === 'open' ? 'Nothing open. The checks only know what they can see; no findings is not an all-clear.' : 'No decisions yet.'}</p>}
         {shown.map((entry) => <Fragment key={entry.key}><button type="button" className={`ct-sec-row ${entry.filtered ? 'filed' : tone(entry.severity)}${entry.key === item?.key ? ' on' : ''}`} aria-pressed={entry.key === item?.key} onClick={() => select(entry.key === item?.key ? '' : entry.key)}>
-          <span className="ct-label sev">{entry.filtered ? 'NORMAL' : !entry.open ? verdictName(entry.decision?.verdict ?? 'dismissed') : priority(entry.severity)}</span>
+          <span className="ct-label sev">{entry.filtered ? 'NORMAL' : !entry.open ? verdictName(entry.decision?.verdict ?? 'dismissed') : entry.triage?.verdict === 'fix' ? 'FIX' : priority(entry.severity)}</span>
           <Hits hits={[...(history?.hits[entry.key] ?? []), ...(entry.incident ? history?.hits[entry.incident.id] ?? [] : [])]} buckets={history?.series.length ?? 0} />
           <span className="ct-sec-row-main"><span className="ct-sec-row-title" dir="auto">{entry.title}</span><span className="ct-sec-row-text" dir="auto">{entry.text}</span></span>
           <span className="ct-sec-row-side">{entry.open && entry.triage?.verdict === 'pending' && <span className="ct-label ct-blue">CHECKING</span>}<span className="ct-label ct-faint">{entry.kind === 'sweep' ? plural(entry.count, 'finding') : entry.kind === 'incident' ? 'INCIDENT' : entry.alert?.kind.toUpperCase()}</span><time className="ct-label ct-faint" dateTime={iso(entry.last)}>{date(entry.last) ? ago(entry.last) : ''}</time></span>
@@ -541,10 +544,14 @@ export function SecurityPane({ onAsk, onCommand }: { onAsk: Ask; onCommand: (com
     if (triage.verdict === 'pending') return <div className="ct-sec-triage"><h4 className="ct-label ct-blue">TRIAGE · CHECKING</h4><p className="ct-asec-note" role="status">Code and the local model are looking at it; it notifies only if it needs you.</p></div>;
     const filed = entry.filtered;
     return <div className={`ct-sec-triage${filed ? ' filed' : ''}`}>
-      <h4 className="ct-label ct-blue">{filed ? 'FILED AS NORMAL' : triage.shadow ? 'TRIAGE · SHADOW' : 'TRIAGE · NEEDS YOUR LOOK'} · {TRIAGED_BY[triage.by] ?? triage.by.toUpperCase()}{triage.at ? ` · ${ago(triage.at).toUpperCase()}` : ''}</h4>
+      <h4 className="ct-label ct-blue">{filed ? 'FILED AS NORMAL' : triage.shadow ? 'TRIAGE · SHADOW' : triage.verdict === 'fix' ? 'TRIAGE · UPKEEP TO DO' : 'TRIAGE · NEEDS YOUR LOOK'} · {TRIAGED_BY[triage.by] ?? triage.by.toUpperCase()}{triage.at ? ` · ${ago(triage.at).toUpperCase()}` : ''}</h4>
       <p className={filed ? 'ct-asec-note' : 'ct-asec-note ct-warn'} dir="auto">{triage.reason}{triage.shadow && (triage.verdict === 'expected' || triage.verdict === 'false_alarm') ? ' Shadow mode: it stays shown.' : ''}</p>
+      {!filed && triage.action && <div className="ct-sec-do"><span className="ct-label">{triage.verdict === 'fix' ? 'WHAT TO DO' : 'FIRST STEP'}</span><code dir="ltr">{triage.action}</code>
+        <div className="ct-protection-actions"><button type="button" className="detent sm warn" title="The assistant runs it in the terminal; the risk check asks you first when it changes anything" onClick={() => doAction(entry, triage)}>X · DO IT</button></div></div>}
+      {triage.basis.length > 0 && <details className="ct-sec-facts"><summary className="ct-label">ITS ANSWERS · {triage.basis.length}</summary>
+        <ul>{triage.basis.map((line, index) => <li key={index} dir="auto">{line}</li>)}</ul></details>}
       {triage.facts.length > 0 && <details className="ct-sec-facts"><summary className="ct-label">WHAT IT LOOKED AT · {triage.facts.length}</summary>
-        <ul>{triage.facts.slice(0, 24).map((fact, index) => <li key={index} className={triage.basis.includes(fact) ? 'basis' : ''} dir="auto">{fact}</li>)}</ul></details>}
+        <ul>{triage.facts.slice(0, 24).map((fact, index) => <li key={index} dir="auto">{fact}</li>)}</ul></details>}
       {filed && item && <div className="ct-protection-actions"><button type="button" className="detent sm warn" disabled={!!busy} title="It shows in colour again and stays shown; the model is told next time it looks at something like it" onClick={() => void undoTriage(item)}>W · THIS WAS WRONG</button></div>}
     </div>;
   }

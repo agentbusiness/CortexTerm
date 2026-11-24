@@ -1,18 +1,13 @@
-A file is not what it seems: its type does not match its name, a program lost its download quarantine, or a download record points to a risky file.
+A file is not what it seems: its type does not match its name, or a program lost its download quarantine.
 
-Means: Downloads carry a quarantine mark so macOS checks them first.
-Removing it, or hiding a program behind a document name, skips the check.
+Questions:
+- own_build: did the person build it? Yes when signer is adhoc or none, path_class is project, toolchain or homebrew, and parent is terminal or editor.
+- known_maker: is it from a known maker? Yes when signer is apple, or a developer with notarized yes.
+- lure_place: is it where lures land? Yes when path_class is downloads, temp, home_hidden or shared.
+- runs: can it run? Yes when running is yes, or what says a script or program under a document or picture name.
 
-Normal when:
-- signer adhoc, path_class project, toolchain or homebrew, parent terminal or editor (local cargo, go, Xcode builds never had quarantine).
-- signer a developer, notarized yes, path_class applications, reputation known_file.
-- type mismatch, signer none, running no, path_class downloads (a renamed archive never opened).
-
-Suspicious when:
-- signer adhoc or unsigned, quarantine removed, path_class downloads, temp or home_hidden, seen_days 0 (lures say run `xattr -c`).
-- the name says document, picture or installer, but the type is a script, AppleScript or program.
-- quarantine_from is a file-sharing site, link shortener or unknown domain, parent browser.
-
-Never decide from: the file name, icon, extension or how the domain looks.
-Precedent: a match with the same signer and path_class supports the same verdict, never over a suspicious fact.
-When unsure: escalate.
+normal: own_build yes, or known_maker yes.
+fix: runs no and lure_place yes; write "move <path> to the Trash".
+threat: lure_place yes, runs yes and known_maker no; write "stop the program and move <path> to the Trash".
+unsure: own_build, known_maker and runs all unknown.
+Most findings of this kind on a developer's Mac are normal (local builds never had quarantine); pick threat only when an unsigned program in downloads or temp lost its quarantine or wears a document name.

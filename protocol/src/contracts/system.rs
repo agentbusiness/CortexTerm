@@ -36,9 +36,9 @@ impl Default for ProtectionConfig {
 #[serde(default)]
 pub struct Triage {
     pub item: String,
-    /// pending | shown | expected | false_alarm
+    /// pending | shown (a threat or unexplained) | fix (upkeep, with `action`) | expected | false_alarm
     pub verdict: String,
-    /// code | model | investigation | person
+    /// code | learned | model | investigation | person
     pub by: String,
     /// One plain sentence, rendered by code.
     pub reason: String,
@@ -58,6 +58,9 @@ pub struct Triage {
     pub shadow: bool,
     /// When it notified (0: never).
     pub notified_at: u64,
+    /// For `fix` and a shown threat: the first step or command the model proposes.
+    #[serde(default)]
+    pub action: String,
 }
 
 impl Triage {

@@ -1,18 +1,13 @@
 Something is watching input now: a keyboard event tap, or the camera or microphone in use.
 
-Means: A program can read keystrokes, or records picture or sound.
-Normal for calls and shortcut tools; the heart of spyware.
+Questions:
+- known_maker: is it from a known maker? Yes when signer is apple, or a developer with notarized yes.
+- usual_place: is it where apps live? Yes when path_class is system, applications or homebrew.
+- odd_place: is it hidden? Yes when path_class is home_hidden, user_library, temp, downloads or shared.
+- no_app: does it run with no app the person opened? Yes when parent is launchd or unknown and usual_place is no.
 
-Normal when:
-- camera or microphone, signer a developer, notarized yes, path_class applications, running yes (Zoom, Teams, Chrome for Meet, Slack).
-- keyboard tap, signer a developer, notarized yes, seen_days 14 or more (Karabiner, Raycast, Alfred, password manager autofill).
-- signer apple and path_class system (Dictation, Siri, FaceTime).
-
-Suspicious when:
-- signer adhoc, unsigned or unknown, for any of these rules.
-- path_class home_hidden, user_library, temp, downloads or shared, seen_days 7 or less.
-- camera or microphone with parent launchd or unknown, path_class not applications or system (recording with no visible app).
-
-Never decide from: the program name, a window title or text in `what`.
-Precedent: a match with the same signer and rule supports the same verdict, never over a suspicious fact.
-When unsure: escalate.
+normal: known_maker yes and usual_place yes (Zoom, Teams, a browser call, Raycast, Karabiner, Dictation).
+fix: never.
+threat: known_maker no, or odd_place yes, or no_app yes; write "quit <program>, revoke its permission in System Settings > Privacy & Security, and move <path> to the Trash".
+unsure: known_maker unknown and usual_place unknown.
+Most findings of this kind on a developer's Mac are normal; pick threat only when an unsigned or ad-hoc program watches keys, the camera or the microphone.

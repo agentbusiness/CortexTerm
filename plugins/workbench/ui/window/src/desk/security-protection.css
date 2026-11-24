@@ -107,7 +107,8 @@
 .ct-sec-triage.filed{border-left-color:var(--ink-3);}
 .ct-sec-triage h4{margin:0 0 4px;}
 .ct-sec-facts ul{margin:4px 0 0;padding-left:16px;font-family:var(--mono, ui-monospace, monospace);font-size:11px;color:var(--ink-2);}
-.ct-sec-facts li.basis{color:var(--ink);}
+.ct-sec-do{display:flex;flex-direction:column;gap:6px;margin:8px 0;}
+.ct-sec-do code{font:12px/1.5 var(--font-mono);color:var(--ink);background:var(--rubric-wash);padding:6px 8px;border-left:2px solid var(--rubric);white-space:pre-wrap;word-break:break-all;}
 .ct-sec-mode .ct-sec-segs{display:inline-flex;gap:2px;}
 .ct-sec-hits{width:56px;height:12px;fill:var(--counter);}
 .ct-sec-row.high .ct-sec-hits{fill:var(--rubric-lift);}

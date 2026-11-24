@@ -498,10 +498,7 @@ impl Shared {
             lock(&self.triage).checked(result);
         }
         let precedents = self.precedents();
-        let s = self.clone();
-        let mine = subject.clone();
-        let similar = move |signer: &str| lock(&s.triage).similar(&mine, signer).cloned();
-        match triage::judge(&ctx, subject.clone(), self.snapshot(), precedents, mode == "shadow", investigate, similar).await {
+        match triage::judge(&ctx, subject.clone(), self.snapshot(), precedents, mode == "shadow", investigate).await {
             Ok(outcome) => {
                 if let (Some(investigation), Some(incident)) = (outcome.investigation, subject.incident.as_ref()) {
                     lock(&self.protection).keep_investigation(&incident.id, incident.revision, investigation);

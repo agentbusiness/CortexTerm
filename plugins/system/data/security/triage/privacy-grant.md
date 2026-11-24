@@ -1,18 +1,14 @@
 A program has a privacy permission: Full Disk Access, Accessibility, Screen Recording, Input Monitoring, or Automation of another app.
 
-Means: The person allowed it in a macOS prompt, or was tricked.
-It lets a program read every file, see the screen, read keys or drive apps.
+Questions:
+- known_maker: is it from a known maker? Yes when signer is apple, or a developer with notarized yes.
+- usual_place: is it where apps live? Yes when path_class is system, applications, homebrew or toolchain.
+- new_helper: is it new in an odd place? Yes when seen_days is 0 to 2 and path_class is temp, downloads, home_hidden, user_library or shared.
+- strong_grant: is it a strong grant? Yes when what says Full Disk Access, Accessibility, Input Monitoring, or Automation of Finder or System Events.
+- leftover: is the program gone? Yes when what says it no longer exists.
 
-Normal when:
-- signer a developer, notarized yes, path_class applications, seen_days 14 or more (backup tools, Raycast, Zoom, 1Password).
-- parent terminal or editor, signer a developer, notarized yes (iTerm, VS Code, Cursor, JetBrains).
-- signer apple and path_class system.
-
-Suspicious when:
-- Full Disk Access, Accessibility or Input Monitoring with signer adhoc, unsigned or unknown, or notarized no.
-- seen_days 0 and path_class temp, downloads, home_hidden or user_library (a new helper that asked at once).
-- Automation of Finder or System Events, parent terminal or unknown, seen_days 0 (stealers drive Finder to copy Notes and keychains).
-
-Never decide from: the program name in the grant or in `what`.
-Precedent: a match with the same signer and grant supports the same verdict, never over a suspicious fact.
-When unsure: escalate.
+normal: known_maker yes and usual_place yes (Terminal, VS Code, Raycast, Zoom).
+fix: leftover yes; write "remove <program> from System Settings > Privacy & Security > <grant>".
+threat: strong_grant yes with known_maker no, or new_helper yes; write "revoke <grant> for <program> in System Settings > Privacy & Security".
+unsure: known_maker unknown.
+Most findings of this kind on a developer's Mac are normal; pick threat only when an unsigned or ad-hoc program holds Full Disk Access, Accessibility or Input Monitoring.
